@@ -1,0 +1,430 @@
+{
+  "ingredients": [
+    {
+      "ingredient_id": "ing_spinach",
+      "name": "Baby Spinach",
+      "category": "Produce",
+      "standard_unit": "g"
+    },
+    {
+      "ingredient_id": "ing_onion",
+      "name": "Yellow Onion",
+      "category": "Produce",
+      "standard_unit": "unit"
+    },
+    {
+      "ingredient_id": "ing_garlic",
+      "name": "Garlic Clove",
+      "category": "Produce",
+      "standard_unit": "unit"
+    },
+    {
+      "ingredient_id": "ing_bell_pepper",
+      "name": "Bell Pepper",
+      "category": "Produce",
+      "standard_unit": "unit"
+    },
+    {
+      "ingredient_id": "ing_carrot",
+      "name": "Carrot",
+      "category": "Produce",
+      "standard_unit": "unit"
+    },
+    {
+      "ingredient_id": "ing_broccoli",
+      "name": "Broccoli Florets",
+      "category": "Produce",
+      "standard_unit": "g"
+    },
+    {
+      "ingredient_id": "ing_banana",
+      "name": "Banana",
+      "category": "Produce",
+      "standard_unit": "unit"
+    },
+    {
+      "ingredient_id": "ing_berries",
+      "name": "Mixed Berries",
+      "category": "Produce",
+      "standard_unit": "g"
+    },
+    {
+      "ingredient_id": "ing_avocado",
+      "name": "Avocado",
+      "category": "Produce",
+      "standard_unit": "unit"
+    },
+    {
+      "ingredient_id": "ing_cherry_tomatoes",
+      "name": "Cherry Tomatoes",
+      "category": "Produce",
+      "standard_unit": "g"
+    },
+    {
+      "ingredient_id": "ing_rolled_oats",
+      "name": "Rolled Oats",
+      "category": "Grains",
+      "standard_unit": "g"
+    },
+    {
+      "ingredient_id": "ing_brown_rice",
+      "name": "Brown Rice",
+      "category": "Grains",
+      "standard_unit": "g"
+    },
+    {
+      "ingredient_id": "ing_quinoa",
+      "name": "Quinoa",
+      "category": "Grains",
+      "standard_unit": "g"
+    },
+    {
+      "ingredient_id": "ing_whole_wheat_bread",
+      "name": "Whole Wheat Bread",
+      "category": "Bakery",
+      "standard_unit": "slice"
+    },
+    {
+      "ingredient_id": "ing_whole_wheat_pasta",
+      "name": "Whole Wheat Pasta",
+      "category": "Grains",
+      "standard_unit": "g"
+    },
+    {
+      "ingredient_id": "ing_canned_chickpeas",
+      "name": "Canned Chickpeas",
+      "category": "Canned Goods",
+      "standard_unit": "g"
+    },
+    {
+      "ingredient_id": "ing_canned_black_beans",
+      "name": "Canned Black Beans",
+      "category": "Canned Goods",
+      "standard_unit": "g"
+    },
+    {
+      "ingredient_id": "ing_red_lentils",
+      "name": "Dry Red Lentils",
+      "category": "Legumes",
+      "standard_unit": "g"
+    },
+    {
+      "ingredient_id": "ing_canned_tomatoes",
+      "name": "Canned Diced Tomatoes",
+      "category": "Canned Goods",
+      "standard_unit": "g"
+    },
+    {
+      "ingredient_id": "ing_eggs",
+      "name": "Large Eggs",
+      "category": "Dairy & Eggs",
+      "standard_unit": "unit"
+    },
+    {
+      "ingredient_id": "ing_firm_tofu",
+      "name": "Firm Tofu",
+      "category": "Plant-Based Protein",
+      "standard_unit": "g"
+    },
+    {
+      "ingredient_id": "ing_chicken_breast",
+      "name": "Chicken Breast Fillet",
+      "category": "Meat",
+      "standard_unit": "g"
+    },
+    {
+      "ingredient_id": "ing_salmon_fillet",
+      "name": "Fresh Salmon Fillet",
+      "category": "Seafood",
+      "standard_unit": "g"
+    },
+    {
+      "ingredient_id": "ing_greek_yogurt",
+      "name": "Plain Greek Yogurt",
+      "category": "Dairy & Eggs",
+      "standard_unit": "g"
+    },
+    {
+      "ingredient_id": "ing_olive_oil",
+      "name": "Extra Virgin Olive Oil",
+      "category": "Oils & Vinegars",
+      "standard_unit": "ml"
+    },
+    {
+      "ingredient_id": "ing_soy_sauce",
+      "name": "Low Sodium Soy Sauce",
+      "category": "Condiments",
+      "standard_unit": "ml"
+    },
+    {
+      "ingredient_id": "ing_almond_milk",
+      "name": "Unsweetened Almond Milk",
+      "category": "Dairy Alternatives",
+      "standard_unit": "ml"
+    },
+    {
+      "ingredient_id": "ing_chia_seeds",
+      "name": "Chia Seeds",
+      "category": "Seeds",
+      "standard_unit": "g"
+    },
+    {
+      "ingredient_id": "ing_vegetable_broth",
+      "name": "Vegetable Broth",
+      "category": "Soups & Broths",
+      "standard_unit": "ml"
+    },
+    {
+      "ingredient_id": "ing_peanut_butter",
+      "name": "Creamy Peanut Butter",
+      "category": "Nut Butters",
+      "standard_unit": "g"
+    },
+    {
+      "ingredient_id": "ing_parmesan_cheese",
+      "name": "Grated Parmesan Cheese",
+      "category": "Dairy & Eggs",
+      "standard_unit": "g"
+    }
+  ],
+  "recipes": [
+    {
+      "recipe_id": "rec_berry_oatmeal",
+      "name": "Berry Cinnamon Oatmeal Bowl",
+      "tags": ["vegetarian", "vegan", "dairy-free", "breakfast", "quick"],
+      "default_servings": 2,
+      "estimated_cost": "4.20",
+      "requirements": [
+        {"ingredient_id": "ing_rolled_oats", "quantity": "100.0", "unit": "g"},
+        {"ingredient_id": "ing_almond_milk", "quantity": "300.0", "unit": "ml"},
+        {"ingredient_id": "ing_berries", "quantity": "100.0", "unit": "g"},
+        {"ingredient_id": "ing_chia_seeds", "quantity": "15.0", "unit": "g"}
+      ]
+    },
+    {
+      "recipe_id": "rec_spinach_omelet",
+      "name": "Spinach & Parmesan Omelet",
+      "tags": ["vegetarian", "gluten-free", "breakfast", "high-protein", "quick"],
+      "default_servings": 2,
+      "estimated_cost": "5.50",
+      "requirements": [
+        {"ingredient_id": "ing_eggs", "quantity": "4", "unit": "unit"},
+        {"ingredient_id": "ing_spinach", "quantity": "80.0", "unit": "g"},
+        {"ingredient_id": "ing_olive_oil", "quantity": "10.0", "unit": "ml"},
+        {"ingredient_id": "ing_parmesan_cheese", "quantity": "25.0", "unit": "g"}
+      ]
+    },
+    {
+      "recipe_id": "rec_greek_yogurt_bowl",
+      "name": "Greek Yogurt Parfait with Berries & Banana",
+      "tags": ["vegetarian", "gluten-free", "breakfast", "high-protein", "quick"],
+      "default_servings": 1,
+      "estimated_cost": "3.80",
+      "requirements": [
+        {"ingredient_id": "ing_greek_yogurt", "quantity": "200.0", "unit": "g"},
+        {"ingredient_id": "ing_berries", "quantity": "60.0", "unit": "g"},
+        {"ingredient_id": "ing_banana", "quantity": "1", "unit": "unit"},
+        {"ingredient_id": "ing_chia_seeds", "quantity": "10.0", "unit": "g"}
+      ]
+    },
+    {
+      "recipe_id": "rec_avocado_toast",
+      "name": "Classic Avocado Toast with Poached Egg",
+      "tags": ["vegetarian", "breakfast", "quick"],
+      "default_servings": 2,
+      "estimated_cost": "5.00",
+      "requirements": [
+        {"ingredient_id": "ing_whole_wheat_bread", "quantity": "4", "unit": "slice"},
+        {"ingredient_id": "ing_avocado", "quantity": "2", "unit": "unit"},
+        {"ingredient_id": "ing_eggs", "quantity": "2", "unit": "unit"},
+        {"ingredient_id": "ing_olive_oil", "quantity": "10.0", "unit": "ml"}
+      ]
+    },
+    {
+      "recipe_id": "rec_peanut_butter_banana_toast",
+      "name": "Peanut Butter & Banana Toast",
+      "tags": ["vegetarian", "vegan", "dairy-free", "breakfast", "quick"],
+      "default_servings": 2,
+      "estimated_cost": "3.20",
+      "requirements": [
+        {"ingredient_id": "ing_whole_wheat_bread", "quantity": "4", "unit": "slice"},
+        {"ingredient_id": "ing_peanut_butter", "quantity": "40.0", "unit": "g"},
+        {"ingredient_id": "ing_banana", "quantity": "2", "unit": "unit"}
+      ]
+    },
+    {
+      "recipe_id": "rec_chia_pudding",
+      "name": "Almond Milk Chia Seed Pudding",
+      "tags": ["vegetarian", "vegan", "dairy-free", "gluten-free", "breakfast"],
+      "default_servings": 2,
+      "estimated_cost": "3.60",
+      "requirements": [
+        {"ingredient_id": "ing_chia_seeds", "quantity": "40.0", "unit": "g"},
+        {"ingredient_id": "ing_almond_milk", "quantity": "300.0", "unit": "ml"},
+        {"ingredient_id": "ing_berries", "quantity": "80.0", "unit": "g"}
+      ]
+    },
+    {
+      "recipe_id": "rec_mediterranean_chickpea_salad",
+      "name": "Mediterranean Chickpea Salad",
+      "tags": ["vegetarian", "vegan", "gluten-free", "dairy-free", "lunch", "quick"],
+      "default_servings": 2,
+      "estimated_cost": "5.80",
+      "requirements": [
+        {"ingredient_id": "ing_canned_chickpeas", "quantity": "400.0", "unit": "g"},
+        {"ingredient_id": "ing_cherry_tomatoes", "quantity": "150.0", "unit": "g"},
+        {"ingredient_id": "ing_bell_pepper", "quantity": "1", "unit": "unit"},
+        {"ingredient_id": "ing_olive_oil", "quantity": "20.0", "unit": "ml"}
+      ]
+    },
+    {
+      "recipe_id": "rec_quinoa_veggie_bowl",
+      "name": "Roasted Veggie & Quinoa Nourish Bowl",
+      "tags": ["vegetarian", "vegan", "gluten-free", "dairy-free", "lunch"],
+      "default_servings": 2,
+      "estimated_cost": "6.40",
+      "requirements": [
+        {"ingredient_id": "ing_quinoa", "quantity": "150.0", "unit": "g"},
+        {"ingredient_id": "ing_broccoli", "quantity": "200.0", "unit": "g"},
+        {"ingredient_id": "ing_carrot", "quantity": "2", "unit": "unit"},
+        {"ingredient_id": "ing_olive_oil", "quantity": "15.0", "unit": "ml"}
+      ]
+    },
+    {
+      "recipe_id": "rec_tofu_stir_fry",
+      "name": "Crispy Tofu & Vegetable Stir-Fry",
+      "tags": ["vegetarian", "vegan", "dairy-free", "lunch", "dinner", "high-protein"],
+      "default_servings": 2,
+      "estimated_cost": "7.20",
+      "requirements": [
+        {"ingredient_id": "ing_firm_tofu", "quantity": "300.0", "unit": "g"},
+        {"ingredient_id": "ing_broccoli", "quantity": "150.0", "unit": "g"},
+        {"ingredient_id": "ing_bell_pepper", "quantity": "1", "unit": "unit"},
+        {"ingredient_id": "ing_soy_sauce", "quantity": "25.0", "unit": "ml"},
+        {"ingredient_id": "ing_olive_oil", "quantity": "15.0", "unit": "ml"}
+      ]
+    },
+    {
+      "recipe_id": "rec_chicken_salad_wrap",
+      "name": "Grilled Chicken & Spinach Wrap",
+      "tags": ["high-protein", "lunch"],
+      "default_servings": 2,
+      "estimated_cost": "8.50",
+      "requirements": [
+        {"ingredient_id": "ing_chicken_breast", "quantity": "300.0", "unit": "g"},
+        {"ingredient_id": "ing_spinach", "quantity": "100.0", "unit": "g"},
+        {"ingredient_id": "ing_cherry_tomatoes", "quantity": "100.0", "unit": "g"},
+        {"ingredient_id": "ing_whole_wheat_bread", "quantity": "4", "unit": "slice"}
+      ]
+    },
+    {
+      "recipe_id": "rec_black_bean_quinoa_bowl",
+      "name": "Southwest Black Bean & Quinoa Salad",
+      "tags": ["vegetarian", "vegan", "gluten-free", "dairy-free", "lunch", "high-protein"],
+      "default_servings": 2,
+      "estimated_cost": "5.60",
+      "requirements": [
+        {"ingredient_id": "ing_canned_black_beans", "quantity": "400.0", "unit": "g"},
+        {"ingredient_id": "ing_quinoa", "quantity": "120.0", "unit": "g"},
+        {"ingredient_id": "ing_bell_pepper", "quantity": "1", "unit": "unit"},
+        {"ingredient_id": "ing_olive_oil", "quantity": "15.0", "unit": "ml"}
+      ]
+    },
+    {
+      "recipe_id": "rec_tomato_spinach_pasta",
+      "name": "Rustic Tomato & Spinach Whole Wheat Pasta",
+      "tags": ["vegetarian", "vegan", "dairy-free", "lunch", "dinner"],
+      "default_servings": 2,
+      "estimated_cost": "5.20",
+      "requirements": [
+        {"ingredient_id": "ing_whole_wheat_pasta", "quantity": "200.0", "unit": "g"},
+        {"ingredient_id": "ing_canned_tomatoes", "quantity": "400.0", "unit": "g"},
+        {"ingredient_id": "ing_spinach", "quantity": "100.0", "unit": "g"},
+        {"ingredient_id": "ing_garlic", "quantity": "2", "unit": "unit"},
+        {"ingredient_id": "ing_olive_oil", "quantity": "15.0", "unit": "ml"}
+      ]
+    },
+    {
+      "recipe_id": "rec_red_lentil_dahl",
+      "name": "Golden Red Lentil Dahl",
+      "tags": ["vegetarian", "vegan", "gluten-free", "dairy-free", "dinner"],
+      "default_servings": 4,
+      "estimated_cost": "7.80",
+      "requirements": [
+        {"ingredient_id": "ing_red_lentils", "quantity": "300.0", "unit": "g"},
+        {"ingredient_id": "ing_onion", "quantity": "1", "unit": "unit"},
+        {"ingredient_id": "ing_garlic", "quantity": "3", "unit": "unit"},
+        {"ingredient_id": "ing_vegetable_broth", "quantity": "600.0", "unit": "ml"},
+        {"ingredient_id": "ing_canned_tomatoes", "quantity": "400.0", "unit": "g"}
+      ]
+    },
+    {
+      "recipe_id": "rec_pan_seared_salmon",
+      "name": "Pan-Seared Salmon with Steamed Broccoli & Rice",
+      "tags": ["pescatarian", "gluten-free", "dairy-free", "dinner", "high-protein"],
+      "default_servings": 2,
+      "estimated_cost": "14.50",
+      "requirements": [
+        {"ingredient_id": "ing_salmon_fillet", "quantity": "350.0", "unit": "g"},
+        {"ingredient_id": "ing_broccoli", "quantity": "250.0", "unit": "g"},
+        {"ingredient_id": "ing_brown_rice", "quantity": "150.0", "unit": "g"},
+        {"ingredient_id": "ing_olive_oil", "quantity": "15.0", "unit": "ml"}
+      ]
+    },
+    {
+      "recipe_id": "rec_baked_chicken_rice",
+      "name": "Herb-Roasted Chicken Breast with Brown Rice",
+      "tags": ["high-protein", "gluten-free", "dairy-free", "dinner"],
+      "default_servings": 2,
+      "estimated_cost": "9.80",
+      "requirements": [
+        {"ingredient_id": "ing_chicken_breast", "quantity": "350.0", "unit": "g"},
+        {"ingredient_id": "ing_brown_rice", "quantity": "150.0", "unit": "g"},
+        {"ingredient_id": "ing_carrot", "quantity": "2", "unit": "unit"},
+        {"ingredient_id": "ing_olive_oil", "quantity": "15.0", "unit": "ml"}
+      ]
+    },
+    {
+      "recipe_id": "rec_veggie_fried_rice",
+      "name": "Healthy Brown Rice & Egg Fried Rice",
+      "tags": ["vegetarian", "dairy-free", "dinner", "quick"],
+      "default_servings": 2,
+      "estimated_cost": "5.40",
+      "requirements": [
+        {"ingredient_id": "ing_brown_rice", "quantity": "200.0", "unit": "g"},
+        {"ingredient_id": "ing_eggs", "quantity": "3", "unit": "unit"},
+        {"ingredient_id": "ing_carrot", "quantity": "1", "unit": "unit"},
+        {"ingredient_id": "ing_onion", "quantity": "1", "unit": "unit"},
+        {"ingredient_id": "ing_soy_sauce", "quantity": "20.0", "unit": "ml"}
+      ]
+    },
+    {
+      "recipe_id": "rec_pasta_parmesan_chicken",
+      "name": "Chicken & Spinach Pasta with Parmesan",
+      "tags": ["high-protein", "dinner"],
+      "default_servings": 2,
+      "estimated_cost": "11.20",
+      "requirements": [
+        {"ingredient_id": "ing_whole_wheat_pasta", "quantity": "200.0", "unit": "g"},
+        {"ingredient_id": "ing_chicken_breast", "quantity": "300.0", "unit": "g"},
+        {"ingredient_id": "ing_spinach", "quantity": "100.0", "unit": "g"},
+        {"ingredient_id": "ing_parmesan_cheese", "quantity": "30.0", "unit": "g"},
+        {"ingredient_id": "ing_olive_oil", "quantity": "15.0", "unit": "ml"}
+      ]
+    },
+    {
+      "recipe_id": "rec_hearty_veggie_soup",
+      "name": "Hearty Vegetable & Bean Soup",
+      "tags": ["vegetarian", "vegan", "gluten-free", "dairy-free", "dinner"],
+      "default_servings": 4,
+      "estimated_cost": "7.00",
+      "requirements": [
+        {"ingredient_id": "ing_canned_black_beans", "quantity": "400.0", "unit": "g"},
+        {"ingredient_id": "ing_carrot", "quantity": "2", "unit": "unit"},
+        {"ingredient_id": "ing_onion", "quantity": "1", "unit": "unit"},
+        {"ingredient_id": "ing_vegetable_broth", "quantity": "750.0", "unit": "ml"},
+        {"ingredient_id": "ing_spinach", "quantity": "100.0", "unit": "g"}
+      ]
+    }
+  ]
+}
