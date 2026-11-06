@@ -1,0 +1,3 @@
+# Direct development dependencies for ShopConnect Object-Centric Intelligence Environment
+pydantic==2.14.3
+pytest==9.2.0
