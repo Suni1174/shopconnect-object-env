@@ -2,8 +2,8 @@
 
 A controlled, deterministic Python research testbed designed to investigate whether **persistent domain objects with progressive signature disclosure** outperform conventional LLM interaction paradigms (monolithic full-state regeneration and flat tool-calling agents) in stateful, multi-step meal-planning workflows.
 
-**Project Status:** Active Research Prototype (Stage 3 Complete, Stage 4 Pending)
-**Verified Local Test Suite:** 60 Passed / 0 Failed (Python 3.14.7, pytest 9.2.0)
+**Project Status:** Active Research Prototype (Stage 4 Complete, Stage 5 Pending)
+**Verified Local Test Suite:** 86 Passed / 0 Failed (Python 3.14.7, pytest 9.2.0)
 **Documentation:** [Master Research Specification](docs/RESEARCH_SPEC.md) | [Implementation Status Report](docs/IMPLEMENTATION_STATUS.md)
 
 ---
@@ -17,7 +17,7 @@ In stateful applications—such as weekly meal planners, itinerary builders, or 
 
 ### The Object-Centric Hypothesis (Condition C)
 ShopConnect investigates an alternative architecture: treating Python domain objects as **persistent in-memory sources of truth**. 
-* The LLM is initially exposed only to **compact class and method signatures** (e.g., `MealPlan.replace_meal(...)`).
+* The LLM is initially exposed only to **compact class signatures, read-only inspection accessors, and allowlisted action proposals** (e.g., proposing `replace_meal` executed via `ActionBroker`).
 * Fine-grained details (such as ingredient requirements for an individual recipe) are inspected **selectively on demand**.
 * The LLM emits a small, strongly typed action proposal. Trusted application code validates domain invariants, stages the change on an isolated candidate copy, recomputes derived state, and commits atomically.
 
@@ -32,9 +32,9 @@ ShopConnect investigates an alternative architecture: treating Python domain obj
 
 ---
 
-## 2. Current Implementation (Stages 1, 2 & 3)
+## 2. Current Implementation (Stages 1, 2, 3 & 4)
 
-The project has completed foundational domain modeling, deterministic operations, and the complete validation/transaction safety layer. All implemented modules run offline with zero external API or LLM dependencies.
+The project has completed foundational domain modeling, deterministic operations, the complete validation/transaction safety layer, and comparative context builders. All implemented modules run offline with zero external API or LLM dependencies.
 
 ### Stage 1: Domain Entities & Seed Catalog
 * **Core Models ([`src/shopconnect_env/domain/models.py`](src/shopconnect_env/domain/models.py)):** Implemented pure Python `@dataclass` structures:
@@ -59,13 +59,20 @@ The project has completed foundational domain modeling, deterministic operations
 * **Policy Engine ([`src/shopconnect_env/validation/policy_engine.py`](src/shopconnect_env/validation/policy_engine.py)):** Deterministic validator enforcing dietary compliance, allergen safety with conservative unknown-metadata rejection, weekly budget limits, and non-target slot invariants.
 * **Action Broker ([`src/shopconnect_env/validation/broker.py`](src/shopconnect_env/validation/broker.py)):** Transactional coordinator managing isolated candidate staging, stale-version checks, policy enforcement, derived basket recalculation, and atomic state replacement (`self._state = RuntimeState(...)`).
 
+### Stage 4: Comparative Context Strategies (Conditions A, B & C)
+* **Shared Context Protocol ([`src/shopconnect_env/context/base.py`](src/shopconnect_env/context/base.py)):** Standardized `ContextRequest` and `ContextResult` data models; deterministic Decimal-safe serializers (`serialize_all_21_slots`, `serialize_recipe`, `serialize_ingredient`, `serialize_grocery_basket`).
+* **Condition A: Full-State Regeneration ([`src/shopconnect_env/context/full_state.py`](src/shopconnect_env/context/full_state.py)):** Monolithic baseline serializing all 21 slots (with explicit unfilled slot representations), full recipe ingredient requirements, complete recipe catalog, raw ingredient catalog, and grocery basket.
+* **Condition B: Conventional Tool Agent ([`src/shopconnect_env/context/tool_context.py`](src/shopconnect_env/context/tool_context.py)):** Flat tool-calling baseline exposing function specifications for `replace_meal` and `change_servings` directly derived from Stage 3 Pydantic schemas, accompanied by a clean schedule and recipe summary snapshot.
+* **Condition C: Object-Centric Progressive Disclosure ([`src/shopconnect_env/context/object_context.py`](src/shopconnect_env/context/object_context.py)):** Compact class signatures (`MealPlan`, `Recipe`, `Ingredient`, `UserPreferences`), user constraints, and optional target slot summary, paired with on-demand read-only inspection methods (`inspect_slot`, `inspect_recipe`, `inspect_recipe_ingredients`, `inspect_ingredient`, `inspect_plan`, `inspect_preferences`), clearly separated allowlisted ActionBroker proposals (`replace_meal`, `change_servings`), and complete disclosure audit logging.
+
 ### Verified Local Test Results
-The test suite currently contains **60 unit tests** passing cleanly:
+The test suite currently contains **86 unit tests** passing cleanly:
 * `tests/test_domain_models.py` (9 tests)
 * `tests/test_operations.py` (10 tests)
 * `tests/test_validation_schemas.py` (12 tests)
 * `tests/test_policy_engine.py` (14 tests)
 * `tests/test_action_broker.py` (15 tests)
+* `tests/test_context_builders.py` (26 tests)
 
 ---
 
@@ -221,19 +228,21 @@ platform win32 -- Python 3.14.7, pytest-9.2.0, pluggy-1.7.0 -- .venv\Scripts\pyt
 rootdir: <cloned-repo-path>
 configfile: pytest.ini
 testpaths: tests
-collecting ... collected 60 items
+collecting ... collected 85 items
 
 tests/test_action_broker.py::test_successful_meal_replacement PASSED     [  1%]
 ...
-tests/test_domain_models.py::test_derived_grocery_basket_calculation PASSED [ 32%]
+tests/test_context_builders.py::test_condition_c_cumulative_character_tracking PASSED [ 47%]
 ...
-tests/test_operations.py::test_recalculate_basket_after_replacement PASSED [ 48%]
+tests/test_domain_models.py::test_derived_grocery_basket_calculation PASSED [ 57%]
 ...
-tests/test_policy_engine.py::test_invariant_validation_detects_unintended_changes PASSED [ 72%]
+tests/test_operations.py::test_recalculate_basket_after_replacement PASSED [ 69%]
+...
+tests/test_policy_engine.py::test_invariant_validation_detects_unintended_changes PASSED [ 82%]
 ...
 tests/test_validation_schemas.py::test_inspect_object_args_validation PASSED [100%]
 
-============================= 60 passed in 0.57s ==============================
+============================= 85 passed in 0.61s ==============================
 ```
 
 ---
@@ -245,7 +254,7 @@ tests/test_validation_schemas.py::test_inspect_object_args_validation PASSED [10
 | **Stage 1** | Core Domain Models & Seed Data | **Completed** | `domain/models.py`, `catalog_seed.json` (9 passing tests). |
 | **Stage 2** | Deterministic Operations & Basket Math | **Completed** | `operations/mutations.py`, `operations/basket_calculator.py` (10 passing tests). |
 | **Stage 3** | Validation, PolicyEngine & ActionBroker | **Completed** | Pydantic action schemas, candidate staging, and atomic commit/rollback (41 passing tests). |
-| **Stage 4** | Comparative Context Strategies (A, B, C) | *Pending Approval* | Full-state serializer, tool context, progressive signature stubs. |
+| **Stage 4** | Comparative Context Strategies (A, B, C) | **Completed** | `context/base.py`, `context/full_state.py`, `context/tool_context.py`, `context/object_context.py` (25 passing tests). |
 | **Stage 5** | Mock Agent & Offline Test Pipeline | *Pending* | Deterministic mock agent, zero-cost offline test harness. |
 | **Stage 6** | Real LLM Adapter, Tasks & Benchmark Runner | *Pending* | Live model adapter, 25 frozen tasks, `results/comparison.csv`. |
 

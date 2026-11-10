@@ -2,7 +2,7 @@
 
 **Environment Runtime:** Python 3.14.7 (`.venv`)  
 **Package Name:** `shopconnect_env`  
-**Current Test Coverage:** 60 Passed / 0 Failed (100% pass rate)
+**Current Test Coverage:** 86 Passed / 0 Failed (100% pass rate)
 **Last Verification Run:** 2026-11-10
 **Master Specification:** [docs/RESEARCH_SPEC.md](RESEARCH_SPEC.md)
 
@@ -114,7 +114,57 @@ Stage 3 established the deterministic safety and transactional coordination laye
 
 ---
 
-## 5. Current Function & Module Catalog
+## 5. Stage 4 Implementation: Comparative Context Strategies (Conditions A, B & C)
+
+Stage 4 implemented three independent, read-only context construction strategies to benchmark how different interaction architectures affect LLM token consumption, latency, and state preservation.
+
+### 5.1 Shared Architecture & Protocol ([`src/shopconnect_env/context/base.py`](../src/shopconnect_env/context/base.py))
+* **`ContextRequest`:** Standardized input dataclass holding `user_request`, `plan`, `catalog`, `ingredients`, optional `basket` (auto-derived if omitted), and optional `target_day` and `target_meal_type`.
+* **`ContextResult`:** Standardized output dataclass returning `condition`, `condition_id`, `system_prompt`, `task_prompt`, `signatures`, `serialized_context`, and `metadata`.
+* **Deterministic Serializers:** Pure functions guaranteeing stable key ordering (`sort_keys=True`), canonical slot sequencing (`serialize_all_21_slots`), and exact string representation for monetary and quantity values (`serialize_decimal`).
+* **Read-Only Invariant:** Context builders operate strictly on deep copies and never mutate authoritative state.
+
+### 5.2 Condition A: Full-State Regeneration ([`src/shopconnect_env/context/full_state.py`](../src/shopconnect_env/context/full_state.py))
+* **Monolithic Baseline:** Exposes the entire application state in a single JSON payload.
+* **Content Serialized:**
+  1. All 7 days and 21 slots in canonical order (Monday breakfast through Sunday dinner), with explicit `status: "unfilled"` representation for unscheduled slots.
+  2. Detailed recipe definitions for all active meals in the plan, including complete ingredient requirements, quantities, units, tags, and costs.
+  3. Complete recipe catalog of all available recipes.
+  4. Full canonical ingredient catalog (all 31 ingredients with standard units and allergen classifications).
+  5. Current derived `GroceryBasket` and `basket_version`.
+  6. `plan_id`, `plan_version`, and full `UserPreferences`.
+* **Interaction Modality:** The agent is instructed to read the entire state and re-emit the complete 7-day schedule. No tools or progressive signatures are provided (`signatures = None`).
+
+### 5.3 Condition B: Conventional Flat Tool-Calling ([`src/shopconnect_env/context/tool_context.py`](../src/shopconnect_env/context/tool_context.py))
+* **Industry Baseline:** Implements standard function-calling schemas (matching OpenAI/Anthropic tool interfaces).
+* **Content Serialized:**
+  1. Flat tool specifications for `replace_meal` and `change_servings`, directly embedding JSON schemas generated from Stage 3 Pydantic models (`ReplaceMealArgs.model_json_schema()` and `ChangeServingsArgs.model_json_schema()`).
+  2. Structured application state snapshot containing currently assigned meals, high-level recipe metadata (names, tags, costs), user preferences, and a grocery basket summary.
+* **Boundaries:** Does not expose raw ingredient tables, granular ingredient requirement breakdowns, or Condition C's progressive inspection methods.
+
+### 5.4 Condition C: Object-Centric Progressive Disclosure ([`src/shopconnect_env/context/object_context.py`](../src/shopconnect_env/context/object_context.py))
+* **Proposed Research Condition:** Exposes compact Python domain class signatures and progressive disclosure rather than monolithic JSON state dumps.
+* **Initial Context:**
+  1. Authoritative domain object stubs: `MealPlan`, `Recipe`, `Ingredient`, and `UserPreferences` with attributes and read-only accessors (`get_meal`, `calculate_total_cost`, `is_complete`).
+  2. Clearly defined mutating operations executed as allowlisted `ActionProposal` submissions to the Stage 3 `ActionBroker` (`replace_meal`, `change_servings`).
+  3. User preferences and constraints (`diet_tags`, `allergies`, `weekly_budget`, `household_size`).
+  4. Target slot summary (e.g. `Wednesday_dinner` current recipe, servings, and cost) if target coordinates are provided.
+  5. Clear usage instructions for on-demand read-only inspection operations.
+* **Progressive Inspection API:**
+  - `inspect_slot(day, meal_type) -> Dict[str, Any]`: Queries meal assigned to a specific schedule slot.
+  - `inspect_recipe(recipe_id) -> Dict[str, Any]`: Queries recipe metadata, tags, servings, and costs.
+  - `inspect_recipe_ingredients(recipe_id) -> Dict[str, Any]`: Queries ingredient requirements for a recipe.
+  - `inspect_ingredient(ingredient_id) -> Dict[str, Any]`: Queries canonical ingredient details and allergen classifications.
+  - `inspect_plan() -> Dict[str, Any]`: Queries active plan metadata, plan_version, and total assigned meal count.
+  - `inspect_preferences() -> Dict[str, Any]`: Queries household dietary constraints, allergy restrictions, and weekly budget.
+  - `inspect(target_type, target_id, day, meal_type) -> Dict[str, Any]`: Unified dispatcher matching `InspectObjectArgs`.
+* **Disclosure Tracking & Audit Log:**
+  - Every successful inspection records `disclosure_id`, `object_type`, `object_id`, `status`, `summary`, and `revealed_fields`.
+  - Exposes `get_disclosure_log()`, `get_disclosure_count()`, and `reset_disclosure_log()` for precise empirical token and disclosure accounting.
+
+---
+
+## 6. Current Function & Module Catalog
 
 | Module | Implemented Class / Function | Signature | Operational Role |
 | :--- | :--- | :--- | :--- |
@@ -137,10 +187,16 @@ Stage 3 established the deterministic safety and transactional coordination laye
 | `validation.schemas` | `ActionResult` | `BaseModel` | Authoritative transaction execution result. |
 | `validation.policy_engine` | `PolicyEngine` | `class` | Deterministic dietary, allergen, budget, and invariant checker. |
 | `validation.broker` | `ActionBroker` | `class` | Transaction staging, atomic commit, and rollback coordinator. |
+| `context.base` | `ContextRequest` | `@dataclass(frozen=True)` | Standardized input payload for context construction. |
+| `context.base` | `ContextResult` | `@dataclass(frozen=True)` | Standardized output payload for context builders. |
+| `context.base` | `serialize_all_21_slots` | `(plan, catalog) -> List[Dict]` | Deterministic 21-slot serialization with unfilled markers. |
+| `context.full_state` | `FullStateContextBuilder` | `BaseContextBuilder` | Monolithic Condition A full-state serialization builder. |
+| `context.tool_context` | `ToolContextBuilder` | `BaseContextBuilder` | Flat Condition B tool-calling schema and snapshot builder. |
+| `context.object_context` | `ObjectContextBuilder` | `BaseContextBuilder` | Compact Condition C progressive disclosure builder & inspector. |
 
 ---
 
-## 6. Verification: Passing Automated Test Suite
+## 7. Verification: Passing Automated Test Suite (86 Tests)
 
 Executed via `.\.venv\Scripts\python.exe -m pytest -v`:
 
@@ -150,93 +206,58 @@ platform win32 -- Python 3.14.7, pytest-9.2.0, pluggy-1.7.0 -- .venv\Scripts\pyt
 rootdir: C:\Users\deepu\OneDrive\Desktop\shopconnect-object-env
 configfile: pytest.ini
 testpaths: tests
-collecting ... collected 53 items
+collected 86 items
 
 tests/test_action_broker.py::test_successful_meal_replacement PASSED     [  1%]
-tests/test_action_broker.py::test_successful_serving_update PASSED       [  3%]
-tests/test_action_broker.py::test_non_target_meals_preserved_on_commit PASSED [  5%]
-tests/test_action_broker.py::test_malformed_proposals_rejected PASSED    [  7%]
-tests/test_action_broker.py::test_unsupported_operations_rejected PASSED [  9%]
-tests/test_action_broker.py::test_dietary_violations_rejected PASSED     [ 11%]
-tests/test_action_broker.py::test_allergen_violations_rejected PASSED    [ 13%]
-tests/test_action_broker.py::test_budget_violations_rejected PASSED      [ 15%]
-tests/test_action_broker.py::test_stale_proposals_rejected PASSED        [ 16%]
-tests/test_action_broker.py::test_recalculation_failure_does_not_partially_commit PASSED [ 18%]
-tests/test_action_broker.py::test_authoritative_state_cannot_be_mutated_via_exposed_snapshots PASSED [ 20%]
-tests/test_domain_models.py::test_ingredient_creation PASSED             [ 22%]
-tests/test_domain_models.py::test_ingredient_requirement_and_scaling PASSED [ 24%]
-tests/test_domain_models.py::test_recipe_cost_per_serving PASSED         [ 26%]
-tests/test_domain_models.py::test_meal_slot_keys_and_validation PASSED   [ 28%]
-tests/test_domain_models.py::test_meal_cost_calculation PASSED           [ 30%]
-tests/test_domain_models.py::test_meal_plan_slot_representation PASSED   [ 32%]
-tests/test_domain_models.py::test_user_preferences_defaults PASSED       [ 33%]
-tests/test_domain_models.py::test_load_catalog_seed PASSED               [ 35%]
-tests/test_domain_models.py::test_derived_grocery_basket_calculation PASSED [ 37%]
-tests/test_operations.py::test_replace_wednesday_dinner PASSED           [ 39%]
-tests/test_operations.py::test_other_slots_remain_unchanged PASSED       [ 41%]
-tests/test_operations.py::test_change_servings PASSED                    [ 43%]
-tests/test_operations.py::test_ingredient_quantity_scaling PASSED        [ 45%]
-tests/test_operations.py::test_aggregating_shared_ingredients PASSED     [ 47%]
-tests/test_operations.py::test_missing_recipe_id_error PASSED            [ 49%]
-tests/test_operations.py::test_unknown_meal_slot_error PASSED            [ 50%]
-tests/test_operations.py::test_invalid_serving_counts PASSED             [ 52%]
-tests/test_operations.py::test_original_plan_unchanged_on_failure PASSED [ 54%]
-tests/test_operations.py::test_recalculate_basket_after_replacement PASSED [ 56%]
-tests/test_policy_engine.py::test_vegetarian_recipe_allowed PASSED       [ 58%]
-tests/test_policy_engine.py::test_non_vegetarian_recipe_rejected PASSED  [ 60%]
-tests/test_policy_engine.py::test_multiple_dietary_constraints PASSED    [ 62%]
-tests/test_policy_engine.py::test_peanut_allergy_rejects_peanut_recipe PASSED [ 64%]
-tests/test_policy_engine.py::test_known_non_matching_allergen_allowed PASSED [ 66%]
-tests/test_policy_engine.py::test_unknown_allergen_metadata_conservatively_rejected PASSED [ 67%]
-tests/test_policy_engine.py::test_budget_compliant_candidate PASSED      [ 69%]
-tests/test_policy_engine.py::test_budget_exceeding_candidate_rejected PASSED [ 71%]
-tests/test_policy_engine.py::test_missing_recipe_reference_in_plan PASSED [ 73%]
-tests/test_policy_engine.py::test_incomplete_plan_cost_semantics_documented PASSED [ 75%]
-tests/test_policy_engine.py::test_invariant_validation_detects_unintended_changes PASSED [ 77%]
-tests/test_validation_schemas.py::test_valid_replace_meal_proposal PASSED [ 79%]
-tests/test_validation_schemas.py::test_valid_change_servings_proposal PASSED [ 81%]
-tests/test_validation_schemas.py::test_malformed_json PASSED             [ 83%]
-tests/test_validation_schemas.py::test_unknown_operation PASSED          [ 84%]
-tests/test_validation_schemas.py::test_missing_required_arguments PASSED [ 86%]
-tests/test_validation_schemas.py::test_unexpected_fields_forbidden PASSED [ 88%]
-tests/test_validation_schemas.py::test_invalid_day_and_meal_type PASSED  [ 90%]
-tests/test_validation_schemas.py::test_zero_and_negative_servings_rejected PASSED [ 92%]
-tests/test_validation_schemas.py::test_float_and_boolean_servings_explicitly_rejected PASSED [ 94%]
-tests/test_validation_schemas.py::test_wrong_argument_schema_for_operation PASSED [ 96%]
-tests/test_validation_schemas.py::test_stale_version_field_parsing PASSED [ 98%]
+...
+tests/test_action_broker.py::test_boolean_and_float_servings_rejected_by_broker PASSED [ 17%]
+tests/test_context_builders.py::test_shared_context_request_auto_derives_basket PASSED [ 18%]
+...
+tests/test_context_builders.py::test_condition_c_cumulative_character_tracking PASSED [ 47%]
+tests/test_domain_models.py::test_ingredient_creation PASSED             [ 48%]
+...
+tests/test_domain_models.py::test_derived_grocery_basket_calculation PASSED [ 58%]
+tests/test_operations.py::test_replace_wednesday_dinner PASSED           [ 59%]
+...
+tests/test_operations.py::test_recalculate_basket_after_replacement PASSED [ 69%]
+tests/test_policy_engine.py::test_vegetarian_recipe_allowed PASSED       [ 70%]
+...
+tests/test_policy_engine.py::test_unknown_allergen_allowed_when_user_has_no_allergies PASSED [ 86%]
+tests/test_validation_schemas.py::test_valid_replace_meal_proposal PASSED [ 87%]
+...
 tests/test_validation_schemas.py::test_inspect_object_args_validation PASSED [100%]
 
-============================= 60 passed in 0.57s ==============================
+============================= 86 passed in 0.55s ==============================
 ```
 
 ---
 
-## 7. Implementation Roadmap & Current Status
+## 8. Implementation Roadmap & Current Status
 
 ```mermaid
 flowchart LR
     S1["Stage 1: Domain Models & Seed Data<br><b>[COMPLETED]</b>"] --> S2["Stage 2: Deterministic Operations<br><b>[COMPLETED]</b>"]
     S2 --> S3["Stage 3: Validation, Policy & Broker<br><b>[COMPLETED]</b>"]
-    S3 --> S4["Stage 4: Comparative Context Builders<br><i>[PENDING APPROVAL]</i>"]
+    S3 --> S4["Stage 4: Comparative Context Builders<br><b>[COMPLETED]</b>"]
     S4 --> S5["Stage 5: Offline Mock Agent & Pipeline<br><i>[PENDING]</i>"]
     S5 --> S6["Stage 6: LLM Adapter & Evaluation Runner<br><i>[PENDING]</i>"]
 ```
 
 | Stage | Focus Area | Status | Implemented / Planned Modules |
 | :--- | :--- | :---: | :--- |
-| **Stage 1** | Core Domain Models & Seed Catalog | **Completed** | `domain/models.py`, `catalog_seed.json` |
-| **Stage 2** | Deterministic Operations & Basket Math | **Completed** | `operations/mutations.py`, `operations/basket_calculator.py` |
-| **Stage 3** | Validation, PolicyEngine & ActionBroker | **Completed** | `validation/schemas.py`, `validation/policy_engine.py`, `validation/broker.py` |
-| **Stage 4** | Comparative Context Strategies (A, B, C) | *Pending Approval* | `context/full_state.py`, `context/tool_context.py`, `context/object_context.py` |
+| **Stage 1** | Core Domain Models & Seed Catalog | **Completed** | `domain/models.py`, `catalog_seed.json` (9 tests) |
+| **Stage 2** | Deterministic Operations & Basket Math | **Completed** | `operations/mutations.py`, `operations/basket_calculator.py` (10 tests) |
+| **Stage 3** | Validation, PolicyEngine & ActionBroker | **Completed** | `validation/schemas.py`, `validation/policy_engine.py`, `validation/broker.py` (41 tests) |
+| **Stage 4** | Comparative Context Strategies (A, B, C) | **Completed** | `context/base.py`, `context/full_state.py`, `context/tool_context.py`, `context/object_context.py` (26 tests) |
 | **Stage 5** | Offline Mock Agent & Test Pipeline | *Pending* | `agents/base.py`, `agents/mock_agent.py`, `tests/test_offline_pipeline.py` |
 | **Stage 6** | Real LLM Adapter, Tasks & Benchmark Runner | *Pending* | `agents/llm_adapter.py`, `evaluation/runner.py`, `results/comparison.csv` |
 
 ---
 
-## 8. Current System Limitations & Scientific Boundaries
+## 9. Current System Limitations & Scientific Boundaries
 
 1. **Synthetic Allergen Metadata Limitation:** Allergen classifications in `data/catalog_seed.json` are synthetic test representations. In real applications, allergen verification requires live manufacturer API feeds and physical product packaging review.
 2. **Cross-Contamination Not Modeled:** Shared production line warnings ("may contain traces of...") are outside the current data model scope.
 3. **Incomplete-Plan Cost Semantics:** If a meal plan has empty slots, `calculate_total_cost()` sums only scheduled meals. The resulting value represents current planned spend, not full weekly household expenditure.
-4. **No LLM Integration Yet:** The system runs fully offline; context serialization (Conditions A, B, C) and LLM adapters will be added in Stages 4 and 5.
+4. **No LLM Integration Yet (Stage 5/6 Scope):** Stage 4 context builders provide deterministic prompt construction and disclosure auditing, but do not make network calls or invoke LLMs. Offline mock agents and live LLM adapters are scheduled for Stages 5 and 6.
 5. **In-Memory Storage:** The runtime state resides in Python process memory.
