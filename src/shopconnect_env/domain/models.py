@@ -60,12 +60,17 @@ class Ingredient:
         name: Human-readable display name (e.g. 'Rolled Oats').
         category: Broad category for organization (e.g. 'Grains', 'Produce', 'Dairy').
         standard_unit: Canonical measurement unit (e.g. 'g', 'ml', 'unit').
+        allergens: Optional tuple of canonical allergen classifications (e.g. ('dairy', 'milk')).
+                   None indicates unknown allergen metadata (treated conservatively).
+                   An empty tuple () indicates explicitly verified allergen-free
+                   among standard monitored classifications.
     """
 
     ingredient_id: str
     name: str
     category: str
     standard_unit: str
+    allergens: Optional[Tuple[str, ...]] = None
 
     def __post_init__(self) -> None:
         if not self.ingredient_id.strip():
@@ -74,6 +79,10 @@ class Ingredient:
             raise ValueError("name cannot be empty.")
         if not self.standard_unit.strip():
             raise ValueError("standard_unit cannot be empty.")
+        if self.allergens is not None:
+            # Normalize to an immutable tuple of stripped lowercase strings
+            normalized = tuple(a.strip().lower() for a in self.allergens)
+            object.__setattr__(self, "allergens", normalized)
 
 
 @dataclass(frozen=True)
@@ -396,11 +405,16 @@ def load_catalog_from_json(
     # 1. Parse Ingredients
     ingredients: Dict[str, Ingredient] = {}
     for ing_data in data.get("ingredients", []):
+        raw_allergens = ing_data.get("allergens")
+        allergens_val = (
+            tuple(raw_allergens) if raw_allergens is not None else None
+        )
         ing = Ingredient(
             ingredient_id=ing_data["ingredient_id"],
             name=ing_data["name"],
             category=ing_data["category"],
             standard_unit=ing_data["standard_unit"],
+            allergens=allergens_val,
         )
         ingredients[ing.ingredient_id] = ing
 

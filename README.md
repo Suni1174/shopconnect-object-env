@@ -2,8 +2,8 @@
 
 A controlled, deterministic Python research testbed designed to investigate whether **persistent domain objects with progressive signature disclosure** outperform conventional LLM interaction paradigms (monolithic full-state regeneration and flat tool-calling agents) in stateful, multi-step meal-planning workflows.
 
-**Project Status:** Active Research Prototype (Stage 2 Complete, Stage 3 Pending)  
-**Verified Local Test Suite:** 19 Passed / 0 Failed (Python 3.14.7, pytest 9.2.0)  
+**Project Status:** Active Research Prototype (Stage 3 Complete, Stage 4 Pending)
+**Verified Local Test Suite:** 60 Passed / 0 Failed (Python 3.14.7, pytest 9.2.0)
 **Documentation:** [Master Research Specification](docs/RESEARCH_SPEC.md) | [Implementation Status Report](docs/IMPLEMENTATION_STATUS.md)
 
 ---
@@ -32,20 +32,20 @@ ShopConnect investigates an alternative architecture: treating Python domain obj
 
 ---
 
-## 2. Current Implementation (Stages 1 & 2)
+## 2. Current Implementation (Stages 1, 2 & 3)
 
-As of the current milestone, the project has completed foundational domain modeling and deterministic operations. All implemented modules run offline with zero external API or LLM dependencies.
+The project has completed foundational domain modeling, deterministic operations, and the complete validation/transaction safety layer. All implemented modules run offline with zero external API or LLM dependencies.
 
 ### Stage 1: Domain Entities & Seed Catalog
 * **Core Models ([`src/shopconnect_env/domain/models.py`](src/shopconnect_env/domain/models.py)):** Implemented pure Python `@dataclass` structures:
-  * `Ingredient`: Immutable frozen dataclass with canonical ID, display name, category, and standard unit.
+  * `Ingredient`: Immutable frozen dataclass with canonical ID, display name, category, standard unit, and allergen classifications.
   * `IngredientRequirement`: Quantity (`Decimal`) and unit specification with a pure `scale(factor)` method.
   * `Recipe`: Recipe blueprint with portion sizes, tags, `estimated_cost` (`Decimal`), and `cost_per_serving`.
   * `Meal`: Scheduled meal slot (`day`, `meal_type`, `recipe_id`, `servings`, `slot_key`, `calculate_cost`).
   * `UserPreferences`: Household constraints (`diet_tags`, `allergies`, `weekly_budget`, `household_size`).
   * `MealPlan`: Authoritative 7-day schedule (21 slots) with monotonic `plan_version` tracking.
   * `GroceryItem` & `GroceryBasket`: Immutable derived projections representing aggregated shopping requirements.
-* **Synthetic Catalog ([`data/catalog_seed.json`](data/catalog_seed.json)):** Curated dataset containing 31 canonical ingredients and 18 realistic recipes with 100% referential integrity verified at parse time.
+* **Synthetic Catalog ([`data/catalog_seed.json`](data/catalog_seed.json)):** Curated dataset containing 31 canonical ingredients with allergen metadata and 18 realistic recipes with 100% referential integrity verified at parse time.
 
 ### Stage 2: Deterministic Operations & Derived Basket Math
 * **State Mutations ([`src/shopconnect_env/operations/mutations.py`](src/shopconnect_env/operations/mutations.py)):**
@@ -54,24 +54,28 @@ As of the current milestone, the project has completed foundational domain model
 * **Derived Basket Engine ([`src/shopconnect_env/operations/basket_calculator.py`](src/shopconnect_env/operations/basket_calculator.py)):**
   * `calculate_grocery_basket(...)`: Deterministically inspects active meals, computes exact scaled requirements via $\text{scale\_factor} = \frac{\text{meal.servings}}{\text{recipe.default\_servings}}$, aggregates shared ingredients across recipes using `Decimal` math, verifies unit consistency, and returns an immutable `GroceryBasket`.
 
+### Stage 3: Validation, Policy Engine & Action Broker
+* **Pydantic Action Schemas ([`src/shopconnect_env/validation/schemas.py`](src/shopconnect_env/validation/schemas.py)):** Strict Pydantic v2 schemas (`ReplaceMealArgs`, `ChangeServingsArgs`, `InspectObjectArgs`, `ActionProposal`, `ActionResult`) rejecting unexpected fields (`extra="forbid"`), validating coordinates, and explicitly disallowing float or boolean servings.
+* **Policy Engine ([`src/shopconnect_env/validation/policy_engine.py`](src/shopconnect_env/validation/policy_engine.py)):** Deterministic validator enforcing dietary compliance, allergen safety with conservative unknown-metadata rejection, weekly budget limits, and non-target slot invariants.
+* **Action Broker ([`src/shopconnect_env/validation/broker.py`](src/shopconnect_env/validation/broker.py)):** Transactional coordinator managing isolated candidate staging, stale-version checks, policy enforcement, derived basket recalculation, and atomic state replacement (`self._state = RuntimeState(...)`).
+
 ### Verified Local Test Results
-The test suite currently contains **19 unit tests** across `tests/test_domain_models.py` (9 tests) and `tests/test_operations.py` (10 tests), all passing cleanly:
-* Exact `Decimal` financial and ingredient quantity calculations.
-* Schedule slot uniqueness and validation.
-* Catalog referential integrity.
-* Preservation of non-target meal slots during replacement.
-* Candidate state isolation (failed operations leave the original plan untouched).
-* Dynamic grocery basket recalculation after meal swaps.
+The test suite currently contains **60 unit tests** passing cleanly:
+* `tests/test_domain_models.py` (9 tests)
+* `tests/test_operations.py` (10 tests)
+* `tests/test_validation_schemas.py` (12 tests)
+* `tests/test_policy_engine.py` (14 tests)
+* `tests/test_action_broker.py` (15 tests)
 
 ---
 
-## 3. Proposed Target Architecture (Stage 3 & Beyond)
+## 3. Proposed Target Architecture (Stages 4–6)
 
-The full ShopConnect research runtime introduces a strict **Trust Boundary** between the untrusted agent and authoritative application state.
+The full ShopConnect research runtime maintains a strict **Trust Boundary** between the untrusted agent and authoritative application state.
 
 ```
 +---------------------------------------------------------------------------------------+
-|                               PROPOSED TRUST BOUNDARY                                 |
+|                                    TRUST BOUNDARY                                     |
 |                                                                                       |
 |   +-----------------------+              ActionProposal             +-------------+   |
 |   |   LLM Agent / Model   | --------------------------------------> |  Pydantic   |   |
@@ -81,7 +85,7 @@ The full ShopConnect research runtime introduces a strict **Trust Boundary** bet
 | ===========================================================================|========= |
 |                                                                            v          |
 |   +-------------------------------------------------------------------------------+   |
-|   |                  Deterministic Application Core (Proposed Stage 3)            |   |
+|   |                Deterministic Application Core (Implemented in Stage 3)        |   |
 |   |                                                                               |   |
 |   |   +-------------------+    +---------------------+    +-------------------+   |   |
 |   |   |   Policy Engine   | -> | Candidate Staging   | -> | Transaction Commit|   |   |
@@ -89,7 +93,7 @@ The full ShopConnect research runtime introduces a strict **Trust Boundary** bet
 |   |   +-------------------+    +---------------------+    +-------------------+   |   |
 |   |                                                                               |   |
 |   |   +-----------------------------------------------------------------------+   |   |
-|   |   |                Persistent State Store (Implemented Stages 1-2)        |   |   |
+|   |   |                Persistent State Store (Implemented in Stages 1-2)     |   |   |
 |   |   |  [MealPlan v(N)]  <-->  [Meals / Recipes]  --->  [Derived Grocery]   |   |   |
 |   |   +-----------------------------------------------------------------------+   |   |
 |   +-------------------------------------------------------------------------------+   |
@@ -99,13 +103,13 @@ The full ShopConnect research runtime introduces a strict **Trust Boundary** bet
 ### Planned Target Request Lifecycle
 1. **Context Construction (Stage 4):** A `ContextBuilder` formats the prompt under Condition A (full state), Condition B (flat tools), or Condition C (progressive signature disclosure).
 2. **Action Proposal (Stage 5):** The model emits a structured JSON action payload.
-3. **Pydantic Validation (Stage 3):** Untrusted JSON is parsed against strict typed schemas (`ReplaceMealArgs`, `ActionProposal`).
-4. **Policy Precondition Check (Stage 3):** The `PolicyEngine` checks dietary tags and budget ceilings.
-5. **Candidate Staging (Stage 3):** The `ActionBroker` stages the change on a cloned `MealPlan`.
+3. **Pydantic Validation (Implemented in Stage 3):** Untrusted JSON is parsed against strict typed schemas.
+4. **Policy Precondition Check (Implemented in Stage 3):** The `PolicyEngine` checks dietary tags and budget ceilings.
+5. **Candidate Staging (Implemented in Stage 3):** The `ActionBroker` stages the change on a cloned `MealPlan`.
 6. **Deterministic Execution (Implemented in Stage 2):** Allowlisted functions (`apply_replace_meal`) mutate the candidate.
 7. **Pure Recalculation (Implemented in Stage 2):** `calculate_grocery_basket` re-derives the shopping list.
-8. **Invariant Verification (Stage 3):** Postcondition checks assert that non-target slots were not mutated.
-9. **Atomic Commit or Rollback (Stage 3):** Valid proposals commit with an incremented version; failures revert with zero state mutation.
+8. **Invariant Verification (Implemented in Stage 3):** Postcondition checks assert that non-target slots were not mutated.
+9. **Atomic Commit or Rollback (Implemented in Stage 3):** Valid proposals commit with an incremented version; failures revert with zero state mutation.
 
 ---
 
@@ -121,7 +125,7 @@ shopconnect-object-env/
 ├── README.md                          # Project overview and reproduction guide (this file)
 │
 ├── data/
-│   └── catalog_seed.json              # [Implemented] 31 ingredients and 18 recipes
+│   └── catalog_seed.json              # [Implemented] 31 ingredients and 18 recipes with allergens
 │
 ├── docs/
 │   ├── RESEARCH_SPEC.md               # [Implemented] Master architectural blueprint
@@ -140,8 +144,11 @@ shopconnect-object-env/
 │       │   ├── mutations.py           # apply_replace_meal, apply_change_servings
 │       │   └── basket_calculator.py   # calculate_grocery_basket
 │       │
-│       ├── validation/                # [Stage 3 - Directory Present, Modules Planned]
-│       │   └── (planned: schemas.py, policy_engine.py, broker.py)
+│       ├── validation/                # [Stage 3 - Implemented]
+│       │   ├── __init__.py            # Validation exports
+│       │   ├── schemas.py             # ActionProposal, ReplaceMealArgs, ActionResult
+│       │   ├── policy_engine.py       # Dietary, allergen, budget, invariant verifier
+│       │   └── broker.py              # ActionBroker transaction coordinator
 │       │
 │       ├── context/                   # [Stage 4 - Directory Present, Modules Planned]
 │       │   └── (planned: full_state.py, tool_context.py, object_context.py)
@@ -154,13 +161,13 @@ shopconnect-object-env/
 │
 ├── tests/
 │   ├── test_domain_models.py          # [Stage 1 - Implemented] 9 passing unit tests
-│   └── test_operations.py             # [Stage 2 - Implemented] 10 passing unit tests
+│   ├── test_operations.py             # [Stage 2 - Implemented] 10 passing unit tests
+│   ├── test_validation_schemas.py     # [Stage 3 - Implemented] 12 passing unit tests
+│   ├── test_policy_engine.py          # [Stage 3 - Implemented] 11 passing unit tests
+│   └── test_action_broker.py          # [Stage 3 - Implemented] 11 passing unit tests
 │
 └── results/                           # [Directory Present] Reserved for benchmark execution traces
 ```
-
-> [!NOTE]
-> Git does not track completely empty directories. In a fresh clone, empty stage directories (`validation/`, `context/`, `agents/`, `evaluation/`, `results/`) will be populated as their respective modules are committed.
 
 ---
 
@@ -214,29 +221,19 @@ platform win32 -- Python 3.14.7, pytest-9.2.0, pluggy-1.7.0 -- .venv\Scripts\pyt
 rootdir: <cloned-repo-path>
 configfile: pytest.ini
 testpaths: tests
-collecting ... collected 19 items
+collecting ... collected 60 items
 
-tests/test_domain_models.py::test_ingredient_creation PASSED             [  5%]
-tests/test_domain_models.py::test_ingredient_requirement_and_scaling PASSED [ 10%]
-tests/test_domain_models.py::test_recipe_cost_per_serving PASSED         [ 15%]
-tests/test_domain_models.py::test_meal_slot_keys_and_validation PASSED   [ 21%]
-tests/test_domain_models.py::test_meal_cost_calculation PASSED           [ 26%]
-tests/test_domain_models.py::test_meal_plan_slot_representation PASSED   [ 31%]
-tests/test_domain_models.py::test_user_preferences_defaults PASSED       [ 36%]
-tests/test_domain_models.py::test_load_catalog_seed PASSED               [ 42%]
-tests/test_domain_models.py::test_derived_grocery_basket_calculation PASSED [ 47%]
-tests/test_operations.py::test_replace_wednesday_dinner PASSED           [ 52%]
-tests/test_operations.py::test_other_slots_remain_unchanged PASSED       [ 57%]
-tests/test_operations.py::test_change_servings PASSED                    [ 63%]
-tests/test_operations.py::test_ingredient_quantity_scaling PASSED        [ 68%]
-tests/test_operations.py::test_aggregating_shared_ingredients PASSED     [ 73%]
-tests/test_operations.py::test_missing_recipe_id_error PASSED            [ 78%]
-tests/test_operations.py::test_unknown_meal_slot_error PASSED            [ 84%]
-tests/test_operations.py::test_invalid_serving_counts PASSED             [ 89%]
-tests/test_operations.py::test_original_plan_unchanged_on_failure PASSED [ 94%]
-tests/test_operations.py::test_recalculate_basket_after_replacement PASSED [100%]
+tests/test_action_broker.py::test_successful_meal_replacement PASSED     [  1%]
+...
+tests/test_domain_models.py::test_derived_grocery_basket_calculation PASSED [ 32%]
+...
+tests/test_operations.py::test_recalculate_basket_after_replacement PASSED [ 48%]
+...
+tests/test_policy_engine.py::test_invariant_validation_detects_unintended_changes PASSED [ 72%]
+...
+tests/test_validation_schemas.py::test_inspect_object_args_validation PASSED [100%]
 
-============================= 19 passed in 0.10s ==============================
+============================= 60 passed in 0.57s ==============================
 ```
 
 ---
@@ -247,8 +244,8 @@ tests/test_operations.py::test_recalculate_basket_after_replacement PASSED [100%
 | :--- | :--- | :---: | :--- |
 | **Stage 1** | Core Domain Models & Seed Data | **Completed** | `domain/models.py`, `catalog_seed.json` (9 passing tests). |
 | **Stage 2** | Deterministic Operations & Basket Math | **Completed** | `operations/mutations.py`, `operations/basket_calculator.py` (10 passing tests). |
-| **Stage 3** | Validation, PolicyEngine & ActionBroker | *Pending Approval* | Pydantic action schemas, candidate staging, and atomic commit/rollback. |
-| **Stage 4** | Comparative Context Strategies (A, B, C) | *Pending* | Full-state serializer, tool context, progressive signature stubs. |
+| **Stage 3** | Validation, PolicyEngine & ActionBroker | **Completed** | Pydantic action schemas, candidate staging, and atomic commit/rollback (41 passing tests). |
+| **Stage 4** | Comparative Context Strategies (A, B, C) | *Pending Approval* | Full-state serializer, tool context, progressive signature stubs. |
 | **Stage 5** | Mock Agent & Offline Test Pipeline | *Pending* | Deterministic mock agent, zero-cost offline test harness. |
 | **Stage 6** | Real LLM Adapter, Tasks & Benchmark Runner | *Pending* | Live model adapter, 25 frozen tasks, `results/comparison.csv`. |
 

@@ -1,190 +1,222 @@
 {
+  "_disclaimer": "This synthetic catalog contains offline research annotations and is NOT a substitute for product-label verification or manufacturer allergen declarations. Facility cross-contamination and shared production lines are not modeled.",
   "ingredients": [
     {
       "ingredient_id": "ing_spinach",
       "name": "Baby Spinach",
       "category": "Produce",
-      "standard_unit": "g"
+      "standard_unit": "g",
+      "allergens": []
     },
     {
       "ingredient_id": "ing_onion",
       "name": "Yellow Onion",
       "category": "Produce",
-      "standard_unit": "unit"
+      "standard_unit": "unit",
+      "allergens": []
     },
     {
       "ingredient_id": "ing_garlic",
       "name": "Garlic Clove",
       "category": "Produce",
-      "standard_unit": "unit"
+      "standard_unit": "unit",
+      "allergens": []
     },
     {
       "ingredient_id": "ing_bell_pepper",
       "name": "Bell Pepper",
       "category": "Produce",
-      "standard_unit": "unit"
+      "standard_unit": "unit",
+      "allergens": []
     },
     {
       "ingredient_id": "ing_carrot",
       "name": "Carrot",
       "category": "Produce",
-      "standard_unit": "unit"
+      "standard_unit": "unit",
+      "allergens": []
     },
     {
       "ingredient_id": "ing_broccoli",
       "name": "Broccoli Florets",
       "category": "Produce",
-      "standard_unit": "g"
+      "standard_unit": "g",
+      "allergens": []
     },
     {
       "ingredient_id": "ing_banana",
       "name": "Banana",
       "category": "Produce",
-      "standard_unit": "unit"
+      "standard_unit": "unit",
+      "allergens": []
     },
     {
       "ingredient_id": "ing_berries",
       "name": "Mixed Berries",
       "category": "Produce",
-      "standard_unit": "g"
+      "standard_unit": "g",
+      "allergens": []
     },
     {
       "ingredient_id": "ing_avocado",
       "name": "Avocado",
       "category": "Produce",
-      "standard_unit": "unit"
+      "standard_unit": "unit",
+      "allergens": []
     },
     {
       "ingredient_id": "ing_cherry_tomatoes",
       "name": "Cherry Tomatoes",
       "category": "Produce",
-      "standard_unit": "g"
+      "standard_unit": "g",
+      "allergens": []
     },
     {
       "ingredient_id": "ing_rolled_oats",
       "name": "Rolled Oats",
       "category": "Grains",
-      "standard_unit": "g"
+      "standard_unit": "g",
+      "allergens": ["gluten"]
     },
     {
       "ingredient_id": "ing_brown_rice",
       "name": "Brown Rice",
       "category": "Grains",
-      "standard_unit": "g"
+      "standard_unit": "g",
+      "allergens": []
     },
     {
       "ingredient_id": "ing_quinoa",
       "name": "Quinoa",
       "category": "Grains",
-      "standard_unit": "g"
+      "standard_unit": "g",
+      "allergens": []
     },
     {
       "ingredient_id": "ing_whole_wheat_bread",
       "name": "Whole Wheat Bread",
       "category": "Bakery",
-      "standard_unit": "slice"
+      "standard_unit": "slice",
+      "allergens": ["wheat", "gluten"]
     },
     {
       "ingredient_id": "ing_whole_wheat_pasta",
       "name": "Whole Wheat Pasta",
       "category": "Grains",
-      "standard_unit": "g"
+      "standard_unit": "g",
+      "allergens": ["wheat", "gluten"]
     },
     {
       "ingredient_id": "ing_canned_chickpeas",
       "name": "Canned Chickpeas",
       "category": "Canned Goods",
-      "standard_unit": "g"
+      "standard_unit": "g",
+      "allergens": []
     },
     {
       "ingredient_id": "ing_canned_black_beans",
       "name": "Canned Black Beans",
       "category": "Canned Goods",
-      "standard_unit": "g"
+      "standard_unit": "g",
+      "allergens": []
     },
     {
       "ingredient_id": "ing_red_lentils",
       "name": "Dry Red Lentils",
       "category": "Legumes",
-      "standard_unit": "g"
+      "standard_unit": "g",
+      "allergens": []
     },
     {
       "ingredient_id": "ing_canned_tomatoes",
       "name": "Canned Diced Tomatoes",
       "category": "Canned Goods",
-      "standard_unit": "g"
+      "standard_unit": "g",
+      "allergens": []
     },
     {
       "ingredient_id": "ing_eggs",
       "name": "Large Eggs",
       "category": "Dairy & Eggs",
-      "standard_unit": "unit"
+      "standard_unit": "unit",
+      "allergens": ["eggs"]
     },
     {
       "ingredient_id": "ing_firm_tofu",
       "name": "Firm Tofu",
       "category": "Plant-Based Protein",
-      "standard_unit": "g"
+      "standard_unit": "g",
+      "allergens": ["soy"]
     },
     {
       "ingredient_id": "ing_chicken_breast",
       "name": "Chicken Breast Fillet",
       "category": "Meat",
-      "standard_unit": "g"
+      "standard_unit": "g",
+      "allergens": []
     },
     {
       "ingredient_id": "ing_salmon_fillet",
       "name": "Fresh Salmon Fillet",
       "category": "Seafood",
-      "standard_unit": "g"
+      "standard_unit": "g",
+      "allergens": ["fish"]
     },
     {
       "ingredient_id": "ing_greek_yogurt",
       "name": "Plain Greek Yogurt",
       "category": "Dairy & Eggs",
-      "standard_unit": "g"
+      "standard_unit": "g",
+      "allergens": ["dairy", "milk"]
     },
     {
       "ingredient_id": "ing_olive_oil",
       "name": "Extra Virgin Olive Oil",
       "category": "Oils & Vinegars",
-      "standard_unit": "ml"
+      "standard_unit": "ml",
+      "allergens": []
     },
     {
       "ingredient_id": "ing_soy_sauce",
       "name": "Low Sodium Soy Sauce",
       "category": "Condiments",
-      "standard_unit": "ml"
+      "standard_unit": "ml",
+      "allergens": ["soy", "wheat", "gluten"]
     },
     {
       "ingredient_id": "ing_almond_milk",
       "name": "Unsweetened Almond Milk",
       "category": "Dairy Alternatives",
-      "standard_unit": "ml"
+      "standard_unit": "ml",
+      "allergens": ["tree_nuts"]
     },
     {
       "ingredient_id": "ing_chia_seeds",
       "name": "Chia Seeds",
       "category": "Seeds",
-      "standard_unit": "g"
+      "standard_unit": "g",
+      "allergens": []
     },
     {
       "ingredient_id": "ing_vegetable_broth",
       "name": "Vegetable Broth",
       "category": "Soups & Broths",
-      "standard_unit": "ml"
+      "standard_unit": "ml",
+      "allergens": []
     },
     {
       "ingredient_id": "ing_peanut_butter",
       "name": "Creamy Peanut Butter",
       "category": "Nut Butters",
-      "standard_unit": "g"
+      "standard_unit": "g",
+      "allergens": ["peanuts"]
     },
     {
       "ingredient_id": "ing_parmesan_cheese",
       "name": "Grated Parmesan Cheese",
       "category": "Dairy & Eggs",
-      "standard_unit": "g"
+      "standard_unit": "g",
+      "allergens": ["dairy", "milk"]
     }
   ],
   "recipes": [
