@@ -2,7 +2,7 @@
 
 **Environment Runtime:** Python 3.14.7 (`.venv`)  
 **Package Name:** `shopconnect_env`  
-**Current Test Coverage:** 86 Passed / 0 Failed (100% pass rate)
+**Current Test Coverage:** 105 Passed / 0 Failed (100% pass rate)
 **Last Verification Run:** 2026-11-10
 **Master Specification:** [docs/RESEARCH_SPEC.md](RESEARCH_SPEC.md)
 
@@ -164,7 +164,38 @@ Stage 4 implemented three independent, read-only context construction strategies
 
 ---
 
-## 6. Current Function & Module Catalog
+## 6. Stage 5 Implementation: Offline MockAgent & Common Agent Interface
+
+Stage 5 implemented the offline agent layer, establishing the common interface protocol for both offline deterministic agents and future live LLM adapters.
+
+### 6.1 Agent Contracts & Protocols ([`src/shopconnect_env/agents/base.py`](../src/shopconnect_env/agents/base.py))
+
+* **`ObjectInspector` (`Protocol`):** Narrow, read-only interface (`inspect_slot`, `inspect_recipe`, `inspect_recipe_ingredients`, `inspect_ingredient`, `inspect_plan`, `inspect_preferences`, `inspect`) natively satisfied by `ObjectContextBuilder`. In Condition C, the exact builder instance that built the context is passed as the inspector, guaranteeing that progressive disclosures are audited in the builder's log.
+* **`AgentResponse` (`@dataclass(frozen=True)`):** Standardized response container returning `proposal` (`Optional[ActionProposal]`), brief `rationale`, deterministic `raw_output` (serialized JSON of proposal), `inspection_calls_made` counter, and `metadata`.
+* **`BaseAgent` (`ABC`):** Abstract protocol defining `propose_action(context: ContextResult, inspector: Optional[ObjectInspector] = None) -> AgentResponse`. The task is derived strictly from `context.task_prompt`.
+
+### 6.2 Deterministic MockAgent ([`src/shopconnect_env/agents/mock_agent.py`](../src/shopconnect_env/agents/mock_agent.py))
+
+* **Strict Version Safety:** `_extract_plan_version` validates that `plan_version` in `context.serialized_context` is a strictly positive integer. Safely rejects missing, boolean, float, string, zero, or negative versions (`has_proposal = False`).
+* **Deterministic Command Grammar:**
+  * `replace <day> <slot> with <recipe_id>` (with optional servings).
+  * `change servings for <day> <slot> to <N>`.
+  * `replace <day> <slot> with <tag> recipe`: For Conditions A & B, filters recipes by both dietary tag and meal slot category, sorting alphabetically by `recipe_id` as a deterministic tie-breaker (e.g. vegetarian Tuesday lunch resolves to `rec_black_bean_quinoa_bowl`). For Condition C, requires an exact recipe ID or canned fixture (preserving the rule that Condition C context exposes no raw catalog search).
+* **Semantic Rejection Fixtures:**
+  * `TEST_NONEXISTENT_RECIPE`: Valid `ReplaceMealArgs` with unknown `rec_nonexistent`; rejected at broker staging.
+  * `TEST_ALLERGEN_CONFLICT`: Proposes `rec_peanut_butter_banana_toast` in a breakfast slot for a household with peanut allergies; rejected specifically by `PolicyEngine`.
+  * `TEST_BUDGET_OVERFLOW`: Proposes `rec_pan_seared_salmon` ($14.50) against a controlled $10.00 weekly budget; rejected specifically by `PolicyEngine` budget check.
+  * `TEST_STALE_VERSION`: Sets `expected_plan_version = plan_version + 999`; intercepted and rejected at broker Step 3.
+* **Canned Task Fixtures:** Supports registering arbitrary custom task mappings.
+* **Unsupported Task Protection:** Unrecognized commands return `has_proposal = False` with zero broker invocation and zero state mutation.
+
+### 6.3 Scientific Scope & Boundary Note
+
+Stage 5 serves as an offline integration and compatibility harness across all three context builders. Condition A context currently instructs full-state text regeneration, whereas Stage 5's common `ActionProposal` interface tests single targeted operations. Faithful full-state regeneration parsing and comparative drift evaluation are explicitly deferred to Stage 6.
+
+---
+
+## 7. Current Function & Module Catalog
 
 | Module | Implemented Class / Function | Signature | Operational Role |
 | :--- | :--- | :--- | :--- |
@@ -193,10 +224,14 @@ Stage 4 implemented three independent, read-only context construction strategies
 | `context.full_state` | `FullStateContextBuilder` | `BaseContextBuilder` | Monolithic Condition A full-state serialization builder. |
 | `context.tool_context` | `ToolContextBuilder` | `BaseContextBuilder` | Flat Condition B tool-calling schema and snapshot builder. |
 | `context.object_context` | `ObjectContextBuilder` | `BaseContextBuilder` | Compact Condition C progressive disclosure builder & inspector. |
+| `agents.base` | `ObjectInspector` | `Protocol` | Narrow read-only inspection protocol for Condition C. |
+| `agents.base` | `AgentResponse` | `@dataclass(frozen=True)` | Standardized agent response container with proposal and metadata. |
+| `agents.base` | `BaseAgent` | `ABC` | Abstract agent protocol defining `propose_action(context, inspector)`. |
+| `agents.mock_agent` | `MockAgent` | `BaseAgent` | Deterministic offline agent with grammar, version checks, and fixtures. |
 
 ---
 
-## 7. Verification: Passing Automated Test Suite (86 Tests)
+## 8. Verification: Passing Automated Test Suite (105 Tests)
 
 Executed via `.\.venv\Scripts\python.exe -m pytest -v`:
 
@@ -206,40 +241,29 @@ platform win32 -- Python 3.14.7, pytest-9.2.0, pluggy-1.7.0 -- .venv\Scripts\pyt
 rootdir: C:\Users\deepu\OneDrive\Desktop\shopconnect-object-env
 configfile: pytest.ini
 testpaths: tests
-collected 86 items
+collected 105 items
 
-tests/test_action_broker.py::test_successful_meal_replacement PASSED     [  1%]
-...
-tests/test_action_broker.py::test_boolean_and_float_servings_rejected_by_broker PASSED [ 17%]
-tests/test_context_builders.py::test_shared_context_request_auto_derives_basket PASSED [ 18%]
-...
-tests/test_context_builders.py::test_condition_c_cumulative_character_tracking PASSED [ 47%]
-tests/test_domain_models.py::test_ingredient_creation PASSED             [ 48%]
-...
-tests/test_domain_models.py::test_derived_grocery_basket_calculation PASSED [ 58%]
-tests/test_operations.py::test_replace_wednesday_dinner PASSED           [ 59%]
-...
-tests/test_operations.py::test_recalculate_basket_after_replacement PASSED [ 69%]
-tests/test_policy_engine.py::test_vegetarian_recipe_allowed PASSED       [ 70%]
-...
-tests/test_policy_engine.py::test_unknown_allergen_allowed_when_user_has_no_allergies PASSED [ 86%]
-tests/test_validation_schemas.py::test_valid_replace_meal_proposal PASSED [ 87%]
-...
-tests/test_validation_schemas.py::test_inspect_object_args_validation PASSED [100%]
+tests/test_action_broker.py (15 tests) ...............                   [ 14%]
+tests/test_context_builders.py (26 tests) ..........................     [ 39%]
+tests/test_domain_models.py (9 tests) .........                          [ 48%]
+tests/test_offline_pipeline.py (19 tests) ...................            [ 66%]
+tests/test_operations.py (10 tests) ..........                           [ 75%]
+tests/test_policy_engine.py (14 tests) ..............                    [ 88%]
+tests/test_validation_schemas.py (12 tests) ............                [100%]
 
-============================= 86 passed in 0.55s ==============================
+============================= 105 passed in 0.88s =============================
 ```
 
 ---
 
-## 8. Implementation Roadmap & Current Status
+## 9. Implementation Roadmap & Current Status
 
 ```mermaid
 flowchart LR
     S1["Stage 1: Domain Models & Seed Data<br><b>[COMPLETED]</b>"] --> S2["Stage 2: Deterministic Operations<br><b>[COMPLETED]</b>"]
     S2 --> S3["Stage 3: Validation, Policy & Broker<br><b>[COMPLETED]</b>"]
     S3 --> S4["Stage 4: Comparative Context Builders<br><b>[COMPLETED]</b>"]
-    S4 --> S5["Stage 5: Offline Mock Agent & Pipeline<br><i>[PENDING]</i>"]
+    S4 --> S5["Stage 5: Offline Mock Agent & Pipeline<br><b>[COMPLETED]</b>"]
     S5 --> S6["Stage 6: LLM Adapter & Evaluation Runner<br><i>[PENDING]</i>"]
 ```
 
@@ -249,15 +273,15 @@ flowchart LR
 | **Stage 2** | Deterministic Operations & Basket Math | **Completed** | `operations/mutations.py`, `operations/basket_calculator.py` (10 tests) |
 | **Stage 3** | Validation, PolicyEngine & ActionBroker | **Completed** | `validation/schemas.py`, `validation/policy_engine.py`, `validation/broker.py` (41 tests) |
 | **Stage 4** | Comparative Context Strategies (A, B, C) | **Completed** | `context/base.py`, `context/full_state.py`, `context/tool_context.py`, `context/object_context.py` (26 tests) |
-| **Stage 5** | Offline Mock Agent & Test Pipeline | *Pending* | `agents/base.py`, `agents/mock_agent.py`, `tests/test_offline_pipeline.py` |
+| **Stage 5** | Offline Mock Agent & Test Pipeline | **Completed** | `agents/base.py`, `agents/mock_agent.py`, `tests/test_offline_pipeline.py` (19 tests) |
 | **Stage 6** | Real LLM Adapter, Tasks & Benchmark Runner | *Pending* | `agents/llm_adapter.py`, `evaluation/runner.py`, `results/comparison.csv` |
 
 ---
 
-## 9. Current System Limitations & Scientific Boundaries
+## 10. Current System Limitations & Scientific Boundaries
 
 1. **Synthetic Allergen Metadata Limitation:** Allergen classifications in `data/catalog_seed.json` are synthetic test representations. In real applications, allergen verification requires live manufacturer API feeds and physical product packaging review.
 2. **Cross-Contamination Not Modeled:** Shared production line warnings ("may contain traces of...") are outside the current data model scope.
 3. **Incomplete-Plan Cost Semantics:** If a meal plan has empty slots, `calculate_total_cost()` sums only scheduled meals. The resulting value represents current planned spend, not full weekly household expenditure.
-4. **No LLM Integration Yet (Stage 5/6 Scope):** Stage 4 context builders provide deterministic prompt construction and disclosure auditing, but do not make network calls or invoke LLMs. Offline mock agents and live LLM adapters are scheduled for Stages 5 and 6.
+4. **Offline Integration Scope (Stage 5 Boundary):** Stage 5 context builders and the mock agent verify unified data flow and schema compatibility, but do not invoke real LLMs or parse raw full-text regenerations. Live LLM adapters, benchmark tasks, and comparative drift analysis are scheduled for Stage 6.
 5. **In-Memory Storage:** The runtime state resides in Python process memory.

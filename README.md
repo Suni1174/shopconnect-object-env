@@ -2,8 +2,8 @@
 
 A controlled, deterministic Python research testbed designed to investigate whether **persistent domain objects with progressive signature disclosure** outperform conventional LLM interaction paradigms (monolithic full-state regeneration and flat tool-calling agents) in stateful, multi-step meal-planning workflows.
 
-**Project Status:** Active Research Prototype (Stage 4 Complete, Stage 5 Pending)
-**Verified Local Test Suite:** 86 Passed / 0 Failed (Python 3.14.7, pytest 9.2.0)
+**Project Status:** Active Research Prototype (Stage 5 Complete, Stage 6 Pending)
+**Verified Local Test Suite:** 105 Passed / 0 Failed (Python 3.14.7, pytest 9.2.0)
 **Documentation:** [Master Research Specification](docs/RESEARCH_SPEC.md) | [Implementation Status Report](docs/IMPLEMENTATION_STATUS.md)
 
 ---
@@ -32,9 +32,9 @@ ShopConnect investigates an alternative architecture: treating Python domain obj
 
 ---
 
-## 2. Current Implementation (Stages 1, 2, 3 & 4)
+## 2. Current Implementation (Stages 1, 2, 3, 4 & 5)
 
-The project has completed foundational domain modeling, deterministic operations, the complete validation/transaction safety layer, and comparative context builders. All implemented modules run offline with zero external API or LLM dependencies.
+The project has completed foundational domain modeling, deterministic operations, the complete validation/transaction safety layer, comparative context builders, and the offline agent pipeline. All implemented modules run offline with zero external API or LLM dependencies.
 
 ### Stage 1: Domain Entities & Seed Catalog
 * **Core Models ([`src/shopconnect_env/domain/models.py`](src/shopconnect_env/domain/models.py)):** Implemented pure Python `@dataclass` structures:
@@ -65,14 +65,29 @@ The project has completed foundational domain modeling, deterministic operations
 * **Condition B: Conventional Tool Agent ([`src/shopconnect_env/context/tool_context.py`](src/shopconnect_env/context/tool_context.py)):** Flat tool-calling baseline exposing function specifications for `replace_meal` and `change_servings` directly derived from Stage 3 Pydantic schemas, accompanied by a clean schedule and recipe summary snapshot.
 * **Condition C: Object-Centric Progressive Disclosure ([`src/shopconnect_env/context/object_context.py`](src/shopconnect_env/context/object_context.py)):** Compact class signatures (`MealPlan`, `Recipe`, `Ingredient`, `UserPreferences`), user constraints, and optional target slot summary, paired with on-demand read-only inspection methods (`inspect_slot`, `inspect_recipe`, `inspect_recipe_ingredients`, `inspect_ingredient`, `inspect_plan`, `inspect_preferences`), clearly separated allowlisted ActionBroker proposals (`replace_meal`, `change_servings`), and complete disclosure audit logging.
 
+### Stage 5: Offline MockAgent & Common Agent Interface
+* **Agent Interface & Protocol ([`src/shopconnect_env/agents/base.py`](src/shopconnect_env/agents/base.py)):**
+  * `ObjectInspector`: Narrow read-only `Protocol` defining selective query methods (`inspect_slot`, `inspect_recipe`, `inspect_recipe_ingredients`, `inspect_ingredient`, `inspect_plan`, `inspect_preferences`, `inspect`) natively satisfied by `ObjectContextBuilder`.
+  * `AgentResponse`: Standardized frozen container holding the optional `ActionProposal`, rationale, deterministic raw output, inspection call count, and metadata.
+  * `BaseAgent`: Abstract base class defining `propose_action(context, inspector=None) -> AgentResponse`, using `context.task_prompt` as the authoritative task carrier.
+* **Deterministic MockAgent ([`src/shopconnect_env/agents/mock_agent.py`](src/shopconnect_env/agents/mock_agent.py)):**
+  * Strict plan-version extraction and validation from `context.serialized_context`, safely rejecting missing, boolean, float, string, or non-positive values.
+  * Deterministic command grammar for meal replacement (`replace <day> <slot> with <recipe_id>`) and portion scaling (`change servings for <day> <slot> to <N>`).
+  * Tag + meal-slot category filtering for Conditions A & B with alphabetical tie-breaking by `recipe_id` (e.g. vegetarian Tuesday lunch resolves to `rec_black_bean_quinoa_bowl`).
+  * Condition C progressive inspection of exact recipe IDs via `ObjectInspector`, recording disclosure in the bound builder instance.
+  * Explicit semantic test fixtures (`TEST_NONEXISTENT_RECIPE`, `TEST_ALLERGEN_CONFLICT`, `TEST_BUDGET_OVERFLOW`, `TEST_STALE_VERSION`).
+  * Safe handling of unsupported tasks (`has_proposal = False`) preventing accidental broker invocation.
+* **Experimental Scope Note:** Stage 5 serves as an offline integration and compatibility testbed across all three context builders. Full-state text regeneration output parsing and comparative benchmark evaluations against real LLMs are reserved for Stage 6.
+
 ### Verified Local Test Results
-The test suite currently contains **86 unit tests** passing cleanly:
+The test suite currently contains **105 unit tests** passing cleanly:
 * `tests/test_domain_models.py` (9 tests)
 * `tests/test_operations.py` (10 tests)
 * `tests/test_validation_schemas.py` (12 tests)
 * `tests/test_policy_engine.py` (14 tests)
 * `tests/test_action_broker.py` (15 tests)
 * `tests/test_context_builders.py` (26 tests)
+* `tests/test_offline_pipeline.py` (19 tests)
 
 ---
 
