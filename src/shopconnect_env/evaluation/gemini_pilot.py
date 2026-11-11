@@ -29,7 +29,7 @@ import os
 from pathlib import Path
 import sys
 import time
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 # Ensure src/ is in sys.path for direct CLI script execution
 _src_root = str(Path(__file__).resolve().parent.parent.parent)
@@ -79,34 +79,128 @@ PILOT_TASK_IDS: Tuple[str, ...] = (
 PILOT_CONDITIONS: Tuple[str, ...] = ("A", "B", "C")
 
 MAX_PILOT_RUNS: int = 9  # 3 tasks * 3 conditions
-MAX_REQUESTS_PER_CONDITION_C: int = 6
-MAX_TOTAL_PROVIDER_REQUESTS: int = 24  # Strict pilot ceiling: 3 (Cond A) + 3 (Cond B) + 18 (Cond C max)
+PILOT_TASKS_COUNT: int = len(PILOT_TASK_IDS)  # 3
+
+# Per-condition request budgets for Gemini pilot
+MAX_REQUESTS_PER_CONDITION_A: int = 1
+MAX_REQUESTS_PER_CONDITION_B: int = 1
+MAX_REQUESTS_PER_CONDITION_C: int = 4  # Gemini-pilot-specific maximum of 4 model requests per Condition C task
+MAX_INSPECTIONS_PER_CONDITION_C: int = 5  # Preserved maximum of 5 actual inspections, bounded by smaller request budget
+
+# Maximum possible total requests: 3 tasks × (1 A + 1 B + 4 C) = 18 requests
+MAX_THEORETICAL_TOTAL_REQUESTS: int = PILOT_TASKS_COUNT * (
+    MAX_REQUESTS_PER_CONDITION_A + MAX_REQUESTS_PER_CONDITION_B + MAX_REQUESTS_PER_CONDITION_C
+)
+
+# Global hard ceiling adapted to Google AI Studio free-tier quotas (RPD=20, 2-request safety margin)
+MAX_TOTAL_PROVIDER_REQUESTS: int = 20
+GLOBAL_REQUEST_CEILING: int = MAX_TOTAL_PROVIDER_REQUESTS
 DEFAULT_OUTPUT_TOKEN_CEILING: int = 2048
 PILOT_MODEL: str = "gemini-3.8-flash"
 PILOT_TAG: str = "REAL_API_PILOT (GEMINI) — LIMITED_SAMPLE — NOT_FULL_EXPERIMENT"
 
+# Google AI Studio Free-Tier Quotas & Safe Rate Limiting Target
+QUOTA_RPM_LIMIT: int = 5
+QUOTA_TPM_LIMIT: int = 250_000
+QUOTA_RPD_LIMIT: int = 20
+CONFIGURED_SAFE_TARGET_RPM: int = 3
+MIN_REQUEST_INTERVAL_SECONDS: float = 20.0  # 60s / 3 = 20.0s minimum interval between request starts
+
 
 # =============================================================================
-# 2. PILOT REQUEST GUARDRAIL PROVIDER
+# 2. SEQUENTIAL RATE LIMITER
+# =============================================================================
+
+class SequentialRateLimiter:
+    """Enforces a safe sequential interval between provider requests.
+
+    Guarantees:
+    - Maintains at least min_interval_seconds (default 20.0s for 3 RPM target)
+      between consecutive request starts to respect the 5 RPM free-tier quota.
+    - Uses monotonic timing via clock callable (defaults to time.monotonic).
+    - Allows clock and sleeper dependency injection for fast, deterministic unit testing.
+    - Zero sleep when min_interval_seconds <= 0.0 (e.g. mock-only dry runs).
+    """
+
+    def __init__(
+        self,
+        min_interval_seconds: float = MIN_REQUEST_INTERVAL_SECONDS,
+        clock: Optional[Callable[[], float]] = None,
+        sleeper: Optional[Callable[[float], None]] = None,
+    ) -> None:
+        self.min_interval_seconds = min_interval_seconds
+        self.clock = clock or time.monotonic
+        self.sleeper = sleeper or time.sleep
+        self.last_request_start: Optional[float] = None
+        self.total_sleep_seconds: float = 0.0
+        self.sleep_events: List[float] = []
+
+    def wait_for_slot(self) -> float:
+        """Wait until at least min_interval_seconds has elapsed since the last request start.
+
+        Returns:
+            The duration in seconds that was slept (0.0 if no sleep was required).
+        """
+        if self.min_interval_seconds <= 0.0:
+            self.last_request_start = self.clock()
+            return 0.0
+
+        now = self.clock()
+        slept = 0.0
+        if self.last_request_start is not None:
+            elapsed = now - self.last_request_start
+            wait_time = self.min_interval_seconds - elapsed
+            if wait_time > 0:
+                self.sleeper(wait_time)
+                slept = wait_time
+                now = self.clock()
+
+        self.last_request_start = now
+        self.total_sleep_seconds += slept
+        if slept > 0.0:
+            self.sleep_events.append(slept)
+        return slept
+
+
+# =============================================================================
+# 3. PILOT REQUEST GUARDRAIL PROVIDER
 # =============================================================================
 
 class GeminiPilotRequestGuardrailProvider:
-    """Decorates an LLMProvider to enforce strict invocation and token limits.
+    """Decorates an LLMProvider to enforce strict invocation, token, and rate limits.
 
     Guarantees:
     - Counts every single provider request across all pilot runs.
-    - Strictly halts execution by raising RuntimeError if request ceiling is reached.
-    - Aggregates provider-reported tokens (prompt, candidate, cached, reasoning) and latencies.
+    - Halts execution by raising RuntimeError if 20-request ceiling is reached.
+    - Enforces sequential rate limiting (minimum 20s interval / 3 RPM target) when configured.
+    - Aggregates provider-reported tokens, derived totals, and latencies.
     - Captures request IDs for audit trails.
     """
+
+    MAX_TOTAL_PROVIDER_REQUESTS: int = MAX_TOTAL_PROVIDER_REQUESTS
 
     def __init__(
         self,
         provider: LLMProvider,
         max_requests: int = MAX_TOTAL_PROVIDER_REQUESTS,
+        rate_limiter: Optional[SequentialRateLimiter] = None,
+        min_interval_seconds: float = 0.0,
+        clock: Optional[Callable[[], float]] = None,
+        sleeper: Optional[Callable[[float], None]] = None,
     ) -> None:
         self.provider = provider
         self.max_requests = max_requests
+        if rate_limiter is not None:
+            self.rate_limiter: Optional[SequentialRateLimiter] = rate_limiter
+        elif min_interval_seconds > 0.0:
+            self.rate_limiter = SequentialRateLimiter(
+                min_interval_seconds=min_interval_seconds,
+                clock=clock,
+                sleeper=sleeper,
+            )
+        else:
+            self.rate_limiter = None
+
         self.total_requests: int = 0
         self.request_history: List[Dict[str, Any]] = []
         self.provider_request_ids: List[str] = []
@@ -118,6 +212,7 @@ class GeminiPilotRequestGuardrailProvider:
         self.cumulative_reasoning_tokens: int = 0
         self.cumulative_total_tokens: Optional[int] = None
         self.cumulative_derived_total_tokens: int = 0
+        self.cumulative_sleep_seconds: float = 0.0
 
     @property
     def sdk_version(self) -> Optional[str]:
@@ -133,13 +228,18 @@ class GeminiPilotRequestGuardrailProvider:
         reasoning_effort: str = "low",
         max_output_tokens: Optional[int] = None,
     ) -> LLMCompletionResult:
-        """Execute request under strict count and limit guardrails."""
+        """Execute request under strict count and rate limit guardrails."""
         if self.total_requests >= self.max_requests:
             raise RuntimeError(
                 f"Gemini pilot execution safety ceiling reached: ceiling of {self.max_requests} "
                 "total provider requests exceeded. Cleanly aborting pilot execution to "
                 "prevent unexpected billing or runaways."
             )
+
+        slept = 0.0
+        if self.rate_limiter is not None:
+            slept = self.rate_limiter.wait_for_slot()
+            self.cumulative_sleep_seconds += slept
 
         t0 = time.perf_counter()
         result = self.provider.complete(
@@ -176,6 +276,17 @@ class GeminiPilotRequestGuardrailProvider:
                 else (result.usage.input_tokens + result.usage.output_tokens)
             )
             self.cumulative_derived_total_tokens += derived
+
+        self.request_history.append({
+            "request_index": self.total_requests,
+            "provider_request_id": result.provider_request_id,
+            "system_fingerprint": result.system_fingerprint,
+            "latency_ms": latency_ms,
+            "slept_seconds": slept,
+            "usage": usage_to_dict(result.usage),
+        })
+
+        return result
 
         self.request_history.append({
             "request_index": self.total_requests,
@@ -291,7 +402,20 @@ def run_gemini_pilot_preflight(
         "pilot_task_ids": list(PILOT_TASK_IDS),
         "pilot_conditions": list(PILOT_CONDITIONS),
         "planned_runs_count": MAX_PILOT_RUNS,
+        "max_requests_per_condition_a": MAX_REQUESTS_PER_CONDITION_A,
+        "max_requests_per_condition_b": MAX_REQUESTS_PER_CONDITION_B,
+        "max_requests_per_condition_c": MAX_REQUESTS_PER_CONDITION_C,
+        "max_inspections_per_condition_c": MAX_INSPECTIONS_PER_CONDITION_C,
+        "max_theoretical_requests": MAX_THEORETICAL_TOTAL_REQUESTS,
+        "max_possible_total_requests": MAX_THEORETICAL_TOTAL_REQUESTS,
+        "request_budget_formula": (
+            f"{len(PILOT_TASK_IDS)} tasks × ({MAX_REQUESTS_PER_CONDITION_A} A + "
+            f"{MAX_REQUESTS_PER_CONDITION_B} B + {MAX_REQUESTS_PER_CONDITION_C} C) = "
+            f"{MAX_THEORETICAL_TOTAL_REQUESTS} requests"
+        ),
+        "global_request_ceiling": MAX_TOTAL_PROVIDER_REQUESTS,
         "max_provider_requests_ceiling": MAX_TOTAL_PROVIDER_REQUESTS,
+        "safety_margin_requests": MAX_TOTAL_PROVIDER_REQUESTS - MAX_THEORETICAL_TOTAL_REQUESTS,
         "output_token_ceiling": DEFAULT_OUTPUT_TOKEN_CEILING,
         "model": PILOT_MODEL,
         "thinking_level": "low",
@@ -301,6 +425,13 @@ def run_gemini_pilot_preflight(
             "User-provided reporting assumption, NOT an account-billing verification. "
             "Never inferred from model name or availability."
         ),
+        "rpm_limit": QUOTA_RPM_LIMIT,
+        "tpm_limit": QUOTA_TPM_LIMIT,
+        "rpd_limit": QUOTA_RPD_LIMIT,
+        "configured_safe_target": f"{CONFIGURED_SAFE_TARGET_RPM} RPM",
+        "configured_safe_target_rpm": CONFIGURED_SAFE_TARGET_RPM,
+        "min_request_interval_seconds": MIN_REQUEST_INTERVAL_SECONDS,
+        "max_provider_requests": MAX_TOTAL_PROVIDER_REQUESTS,
         "pricing_version": pricing.version if pricing else None,
         "pricing_complete": pricing.is_complete() if pricing else False,
         "input_rate_per_m": str(pricing.input_cost_per_million) if pricing and pricing.input_cost_per_million is not None else "unknown",
@@ -439,11 +570,14 @@ def run_gemini_pilot_dry_run(
     output_dir: Optional[Union[str, Path]] = None,
     provider: Optional[LLMProvider] = None,
     billing_tier: str = "unknown",
+    rate_limiter: Optional[SequentialRateLimiter] = None,
+    max_requests: int = MAX_TOTAL_PROVIDER_REQUESTS,
 ) -> Dict[str, Any]:
     """Execute complete simulated Gemini pilot evaluation without network access.
 
     Performs preflight checks, loads frozen artifacts, and runs all 9 pilot
     runs sequentially against a deterministic test double.
+    Does not sleep by default in dry-run mode (rate_limiter is None/0.0s).
     """
     preflight = run_gemini_pilot_preflight(
         catalog_path=catalog_path,
@@ -463,7 +597,8 @@ def run_gemini_pilot_dry_run(
     simulated_provider = provider or create_gemini_pilot_mock_provider()
     guardrail = GeminiPilotRequestGuardrailProvider(
         provider=simulated_provider,
-        max_requests=MAX_TOTAL_PROVIDER_REQUESTS,
+        max_requests=max_requests,
+        rate_limiter=rate_limiter,
     )
 
     ts_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -483,13 +618,49 @@ def run_gemini_pilot_dry_run(
         experiment_config_version="phase6.5-gemini-pilot-dry-run",
         provider_mode="simulated",
         model_name="mock-gemini-3.8-flash",
+        condition_c_max_model_requests=MAX_REQUESTS_PER_CONDITION_C,
+        condition_c_max_inspections=MAX_INSPECTIONS_PER_CONDITION_C,
     )
 
     records: List[RunRecord] = []
+    incomplete_reason: Optional[str] = None
     for task in pilot_tasks:
         for cond in PILOT_CONDITIONS:
-            rec = runner.run_task(task=task, condition_id=cond, provider=guardrail)
-            records.append(rec)
+            if guardrail.total_requests >= guardrail.max_requests:
+                incomplete_reason = (
+                    f"Safety ceiling of {guardrail.max_requests} total provider requests reached "
+                    f"before executing task {task.task_id} on Condition {cond}."
+                )
+                break
+            try:
+                rec = runner.run_task(task=task, condition_id=cond, provider=guardrail)
+                records.append(rec)
+                if rec.actual_outcome == "ERROR":
+                    err_msg = rec.error_detail or "Unknown execution error"
+                    if "safety ceiling" in err_msg.lower() or "requests exceeded" in err_msg.lower():
+                        incomplete_reason = err_msg
+                    else:
+                        incomplete_reason = f"Run failure on task {task.task_id} (Condition {cond}): {err_msg}"
+                    break
+            except RuntimeError as exc:
+                if "safety ceiling reached" in str(exc) or "requests exceeded" in str(exc):
+                    incomplete_reason = str(exc)
+                    break
+                incomplete_reason = f"RuntimeError during task {task.task_id} on Condition {cond}: {exc}"
+                break
+            except Exception as exc:
+                incomplete_reason = f"Execution failure during task {task.task_id} on Condition {cond}: {exc}"
+                break
+        if incomplete_reason:
+            break
+
+    is_complete = (len(records) == MAX_PILOT_RUNS) and (incomplete_reason is None)
+    if is_complete:
+        pilot_status = "completed"
+    elif incomplete_reason and ("ceiling" in incomplete_reason.lower() or "requests exceeded" in incomplete_reason.lower()):
+        pilot_status = "incomplete_quota_ceiling_reached"
+    else:
+        pilot_status = "incomplete_run_failed"
 
     # Export artifacts
     runner.export_artifacts(records, target_dir)
@@ -498,10 +669,18 @@ def run_gemini_pilot_dry_run(
         run_id=run_id,
         is_live=False,
         billing_tier=billing_tier,
+        is_complete=is_complete,
+        status=pilot_status,
+        incomplete_reason=incomplete_reason,
+        runs_completed=len(records),
+        runs_planned=MAX_PILOT_RUNS,
+        max_requests=max_requests,
     )
 
     return {
-        "status": "completed",
+        "status": pilot_status,
+        "is_complete": is_complete,
+        "incomplete_reason": incomplete_reason,
         "pilot_run_id": run_id,
         "is_live": False,
         "provider": "Google",
@@ -509,12 +688,20 @@ def run_gemini_pilot_dry_run(
         "billing_tier": billing_tier,
         "output_directory": str(target_dir),
         "total_runs": len(records),
+        "runs_completed": len(records),
+        "runs_planned": MAX_PILOT_RUNS,
         "total_provider_requests": guardrail.total_requests,
-        "max_requests_ceiling": MAX_TOTAL_PROVIDER_REQUESTS,
+        "max_theoretical_requests": MAX_THEORETICAL_TOTAL_REQUESTS,
+        "max_requests_per_condition_c": MAX_REQUESTS_PER_CONDITION_C,
+        "max_inspections_per_condition_c": MAX_INSPECTIONS_PER_CONDITION_C,
+        "max_requests_ceiling": max_requests,
+        "global_request_ceiling": MAX_TOTAL_PROVIDER_REQUESTS,
+        "ceiling_reached": not is_complete and (guardrail.total_requests >= max_requests or "ceiling" in (incomplete_reason or "").lower()),
+        "network_calls_made": 0,
         "raw_runs_file": str(target_dir / "raw_runs.jsonl"),
         "comparison_file": str(target_dir / "comparison.csv"),
         "analysis_file": str(target_dir / "analysis.md"),
-        "tag": PILOT_TAG + " (DRY_RUN_MODE)",
+        "tag": PILOT_TAG + (" (DRY_RUN_MODE)" if is_complete else f" ({pilot_status.upper()})"),
     }
 
 
@@ -532,15 +719,21 @@ def run_live_gemini_pilot(
     tasks_path: Union[str, Path] = "data/tasks.jsonl",
     output_dir: Optional[Union[str, Path]] = None,
     client: Optional[Any] = None,
+    rate_limiter: Optional[SequentialRateLimiter] = None,
+    clock: Optional[Callable[[], float]] = None,
+    sleeper: Optional[Callable[[float], None]] = None,
+    max_requests: int = MAX_TOTAL_PROVIDER_REQUESTS,
 ) -> Dict[str, Any]:
     """Execute the controlled live Google Gemini API pilot for 3 tasks across 3 conditions.
 
     Strict Invariants:
     1. Requires BOTH live=True AND confirm_live=True. Without both, raises ValueError.
     2. Exactly 3 tasks * 3 conditions = 9 total task runs executed sequentially.
-    3. Strict ceiling of 24 provider requests enforced by GeminiPilotRequestGuardrailProvider.
-    4. Target model: gemini-3.8-flash with low thinking level, max_output_tokens=2048.
-    5. Outputs generated under artifacts/phase6_5_gemini_pilot/<run_id>/ and tagged with
+    3. Strict ceiling of 20 provider requests enforced by GeminiPilotRequestGuardrailProvider.
+    4. Target model: gemini-3.8-flash with low thinking level, max_output_tokens=2048, max_retries=0.
+    5. Sequential rate limiter enforces >= 20 seconds between request starts (3 RPM safe target).
+    6. Stops safely when 20 requests reached; records incomplete pilot distinctly.
+    7. Outputs generated under artifacts/phase6_5_gemini_pilot/<run_id>/ and tagged with
        REAL_API_PILOT (GEMINI) — LIMITED_SAMPLE — NOT_FULL_EXPERIMENT.
     """
     if not (live and confirm_live):
@@ -569,7 +762,7 @@ def run_live_gemini_pilot(
     task_map = {t.task_id: t for t in all_tasks}
     pilot_tasks = [task_map[tid] for tid in PILOT_TASK_IDS]
 
-    # Initialize live Gemini provider with Stage 6 specifications
+    # Initialize live Gemini provider with Stage 6 specifications (max_retries=0)
     base_provider = GeminiProvider(
         api_key=api_key,
         model=PILOT_MODEL,
@@ -577,12 +770,21 @@ def run_live_gemini_pilot(
         timeout_seconds=60.0,
         client=client,
         max_output_tokens=DEFAULT_OUTPUT_TOKEN_CEILING,
+        max_retries=0,
     )
 
-    # Wrap provider in request-guardrail
+    # Initialize sequential rate limiter (target: 3 RPM, >= 20s between request starts)
+    actual_rate_limiter = rate_limiter or SequentialRateLimiter(
+        min_interval_seconds=MIN_REQUEST_INTERVAL_SECONDS,
+        clock=clock,
+        sleeper=sleeper,
+    )
+
+    # Wrap provider in request-guardrail with rate limiter
     guardrail = GeminiPilotRequestGuardrailProvider(
         provider=base_provider,
-        max_requests=MAX_TOTAL_PROVIDER_REQUESTS,
+        max_requests=max_requests,
+        rate_limiter=actual_rate_limiter,
     )
 
     ts_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -602,20 +804,50 @@ def run_live_gemini_pilot(
         experiment_config_version="phase6.5-gemini-live-pilot",
         provider_mode="live",
         model_name=PILOT_MODEL,
+        condition_c_max_model_requests=MAX_REQUESTS_PER_CONDITION_C,
+        condition_c_max_inspections=MAX_INSPECTIONS_PER_CONDITION_C,
     )
 
-    # Execute all 9 runs sequentially
+    # Execute runs sequentially, stopping safely if ceiling is reached
     records: List[RunRecord] = []
+    incomplete_reason: Optional[str] = None
     for task in pilot_tasks:
         for cond in PILOT_CONDITIONS:
-            # Check ceiling before launching run
-            if guardrail.total_requests >= MAX_TOTAL_PROVIDER_REQUESTS:
-                raise RuntimeError(
-                    f"Ceiling of {MAX_TOTAL_PROVIDER_REQUESTS} requests reached before executing "
-                    f"task {task.task_id} on Condition {cond}."
+            if guardrail.total_requests >= guardrail.max_requests:
+                incomplete_reason = (
+                    f"Safety ceiling of {guardrail.max_requests} total provider requests reached "
+                    f"before executing task {task.task_id} on Condition {cond}."
                 )
-            rec = runner.run_task(task=task, condition_id=cond, provider=guardrail)
-            records.append(rec)
+                break
+            try:
+                rec = runner.run_task(task=task, condition_id=cond, provider=guardrail)
+                records.append(rec)
+                if rec.actual_outcome == "ERROR":
+                    err_msg = rec.error_detail or "Unknown execution error"
+                    if "safety ceiling" in err_msg.lower() or "requests exceeded" in err_msg.lower():
+                        incomplete_reason = err_msg
+                    else:
+                        incomplete_reason = f"Run failure on task {task.task_id} (Condition {cond}): {err_msg}"
+                    break
+            except RuntimeError as exc:
+                if "safety ceiling reached" in str(exc) or "requests exceeded" in str(exc):
+                    incomplete_reason = str(exc)
+                    break
+                incomplete_reason = f"RuntimeError during task {task.task_id} on Condition {cond}: {exc}"
+                break
+            except Exception as exc:
+                incomplete_reason = f"Execution failure during task {task.task_id} on Condition {cond}: {exc}"
+                break
+        if incomplete_reason:
+            break
+
+    is_complete = (len(records) == MAX_PILOT_RUNS) and (incomplete_reason is None)
+    if is_complete:
+        pilot_status = "completed"
+    elif incomplete_reason and ("ceiling" in incomplete_reason.lower() or "requests exceeded" in incomplete_reason.lower()):
+        pilot_status = "incomplete_quota_ceiling_reached"
+    else:
+        pilot_status = "incomplete_run_failed"
 
     # Export artifacts
     runner.export_artifacts(records, target_dir)
@@ -624,10 +856,18 @@ def run_live_gemini_pilot(
         run_id=run_id,
         is_live=True,
         billing_tier=billing_tier,
+        is_complete=is_complete,
+        status=pilot_status,
+        incomplete_reason=incomplete_reason,
+        runs_completed=len(records),
+        runs_planned=MAX_PILOT_RUNS,
+        max_requests=max_requests,
     )
 
     return {
-        "status": "completed",
+        "status": pilot_status,
+        "is_complete": is_complete,
+        "incomplete_reason": incomplete_reason,
         "pilot_run_id": run_id,
         "is_live": True,
         "provider": "Google",
@@ -635,8 +875,15 @@ def run_live_gemini_pilot(
         "billing_tier": billing_tier,
         "output_directory": str(target_dir),
         "total_runs": len(records),
+        "runs_completed": len(records),
+        "runs_planned": MAX_PILOT_RUNS,
         "total_provider_requests": guardrail.total_requests,
-        "max_requests_ceiling": MAX_TOTAL_PROVIDER_REQUESTS,
+        "max_theoretical_requests": MAX_THEORETICAL_TOTAL_REQUESTS,
+        "max_requests_per_condition_c": MAX_REQUESTS_PER_CONDITION_C,
+        "max_inspections_per_condition_c": MAX_INSPECTIONS_PER_CONDITION_C,
+        "max_requests_ceiling": max_requests,
+        "global_request_ceiling": MAX_TOTAL_PROVIDER_REQUESTS,
+        "ceiling_reached": not is_complete and (guardrail.total_requests >= max_requests or "ceiling" in (incomplete_reason or "").lower()),
         "cumulative_tokens": {
             "input_tokens": guardrail.cumulative_input_tokens,
             "output_tokens": guardrail.cumulative_output_tokens,
@@ -644,11 +891,12 @@ def run_live_gemini_pilot(
             "derived_total_tokens": guardrail.cumulative_derived_total_tokens,
             "cached_input_tokens": guardrail.cumulative_cached_input_tokens,
             "reasoning_tokens": guardrail.cumulative_reasoning_tokens,
+            "sleep_seconds": guardrail.cumulative_sleep_seconds,
         },
         "raw_runs_file": str(target_dir / "raw_runs.jsonl"),
         "comparison_file": str(target_dir / "comparison.csv"),
         "analysis_file": str(target_dir / "analysis.md"),
-        "tag": PILOT_TAG,
+        "tag": PILOT_TAG + ("" if is_complete else " (INCOMPLETE_CEILING_REACHED)"),
     }
 
 
@@ -657,6 +905,12 @@ def _patch_gemini_pilot_analysis_markdown(
     run_id: str,
     is_live: bool,
     billing_tier: str = "unknown",
+    is_complete: bool = True,
+    status: str = "completed",
+    incomplete_reason: Optional[str] = None,
+    runs_completed: int = MAX_PILOT_RUNS,
+    runs_planned: int = MAX_PILOT_RUNS,
+    max_requests: int = MAX_TOTAL_PROVIDER_REQUESTS,
 ) -> None:
     """Inject Gemini pilot-specific header banner and privacy notice into analysis.md."""
     if not analysis_path.exists():
@@ -682,11 +936,22 @@ def _patch_gemini_pilot_analysis_markdown(
             "To prevent false zero-cost reporting, all monetary costs evaluate strictly to None."
         )
 
-    banner = f"""# {PILOT_TAG}
+    completion_badge = ""
+    if not is_complete:
+        completion_badge = f"""
+> [!WARNING]
+> **INCOMPLETE PILOT EXECUTION NOTICE**:
+> Execution was stopped early because {incomplete_reason or 'one or more runs failed'}.
+> - **Runs Completed:** {runs_completed} of {runs_planned} planned task-condition runs.
+> - **Status:** **INCOMPLETE** (`{status}`) — This run must **NOT** be reported as a completed nine-run pilot.
+> - **Termination Reason:** {incomplete_reason}
+"""
 
+    banner = f"""# {PILOT_TAG}
+{completion_badge}
 > [!IMPORTANT]
 > **LIMITED SAMPLE SIZE NOTICE**: This report represents a controlled preliminary pilot
-> consisting of 9 task-condition runs (3 representative tasks across Conditions A, B, and C).
+> consisting of {runs_completed} task-condition runs (across Conditions A, B, and C).
 > It is **NOT** the full 25-task empirical benchmark. Findings should be interpreted as
 > pilot verification of provider integration, format parsing, and error behavior.
 
@@ -696,10 +961,14 @@ def _patch_gemini_pilot_analysis_markdown(
 > - Model: `{PILOT_MODEL}` (`thinking_level=low`, `max_output_tokens={DEFAULT_OUTPUT_TOKEN_CEILING}`)
 > - Billing Tier: `{billing_tier}` (Default: `unknown`)
 > - Billing Tier Assumption: {tier_disclaimer}
+> - Rate Limits: Quota: {QUOTA_RPM_LIMIT} RPM / {QUOTA_TPM_LIMIT:,} TPM / {QUOTA_RPD_LIMIT} RPD | Configured Safe Target: {CONFIGURED_SAFE_TARGET_RPM} RPM (at least {MIN_REQUEST_INTERVAL_SECONDS}s between request starts)
 
 - **Pilot Run ID:** `{run_id}`
 - **Execution Mode:** `{'LIVE GOOGLE GEMINI API' if is_live else 'OFFLINE SIMULATED TEST DOUBLE'}`
-- **Total Provider Requests Ceiling:** `{MAX_TOTAL_PROVIDER_REQUESTS}`
+- **Pilot Status:** `{'COMPLETED' if is_complete else f'INCOMPLETE — {status.upper()}'}`
+- **Runs Completed:** `{runs_completed} / {runs_planned}`
+- **Planned Request Budget:** `{MAX_THEORETICAL_TOTAL_REQUESTS} requests max ({len(PILOT_TASK_IDS)} tasks × [{MAX_REQUESTS_PER_CONDITION_A} A + {MAX_REQUESTS_PER_CONDITION_B} B + {MAX_REQUESTS_PER_CONDITION_C} C])`
+- **Total Provider Requests Ceiling:** `{max_requests} (safety margin: {max_requests - MAX_THEORETICAL_TOTAL_REQUESTS} requests)`
 - **Benchmark Subset:**
   1. `task_01_commit_replace_wed_dinner` (Category: `meal_replacement`, Expected: `COMMIT`)
   2. `task_14_reject_allergen_peanut_toast` (Category: `allergen_conflict`, Expected: `REJECT`)
@@ -800,7 +1069,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 tasks_path=args.tasks,
                 output_dir=args.output_dir,
             )
-            print(f"Live Gemini pilot completed successfully. Artifacts: {res['output_directory']}")
+            if not res.get("is_complete", True):
+                print(
+                    f"NOTICE: Live pilot halted early at request ceiling ({res['runs_completed']}/{res['runs_planned']} runs completed). "
+                    f"Status: {res['status']}. Incomplete pilot recorded distinctly.",
+                    file=sys.stderr,
+                )
+            else:
+                print(f"Live Gemini pilot completed successfully. Artifacts: {res['output_directory']}")
             return 0
         except Exception as e:
             print(f"Live Gemini pilot failed: {e}", file=sys.stderr)
@@ -816,7 +1092,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             output_dir=args.output_dir,
             billing_tier=args.billing_tier,
         )
-        print(f"Dry run completed successfully. Artifacts: {res['output_directory']}")
+        if not res.get("is_complete", True):
+            print(
+                f"NOTICE: Dry-run halted early at request ceiling ({res['runs_completed']}/{res['runs_planned']} runs completed). "
+                f"Status: {res['status']}. Incomplete pilot recorded distinctly.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"Dry run completed successfully. Artifacts: {res['output_directory']}")
         return 0
 
     # 3. Default or explicit preflight

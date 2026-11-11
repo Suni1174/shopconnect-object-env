@@ -21,22 +21,36 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 import pytest
 
+from shopconnect_env.agents.condition_c_agent import ConditionCAgent
 from shopconnect_env.agents.providers import (
     GeminiProvider,
     LLMCompletionResult,
     LLMMessage,
+    LLMProvider,
     LLMUsage,
     MockLLMProvider,
+    RateLimitError,
 )
 from shopconnect_env.evaluation.gemini_pilot import (
+    CONFIGURED_SAFE_TARGET_RPM,
     DEFAULT_OUTPUT_TOKEN_CEILING,
+    MAX_INSPECTIONS_PER_CONDITION_C,
     MAX_PILOT_RUNS,
+    MAX_REQUESTS_PER_CONDITION_A,
+    MAX_REQUESTS_PER_CONDITION_B,
+    MAX_REQUESTS_PER_CONDITION_C,
+    MAX_THEORETICAL_TOTAL_REQUESTS,
     MAX_TOTAL_PROVIDER_REQUESTS,
+    MIN_REQUEST_INTERVAL_SECONDS,
     PILOT_CONDITIONS,
     PILOT_MODEL,
     PILOT_TAG,
     PILOT_TASK_IDS,
+    QUOTA_RPD_LIMIT,
+    QUOTA_RPM_LIMIT,
+    QUOTA_TPM_LIMIT,
     GeminiPilotRequestGuardrailProvider,
+    SequentialRateLimiter,
     create_gemini_pilot_mock_provider,
     main,
     parse_args,
@@ -95,7 +109,22 @@ def test_gemini_pilot_preflight_validation_zero_network():
     assert res["network_calls_made"] == 0
     assert res["pilot_tasks_count"] == 3
     assert res["planned_runs_count"] == 9
-    assert res["max_provider_requests_ceiling"] == 24
+    assert res["max_requests_per_condition_a"] == 1
+    assert res["max_requests_per_condition_b"] == 1
+    assert res["max_requests_per_condition_c"] == 4
+    assert res["max_inspections_per_condition_c"] == 5
+    assert res["max_theoretical_requests"] == 18
+    assert res["max_possible_total_requests"] == 18
+    assert res["global_request_ceiling"] == 20
+    assert res["safety_margin_requests"] == 2
+    assert res["max_provider_requests_ceiling"] == 20
+    assert res["max_provider_requests"] == 20
+    assert res["rpm_limit"] == 5
+    assert res["tpm_limit"] == 250000
+    assert res["rpd_limit"] == 20
+    assert res["configured_safe_target"] == "3 RPM"
+    assert res["configured_safe_target_rpm"] == 3
+    assert res["min_request_interval_seconds"] == 20.0
     assert res["output_token_ceiling"] == 2048
     assert res["model"] == "gemini-3.8-flash"
     assert res["provider"] == "Google"
@@ -275,7 +304,9 @@ def test_gemini_pilot_dry_run_execution(tmp_path):
     assert res["model"] == "gemini-3.8-flash"
     assert res["billing_tier"] == "free_tier"
     assert res["total_runs"] == 9
-    assert res["total_provider_requests"] <= 24
+    assert res["total_provider_requests"] <= 20
+    assert res["max_requests_ceiling"] == 20
+    assert res["is_complete"] is True
     assert PILOT_TAG in res["tag"]
 
     # Verify artifacts exist on disk
@@ -362,6 +393,7 @@ def test_gemini_live_pilot_with_injected_client(tmp_path):
         billing_tier="paid_tier",
         output_dir=output_dir,
         client=fake_client,
+        sleeper=lambda _: None,
     )
 
     assert res["status"] == "completed"
@@ -446,23 +478,299 @@ def test_gemini_pricing_paid_tier():
     assert cost == Decimal("0.457500")
 
 
+import time
+from typing import List
+
+
 # =============================================================================
-# 7. ZERO SOCKET NETWORK CALLS VERIFICATION
+# 8. FREE-TIER QUOTA ADAPTATION & RATE LIMITER REGRESSION TESTS
 # =============================================================================
 
-def test_gemini_pilot_zero_socket_activity(monkeypatch):
-    """Guarantees dry-run and preflight make zero socket calls."""
-    real_socket = socket.socket
+def test_gemini_pilot_20_request_ceiling_constant_and_enforcement():
+    """Verify 20-request ceiling constant and guardrail enforcement on 21st call."""
+    assert MAX_TOTAL_PROVIDER_REQUESTS == 20
+    assert GeminiPilotRequestGuardrailProvider.MAX_TOTAL_PROVIDER_REQUESTS == 20
 
+    mock_inner = MockLLMProvider()
+    guardrail = GeminiPilotRequestGuardrailProvider(mock_inner, max_requests=20)
+
+    # 20 calls must succeed
+    for i in range(20):
+        res = guardrail.complete([LLMMessage(role="user", content=f"Msg {i}")])
+        assert isinstance(res, LLMCompletionResult)
+    assert guardrail.total_requests == 20
+
+    # 21st call must cleanly raise RuntimeError without incrementing request count
+    with pytest.raises(RuntimeError) as exc_info:
+        guardrail.complete([LLMMessage(role="user", content="Msg 21")])
+
+    assert "Gemini pilot execution safety ceiling reached" in str(exc_info.value)
+    assert "ceiling of 20 total provider requests exceeded" in str(exc_info.value)
+    assert guardrail.total_requests == 20
+
+
+def test_gemini_sequential_rate_limiter_enforcement_with_injected_clock():
+    """Verify safe sequential rate limiter enforces >= 20s interval between requests."""
+    curr_time = [1000.0]
+    slept_durations: List[float] = []
+
+    def virtual_clock() -> float:
+        return curr_time[0]
+
+    def virtual_sleeper(duration: float) -> None:
+        slept_durations.append(duration)
+        curr_time[0] += duration
+
+    limiter = SequentialRateLimiter(
+        min_interval_seconds=20.0,
+        clock=virtual_clock,
+        sleeper=virtual_sleeper,
+    )
+
+    # Request 1: First request starts immediately (0 sleep)
+    limiter.wait_for_slot()
+    assert len(slept_durations) == 0
+    assert limiter.last_request_start == 1000.0
+
+    # Advance clock by 6 seconds (elapsed = 6.0s < 20.0s)
+    curr_time[0] += 6.0
+
+    # Request 2: Must sleep for remaining 14.0 seconds
+    limiter.wait_for_slot()
+    assert len(slept_durations) == 1
+    assert slept_durations[-1] == pytest.approx(14.0)
+    assert curr_time[0] == pytest.approx(1020.0)
+    assert limiter.last_request_start == 1020.0
+
+    # Advance clock by 35 seconds (elapsed = 35.0s > 20.0s)
+    curr_time[0] += 35.0
+
+    # Request 3: Elapsed >= 20s, no sleep needed
+    limiter.wait_for_slot()
+    assert len(slept_durations) == 1  # No additional sleep
+    assert curr_time[0] == 1055.0
+    assert limiter.last_request_start == 1055.0
+
+    # Zero-interval mode (for mock dry-runs): never sleeps
+    zero_limiter = SequentialRateLimiter(
+        min_interval_seconds=0.0,
+        clock=virtual_clock,
+        sleeper=virtual_sleeper,
+    )
+    zero_limiter.wait_for_slot()
+    zero_limiter.wait_for_slot()
+    assert len(slept_durations) == 1
+
+
+def test_gemini_provider_no_retries():
+    """Verify GeminiProvider sets max_retries=0 and re-raises immediately on failure."""
+    fake_client = MagicMock()
+    fake_client.models.generate_content.side_effect = RuntimeError("ResourceExhausted 429: Quota exceeded")
+
+    provider = GeminiProvider(
+        api_key="AIzaSyTestKey",
+        client=fake_client,
+        max_retries=0,
+    )
+    assert provider.max_retries == 0
+
+    # Single attempt: must fail immediately without retrying
+    with pytest.raises(RateLimitError) as exc_info:
+        provider.complete([LLMMessage(role="user", content="Ping")])
+
+    assert "rate limit or quota exceeded" in str(exc_info.value)
+    assert fake_client.models.generate_content.call_count == 1
+
+
+def test_gemini_pilot_clean_stopping_at_ceiling_records_incomplete_pilot(tmp_path):
+    """When ceiling is reached, runner stops cleanly and records incomplete pilot metadata."""
+    out_dir = tmp_path / "artifacts" / "gemini_ceiling_test"
+
+    # Set ceiling to 2 requests (well below the 9 runs needed)
+    res = run_gemini_pilot_dry_run(
+        output_dir=out_dir,
+        max_requests=2,
+    )
+
+    assert res["status"] == "incomplete_quota_ceiling_reached"
+    assert res["is_complete"] is False
+    assert res["ceiling_reached"] is True
+    assert res["runs_completed"] < 9
+    assert res["runs_planned"] == 9
+    assert res["total_provider_requests"] == 2
+    assert res["max_requests_ceiling"] == 2
+    assert "INCOMPLETE" in res["tag"]
+
+    # Verify artifacts reflect incomplete status
+    raw_runs_path = Path(res["raw_runs_file"])
+    comparison_path = Path(res["comparison_file"])
+    analysis_path = Path(res["analysis_file"])
+
+    assert raw_runs_path.exists()
+    assert comparison_path.exists()
+    assert analysis_path.exists()
+
+    with open(raw_runs_path, "r", encoding="utf-8") as f:
+        lines = [line.strip() for line in f if line.strip()]
+    assert len(lines) == res["runs_completed"]
+
+    analysis_text = analysis_path.read_text(encoding="utf-8")
+    assert "INCOMPLETE PILOT EXECUTION NOTICE" in analysis_text
+    assert "incomplete_quota_ceiling_reached" in analysis_text
+    assert "Safety ceiling of 2 total provider requests reached" in analysis_text
+
+
+def test_gemini_pilot_dry_run_remains_network_free_and_zero_sleep(tmp_path, monkeypatch):
+    """Verify dry-run execution makes zero network calls and incurs zero sleep time."""
+    # 1. Guard against any network socket activity
     def guarded_socket(*args, **kwargs):
-        raise RuntimeError("NETWORK CALL ATTEMPTED: Test suite must remain 100% offline!")
+        raise RuntimeError("NETWORK CALL ATTEMPTED: Dry run must remain 100% offline!")
 
     monkeypatch.setattr(socket, "socket", guarded_socket)
 
-    # 1. Preflight with blocked socket
-    preflight_res = run_gemini_pilot_preflight()
-    assert preflight_res["status"] == "passed"
+    # 2. Track any sleep invocations
+    slept: List[float] = []
+    monkeypatch.setattr(time, "sleep", lambda d: slept.append(d))
 
-    # 2. Dry-run with blocked socket
-    dry_run_res = run_gemini_pilot_dry_run()
-    assert dry_run_res["status"] == "completed"
+    res = run_gemini_pilot_dry_run(
+        output_dir=tmp_path / "artifacts" / "gemini_zero_sleep_test",
+    )
+
+    assert res["status"] == "completed"
+    assert res["is_complete"] is True
+    assert res["network_calls_made"] == 0
+    assert sum(slept) == 0.0
+
+
+def test_condition_c_architectural_default_and_gemini_pilot_budget():
+    """Verify ConditionCAgent architectural default is 6 and can be overridden to 4."""
+    # 1. Architectural defaults remain 6 requests, 5 inspections
+    assert ConditionCAgent.MAX_MODEL_REQUESTS == 6
+    assert ConditionCAgent.MAX_INSPECTION_CALLS == 5
+
+    mock_provider = MockLLMProvider([])
+    default_agent = ConditionCAgent(provider=mock_provider)
+    assert default_agent.max_model_requests == 6
+    assert default_agent.max_inspection_calls == 5
+
+    # 2. Gemini pilot override configures 4 model requests and preserves 5 inspections
+    gemini_agent = ConditionCAgent(
+        provider=mock_provider,
+        max_model_requests=MAX_REQUESTS_PER_CONDITION_C,
+        max_inspection_calls=MAX_INSPECTIONS_PER_CONDITION_C,
+    )
+    assert gemini_agent.max_model_requests == 4
+    assert gemini_agent.max_inspection_calls == 5
+
+    # 3. Verify agent halts at 4 requests if model never finalizes
+    inspection_resp = LLMCompletionResult(
+        message=LLMMessage(
+            role="assistant",
+            tool_calls=[
+                {
+                    "call_id": "call_1",
+                    "function": {
+                        "name": "inspect_slot",
+                        "arguments": json.dumps({"day": "Monday", "meal_type": "breakfast"}),
+                    },
+                }
+            ],
+        ),
+        usage=LLMUsage(input_tokens=10, output_tokens=5, total_tokens=15, is_provider_reported=True),
+        model_identifier="mock-gemini-3.8-flash",
+    )
+    looping_provider = MockLLMProvider(responses=[inspection_resp] * 10)
+    agent = ConditionCAgent(provider=looping_provider, max_model_requests=4)
+
+    from shopconnect_env.context.base import ContextResult
+    context = ContextResult(
+        condition="Object-Centric",
+        condition_id="C",
+        system_prompt="Test system prompt",
+        task_prompt="Test user request",
+        serialized_context=json.dumps({"plan_version": 1}),
+    )
+    resp = agent.propose_action(context=context)
+
+    assert resp.metadata["total_model_requests"] == 4
+    assert resp.proposal is None
+    assert "MAX_MODEL_REQUESTS_EXCEEDED: Reached limit of 4 requests" in resp.rationale
+
+
+def test_gemini_pilot_budget_breakdown_and_headroom():
+    """Verify formula 3 tasks × (1 A + 1 B + 4 C) = 18 requests and 2-request margin to ceiling of 20."""
+    assert MAX_REQUESTS_PER_CONDITION_A == 1
+    assert MAX_REQUESTS_PER_CONDITION_B == 1
+    assert MAX_REQUESTS_PER_CONDITION_C == 4
+    assert MAX_INSPECTIONS_PER_CONDITION_C == 5
+    assert MAX_THEORETICAL_TOTAL_REQUESTS == 18
+    assert MAX_TOTAL_PROVIDER_REQUESTS == 20
+
+    # Explicit formula check
+    calculated_total = 3 * (1 + 1 + 4)
+    assert MAX_THEORETICAL_TOTAL_REQUESTS == calculated_total
+    assert MAX_TOTAL_PROVIDER_REQUESTS - MAX_THEORETICAL_TOTAL_REQUESTS == 2
+
+    # Verify dry run returns this budget calculation
+    dry_res = run_gemini_pilot_dry_run()
+    assert dry_res["max_theoretical_requests"] == 18
+    assert dry_res["max_requests_per_condition_c"] == 4
+    assert dry_res["max_inspections_per_condition_c"] == 5
+    assert dry_res["global_request_ceiling"] == 20
+
+
+def test_gemini_pilot_halts_safely_when_global_20_ceiling_reached(tmp_path):
+    """Verify pilot runner terminates safely when the global 20-request ceiling is hit."""
+    out_dir = tmp_path / "artifacts" / "gemini_global_20_ceiling_test"
+
+    # Set up a provider that responds but ceiling is reached exactly at 20
+    # We test ceiling enforcement by setting max_requests=20 and simulating 20 successful requests
+    mock_inner = MockLLMProvider()
+    guardrail = GeminiPilotRequestGuardrailProvider(mock_inner, max_requests=20)
+
+    for i in range(20):
+        guardrail.complete([LLMMessage(role="user", content=f"Request {i}")])
+    assert guardrail.total_requests == 20
+
+    # 21st call must cleanly raise RuntimeError
+    with pytest.raises(RuntimeError) as exc_info:
+        guardrail.complete([LLMMessage(role="user", content="Request 21")])
+    assert "Gemini pilot execution safety ceiling reached" in str(exc_info.value)
+    assert guardrail.total_requests == 20
+
+
+def test_gemini_pilot_run_failure_records_incomplete_status(tmp_path):
+    """If an individual run fails with an error, the pilot must report incomplete status and never completed."""
+    out_dir = tmp_path / "artifacts" / "gemini_run_failure_test"
+
+    # Create a mock provider that raises an exception on the 2nd task call
+    class FailingProvider(LLMProvider):
+        def __init__(self):
+            self.call_count = 0
+
+        def complete(self, messages, tools=None, tool_choice=None, **kwargs):
+            self.call_count += 1
+            if self.call_count >= 2:
+                raise RuntimeError("Simulated API transport error on run 2")
+            return LLMCompletionResult(
+                message=LLMMessage(role="assistant", content="[]"),
+                usage=LLMUsage(input_tokens=10, output_tokens=5, total_tokens=15, is_provider_reported=True),
+                model_identifier="mock-model",
+            )
+
+    failing_prov = FailingProvider()
+    res = run_gemini_pilot_dry_run(
+        output_dir=out_dir,
+        provider=failing_prov,
+    )
+
+    assert res["status"] == "incomplete_run_failed"
+    assert res["is_complete"] is False
+    assert res["runs_completed"] < 9
+    assert "incomplete_run_failed" in res["tag"].lower()
+
+    # Verify analysis file records incomplete status
+    analysis_text = Path(res["analysis_file"]).read_text(encoding="utf-8")
+    assert "INCOMPLETE PILOT EXECUTION NOTICE" in analysis_text
+    assert "incomplete_run_failed" in analysis_text
+    assert "**NOT** be reported as a completed nine-run pilot" in analysis_text

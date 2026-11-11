@@ -519,6 +519,8 @@ class ExperimentRunner:
         experiment_config_version: str = "1.0.0",
         provider_mode: str = "simulated",
         model_name: str = "mock-model",
+        condition_c_max_model_requests: Optional[int] = None,
+        condition_c_max_inspections: Optional[int] = None,
     ) -> None:
         self.fixtures = fixtures
         self.tasks = {t.task_id: t for t in tasks}
@@ -533,6 +535,8 @@ class ExperimentRunner:
         self.experiment_config_version = experiment_config_version
         self.provider_mode = provider_mode
         self.model_name = model_name
+        self.condition_c_max_model_requests = condition_c_max_model_requests
+        self.condition_c_max_inspections = condition_c_max_inspections
 
         # Calculate dataset hashes for traceability
         fixtures_raw = json.dumps(
@@ -596,7 +600,11 @@ class ExperimentRunner:
             builder_c = ObjectContextBuilder()
             prompt_template_hash = compute_sha256(builder_c.SYSTEM_PROMPT.encode("utf-8"))
             context_res = builder_c.build(context_req)
-            agent = ConditionCAgent(provider=active_provider)
+            agent = ConditionCAgent(
+                provider=active_provider,
+                max_model_requests=self.condition_c_max_model_requests,
+                max_inspection_calls=self.condition_c_max_inspections,
+            )
             # ObjectContextBuilder implements ObjectInspector
             inspector = builder_c
 

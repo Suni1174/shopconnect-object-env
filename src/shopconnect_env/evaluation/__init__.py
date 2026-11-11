@@ -12,6 +12,9 @@ Exports:
 
 from shopconnect_env.evaluation.gemini_pilot import (
     GeminiPilotRequestGuardrailProvider,
+    MAX_REQUESTS_PER_CONDITION_C,
+    MAX_THEORETICAL_TOTAL_REQUESTS,
+    SequentialRateLimiter,
     create_gemini_pilot_mock_provider,
     run_gemini_pilot_dry_run,
     run_gemini_pilot_preflight,
@@ -68,6 +71,8 @@ __all__ = [
     "FixtureValidationError",
     "GeminiPilotRequestGuardrailProvider",
     "MAX_PILOT_RUNS",
+    "MAX_REQUESTS_PER_CONDITION_C",
+    "MAX_THEORETICAL_TOTAL_REQUESTS",
     "MAX_TOTAL_PROVIDER_REQUESTS",
     "OutcomeEvaluator",
     "PILOT_CONDITIONS",
@@ -81,6 +86,7 @@ __all__ = [
     "PricingConfig",
     "RunMetrics",
     "RunRecord",
+    "SequentialRateLimiter",
     "TaskValidationError",
     "calculate_cost",
     "calculate_percentile",

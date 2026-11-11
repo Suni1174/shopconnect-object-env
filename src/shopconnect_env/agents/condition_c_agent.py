@@ -198,9 +198,20 @@ class ConditionCAgent(BaseAgent):
     MAX_MODEL_REQUESTS: int = 6
     MAX_INSPECTION_CALLS: int = 5
 
-    def __init__(self, provider: LLMProvider) -> None:
-        """Initialize ConditionCAgent with an LLMProvider."""
+    def __init__(
+        self,
+        provider: LLMProvider,
+        max_model_requests: Optional[int] = None,
+        max_inspection_calls: Optional[int] = None,
+    ) -> None:
+        """Initialize ConditionCAgent with an LLMProvider and optional custom limits."""
         self.provider = provider
+        self.max_model_requests: int = (
+            max_model_requests if max_model_requests is not None else self.MAX_MODEL_REQUESTS
+        )
+        self.max_inspection_calls: int = (
+            max_inspection_calls if max_inspection_calls is not None else self.MAX_INSPECTION_CALLS
+        )
 
     def propose_action(
         self,
@@ -248,7 +259,7 @@ class ConditionCAgent(BaseAgent):
         last_raw_output: str = ""
 
         # Multi-turn interaction loop
-        while model_requests_count < self.MAX_MODEL_REQUESTS:
+        while model_requests_count < self.max_model_requests:
             model_requests_count += 1
             completion = self.provider.complete(messages=messages, tools=tools, tool_choice="auto")
             last_raw_output = completion.message.content or ""
@@ -409,12 +420,12 @@ class ConditionCAgent(BaseAgent):
                     "inspect_plan",
                     "inspect_preferences",
                 ):
-                    # Check inspection call limit (MAX 5)
-                    if inspection_calls_count >= self.MAX_INSPECTION_CALLS:
+                    # Check inspection call limit
+                    if inspection_calls_count >= self.max_inspection_calls:
                         # Reached maximum allowed domain inspections
                         error_payload = {
                             "error": (
-                                f"MAX_INSPECTION_CALLS_EXCEEDED: Reached maximum of {self.MAX_INSPECTION_CALLS} "
+                                f"MAX_INSPECTION_CALLS_EXCEEDED: Reached maximum of {self.max_inspection_calls} "
                                 "inspection calls. You must now submit a proposal or call finalize_no_action."
                             )
                         }
@@ -462,13 +473,13 @@ class ConditionCAgent(BaseAgent):
                 break
 
             # If no inspection was executed and limit reached, break
-            if not executed_any_inspection and inspection_calls_count >= self.MAX_INSPECTION_CALLS:
+            if not executed_any_inspection and inspection_calls_count >= self.max_inspection_calls:
                 break
 
         # Check if loop terminated due to model request ceiling
-        if model_requests_count >= self.MAX_MODEL_REQUESTS and final_proposal is None and not final_rationale:
+        if model_requests_count >= self.max_model_requests and final_proposal is None and not final_rationale:
             final_rationale = (
-                f"MAX_MODEL_REQUESTS_EXCEEDED: Reached limit of {self.MAX_MODEL_REQUESTS} "
+                f"MAX_MODEL_REQUESTS_EXCEEDED: Reached limit of {self.max_model_requests} "
                 "requests without producing a final action proposal."
             )
 

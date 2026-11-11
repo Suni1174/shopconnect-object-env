@@ -812,6 +812,7 @@ class GeminiProvider:
         max_output_tokens: Optional[int] = DEFAULT_OUTPUT_TOKEN_CEILING,
         timeout_seconds: float = 60.0,
         client: Optional[Any] = None,
+        max_retries: int = 0,
     ) -> None:
         """Initialize GeminiProvider.
 
@@ -822,6 +823,7 @@ class GeminiProvider:
             max_output_tokens: Output token ceiling per request (default: 2048).
             timeout_seconds: Request timeout in seconds.
             client: Optional injected GenAI client or test double for offline testing.
+            max_retries: Maximum SDK retries (default: 0 to enforce single-attempt execution).
         """
         self.model = model
         self.thinking_level = thinking_level
@@ -830,6 +832,7 @@ class GeminiProvider:
         self._explicit_api_key = api_key
         self._injected_client = client
         self._client: Optional[Any] = client
+        self.max_retries = max_retries
 
     def __repr__(self) -> str:
         """Return safe string representation without exposing API credentials."""
