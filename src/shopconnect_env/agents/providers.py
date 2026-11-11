@@ -91,6 +91,9 @@ class LLMUsage:
         reasoning_tokens: Internal thinking tokens (if reported by provider).
         is_provider_reported: True if numbers originate directly from the API;
                              False if simulated by a mock provider.
+        cache_write_tokens: General cache creation tokens (if reported).
+        cache_write_tokens_30m: 30-minute retention cache write tokens (if reported).
+        cache_write_tokens_12h: 12-hour retention cache write tokens (if reported).
     """
 
     input_tokens: int
@@ -99,6 +102,9 @@ class LLMUsage:
     cached_input_tokens: Optional[int] = None
     reasoning_tokens: Optional[int] = None
     is_provider_reported: bool = True
+    cache_write_tokens: Optional[int] = None
+    cache_write_tokens_30m: Optional[int] = None
+    cache_write_tokens_12h: Optional[int] = None
 
 
 def aggregate_usages(usages: List[Optional[LLMUsage]]) -> Optional[LLMUsage]:
@@ -130,6 +136,27 @@ def aggregate_usages(usages: List[Optional[LLMUsage]]) -> Optional[LLMUsage]:
         else None
     )
 
+    has_cw = any(u.cache_write_tokens is not None for u in valid_usages)
+    cache_write_tokens = (
+        sum(u.cache_write_tokens for u in valid_usages if u.cache_write_tokens is not None)
+        if has_cw
+        else None
+    )
+
+    has_cw_30m = any(u.cache_write_tokens_30m is not None for u in valid_usages)
+    cache_write_tokens_30m = (
+        sum(u.cache_write_tokens_30m for u in valid_usages if u.cache_write_tokens_30m is not None)
+        if has_cw_30m
+        else None
+    )
+
+    has_cw_12h = any(u.cache_write_tokens_12h is not None for u in valid_usages)
+    cache_write_tokens_12h = (
+        sum(u.cache_write_tokens_12h for u in valid_usages if u.cache_write_tokens_12h is not None)
+        if has_cw_12h
+        else None
+    )
+
     is_provider_reported = all(u.is_provider_reported for u in valid_usages)
 
     return LLMUsage(
@@ -139,6 +166,9 @@ def aggregate_usages(usages: List[Optional[LLMUsage]]) -> Optional[LLMUsage]:
         cached_input_tokens=cached_input_tokens,
         reasoning_tokens=reasoning_tokens,
         is_provider_reported=is_provider_reported,
+        cache_write_tokens=cache_write_tokens,
+        cache_write_tokens_30m=cache_write_tokens_30m,
+        cache_write_tokens_12h=cache_write_tokens_12h,
     )
 
 
@@ -146,7 +176,7 @@ def usage_to_dict(usage: Optional[LLMUsage]) -> Optional[Dict[str, Any]]:
     """Convert an LLMUsage instance to a serializable dictionary, or None if usage is None."""
     if usage is None:
         return None
-    return {
+    res = {
         "input_tokens": usage.input_tokens,
         "output_tokens": usage.output_tokens,
         "total_tokens": usage.total_tokens,
@@ -154,6 +184,13 @@ def usage_to_dict(usage: Optional[LLMUsage]) -> Optional[Dict[str, Any]]:
         "reasoning_tokens": usage.reasoning_tokens,
         "is_provider_reported": usage.is_provider_reported,
     }
+    if usage.cache_write_tokens is not None:
+        res["cache_write_tokens"] = usage.cache_write_tokens
+    if usage.cache_write_tokens_30m is not None:
+        res["cache_write_tokens_30m"] = usage.cache_write_tokens_30m
+    if usage.cache_write_tokens_12h is not None:
+        res["cache_write_tokens_12h"] = usage.cache_write_tokens_12h
+    return res
 
 
 @dataclass(frozen=True)
@@ -209,6 +246,8 @@ class LLMProvider(Protocol):
         tool_choice: Optional[str] = None,
         response_format: Optional[Dict[str, Any]] = None,
         reasoning_effort: str = "low",
+        max_output_tokens: Optional[int] = None,
+        **kwargs: Any,
     ) -> LLMCompletionResult:
         """Execute a completion request against the underlying model.
 
@@ -218,6 +257,8 @@ class LLMProvider(Protocol):
             tool_choice: Optional tool selection constraint ('auto', 'required', or name).
             response_format: Optional structured output schema constraint.
             reasoning_effort: Effort parameter for reasoning models ('low', 'medium', 'high').
+            max_output_tokens: Optional ceiling on generated output tokens.
+            kwargs: Additional provider-specific parameters.
 
         Returns:
             An LLMCompletionResult containing the response message, usage, and metadata.
@@ -270,6 +311,8 @@ class MockLLMProvider:
         tool_choice: Optional[str] = None,
         response_format: Optional[Dict[str, Any]] = None,
         reasoning_effort: str = "low",
+        max_output_tokens: Optional[int] = None,
+        **kwargs: Any,
     ) -> LLMCompletionResult:
         """Return a deterministic completion without network access."""
         self.call_history.append({
@@ -278,6 +321,8 @@ class MockLLMProvider:
             "tool_choice": tool_choice,
             "response_format": response_format,
             "reasoning_effort": reasoning_effort,
+            "max_output_tokens": max_output_tokens,
+            **kwargs,
         })
 
         # 1. Sequential queue matching (first priority for multi-turn dialogues)
@@ -364,6 +409,7 @@ class OpenAIProvider:
     """
 
     DEFAULT_MODEL: str = "gpt-6-luna"
+    DEFAULT_OUTPUT_TOKEN_CEILING: int = 2048
 
     def __init__(
         self,
@@ -372,6 +418,8 @@ class OpenAIProvider:
         reasoning_effort: str = "low",
         timeout_seconds: float = 60.0,
         client: Optional[Any] = None,
+        max_output_tokens: Optional[int] = DEFAULT_OUTPUT_TOKEN_CEILING,
+        max_retries: int = 0,
     ) -> None:
         """Initialize OpenAIProvider.
 
@@ -381,6 +429,8 @@ class OpenAIProvider:
             reasoning_effort: Fixed reasoning effort (default: 'low').
             timeout_seconds: Request timeout in seconds.
             client: Optional injected OpenAI client or test double for offline testing.
+            max_output_tokens: Output token ceiling per request (default: 2048).
+            max_retries: Maximum SDK retries (default: 0 to prevent uncontrolled retry loops).
         """
         self.model = model
         self.reasoning_effort = reasoning_effort
@@ -388,6 +438,8 @@ class OpenAIProvider:
         self._explicit_api_key = api_key
         self._injected_client = client
         self._client: Optional[Any] = client
+        self.max_output_tokens = max_output_tokens
+        self.max_retries = max_retries
 
     def __repr__(self) -> str:
         """Return safe string representation without exposing API credentials."""
@@ -409,6 +461,7 @@ class OpenAIProvider:
         self._client = openai.OpenAI(
             api_key=api_key.strip(),
             timeout=self.timeout_seconds,
+            max_retries=self.max_retries,
         )
         return self._client
 
@@ -428,6 +481,7 @@ class OpenAIProvider:
         tool_choice: Optional[str] = None,
         response_format: Optional[Dict[str, Any]] = None,
         reasoning_effort: Optional[str] = None,
+        max_output_tokens: Optional[int] = None,
     ) -> LLMCompletionResult:
         """Execute a completion using the OpenAI Responses API.
 
@@ -438,6 +492,7 @@ class OpenAIProvider:
         """
         client = self._get_client()
         effort = reasoning_effort or self.reasoning_effort
+        effective_max_tokens = max_output_tokens if max_output_tokens is not None else self.max_output_tokens
 
         # 1. Format input items and separate system instructions
         instructions_parts: List[str] = []
@@ -477,6 +532,9 @@ class OpenAIProvider:
         }
         if instructions:
             request_kwargs["instructions"] = instructions
+
+        if effective_max_tokens is not None:
+            request_kwargs["max_output_tokens"] = effective_max_tokens
 
         formatted_tools = convert_to_responses_api_tools(tools)
         if formatted_tools:
@@ -596,6 +654,39 @@ class OpenAIProvider:
             out_details = getattr(usage_obj, "output_tokens_details", None) or getattr(usage_obj, "completion_tokens_details", None)
             if out_details is not None:
                 reasoning_tok = getattr(out_details, "reasoning_tokens", None)
+                if reasoning_tok is None and isinstance(out_details, dict):
+                    reasoning_tok = out_details.get("reasoning_tokens")
+
+            # Cache write tokens (if reported)
+            cw_tok: Optional[int] = None
+            cw_30m: Optional[int] = None
+            cw_12h: Optional[int] = None
+
+            if in_details is not None:
+                if cached_tok is None and isinstance(in_details, dict):
+                    cached_tok = in_details.get("cached_tokens")
+
+                cw_tok = getattr(in_details, "cache_write_tokens", None) or getattr(in_details, "cache_creation_tokens", None)
+                if cw_tok is None and isinstance(in_details, dict):
+                    cw_tok = in_details.get("cache_write_tokens") or in_details.get("cache_creation_tokens")
+
+                cw_30m = getattr(in_details, "cache_write_tokens_30m", None)
+                if cw_30m is None and isinstance(in_details, dict):
+                    cw_30m = in_details.get("cache_write_tokens_30m")
+
+                cw_12h = getattr(in_details, "cache_write_tokens_12h", None)
+                if cw_12h is None and isinstance(in_details, dict):
+                    cw_12h = in_details.get("cache_write_tokens_12h")
+
+            if cw_tok is None:
+                cw_tok = getattr(usage_obj, "cache_write_tokens", None) or getattr(usage_obj, "cache_creation_tokens", None)
+            if cw_30m is None:
+                cw_30m = getattr(usage_obj, "cache_write_tokens_30m", None)
+            if cw_12h is None:
+                cw_12h = getattr(usage_obj, "cache_write_tokens_12h", None)
+
+            if cw_tok is None and (cw_30m is not None or cw_12h is not None):
+                cw_tok = (int(cw_30m) if cw_30m is not None else 0) + (int(cw_12h) if cw_12h is not None else 0)
 
             usage = LLMUsage(
                 input_tokens=int(in_tok),
@@ -604,6 +695,9 @@ class OpenAIProvider:
                 cached_input_tokens=int(cached_tok) if cached_tok is not None else None,
                 reasoning_tokens=int(reasoning_tok) if reasoning_tok is not None else None,
                 is_provider_reported=True,
+                cache_write_tokens=int(cw_tok) if cw_tok is not None else None,
+                cache_write_tokens_30m=int(cw_30m) if cw_30m is not None else None,
+                cache_write_tokens_12h=int(cw_12h) if cw_12h is not None else None,
             )
 
         model_id = getattr(response, "model", self.model) or self.model
