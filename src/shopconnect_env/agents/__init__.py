@@ -17,6 +17,7 @@ from shopconnect_env.agents.providers import (
     AuthenticationError,
     ConfigurationError,
     ConnectionError,
+    GeminiProvider,
     LLMCompletionResult,
     LLMMessage,
     LLMProvider,
@@ -28,6 +29,7 @@ from shopconnect_env.agents.providers import (
     RateLimitError,
     TimeoutError,
     aggregate_usages,
+    convert_to_gemini_tools,
     convert_to_responses_api_tools,
     usage_to_dict,
 )
@@ -41,6 +43,7 @@ __all__ = [
     "ConditionCAgent",
     "ConfigurationError",
     "ConnectionError",
+    "GeminiProvider",
     "LLMCompletionResult",
     "LLMMessage",
     "LLMProvider",
@@ -54,6 +57,7 @@ __all__ = [
     "RateLimitError",
     "TimeoutError",
     "aggregate_usages",
+    "convert_to_gemini_tools",
     "convert_to_responses_api_tools",
     "usage_to_dict",
 ]

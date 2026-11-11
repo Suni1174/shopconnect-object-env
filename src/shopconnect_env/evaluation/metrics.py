@@ -42,6 +42,10 @@ class PricingConfig:
     long_context_input_cost_per_million: Optional[Decimal] = None
     long_context_output_cost_per_million: Optional[Decimal] = None
     cache_retention: Optional[str] = "30m"
+    provider_name: str = "OpenAI"
+    billing_tier: Optional[str] = None
+    api_type: str = "Responses"
+    privacy_notice: Optional[str] = None
 
     def is_complete(self) -> bool:
         """Return True if base input and output rates are defined."""
@@ -218,6 +222,87 @@ def create_gpt6_luna_pricing(
         long_context_input_cost_per_million=long_context_input_cost_per_million,
         long_context_output_cost_per_million=long_context_output_cost_per_million,
         cache_retention=cache_retention,
+        provider_name="OpenAI",
+        billing_tier="paid",
+        api_type="Responses",
+    )
+
+
+def create_gemini_38_flash_pricing(
+    billing_tier: str = "unknown",
+    version: str = "2026-11-gemini-v1",
+    source: str = "Google Official Gemini API Pricing Schedule",
+    source_url: str = "https://ai.google.dev/gemini-api/docs/pricing",
+    effective_date: str = "2026-11-01",
+    verification_date: Optional[str] = "2026-11-11",
+    model_name: str = "gemini-3.8-flash",
+    pricing_mode: str = "Standard",
+    currency: str = "USD",
+    api_type: str = "generate_content",
+    privacy_notice: str = (
+        "Free tier data may be used by Google for product improvement. "
+        "Benchmark uses synthetic data only; no personal or confidential information included."
+    ),
+    input_cost_per_million: Optional[Decimal] = None,
+    cached_input_cost_per_million: Optional[Decimal] = None,
+    output_cost_per_million: Optional[Decimal] = None,
+) -> PricingConfig:
+    """Create pricing configuration for Google Gemini 3.8 Flash.
+
+    Differentiates free tier ($0.00), paid tier, and unknown billing tier.
+    Default billing_tier is strictly 'unknown'.
+    Never infer that an account is on the free tier from the model name or availability.
+    The 'free_tier' option represents a user-provided reporting assumption, NOT an
+    account-billing verification.
+
+    If billing_tier is 'unknown', input and output rates are None, causing
+    monetary cost calculations to strictly evaluate to None (unknown cost),
+    never falsely declaring zero cost.
+
+    Rates per 1M tokens (Standard):
+    - Free tier: $0.00 input, $0.00 cached, $0.00 output (user reporting assumption only)
+    - Paid tier: $0.75 input, $0.075 cached, $3.75 output (user reporting assumption only)
+    - Unknown (DEFAULT): None (evaluates strictly to None, preventing false zero-cost reports)
+
+    Google Official References:
+    - https://ai.google.dev/gemini-api/docs/pricing
+    - https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash
+    """
+    valid_tiers = {"unknown", "free_tier", "paid_tier"}
+    if billing_tier not in valid_tiers:
+        raise ValueError(
+            f"Invalid billing_tier '{billing_tier}'. Must be one of: {sorted(valid_tiers)}."
+        )
+
+    if billing_tier == "free_tier":
+        in_rate = Decimal("0.00") if input_cost_per_million is None else input_cost_per_million
+        cached_rate = Decimal("0.00") if cached_input_cost_per_million is None else cached_input_cost_per_million
+        out_rate = Decimal("0.00") if output_cost_per_million is None else output_cost_per_million
+    elif billing_tier == "paid_tier":
+        in_rate = Decimal("0.75") if input_cost_per_million is None else input_cost_per_million
+        cached_rate = Decimal("0.075") if cached_input_cost_per_million is None else cached_input_cost_per_million
+        out_rate = Decimal("3.75") if output_cost_per_million is None else output_cost_per_million
+    else:  # unknown
+        in_rate = None
+        cached_rate = None
+        out_rate = None
+
+    return PricingConfig(
+        version=version,
+        source=source,
+        effective_date=effective_date,
+        currency=currency,
+        input_cost_per_million=in_rate,
+        cached_input_cost_per_million=cached_rate,
+        output_cost_per_million=out_rate,
+        verification_date=verification_date,
+        model_name=model_name,
+        pricing_mode=pricing_mode,
+        source_url=source_url,
+        provider_name="Google",
+        billing_tier=billing_tier,
+        api_type=api_type,
+        privacy_notice=privacy_notice,
     )
 
 

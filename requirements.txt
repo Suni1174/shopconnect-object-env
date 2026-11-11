@@ -3,3 +3,5 @@ pydantic==2.14.3
 pytest==9.2.0
 # Stage 6: OpenAI Python SDK with native Responses API (client.responses.create)
 openai==3.49.0
+# Stage 6: Official Google GenAI SDK for Gemini Provider
+google-genai==3.1.0

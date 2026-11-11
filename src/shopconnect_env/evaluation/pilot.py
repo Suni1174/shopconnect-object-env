@@ -30,6 +30,11 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
+# Ensure src/ is in sys.path for direct CLI script execution
+_src_root = str(Path(__file__).resolve().parent.parent.parent)
+if _src_root not in sys.path:
+    sys.path.insert(0, _src_root)
+
 from shopconnect_env.agents.providers import (
     LLMCompletionResult,
     LLMMessage,

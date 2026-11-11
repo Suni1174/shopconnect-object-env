@@ -86,7 +86,7 @@ class LLMUsage:
     Attributes:
         input_tokens: Billed input prompt tokens.
         output_tokens: Billed completion/generation tokens.
-        total_tokens: Sum of input and output tokens.
+        total_tokens: Total tokens reported directly by provider API, or None if omitted.
         cached_input_tokens: Billed input tokens served from provider cache (if available).
         reasoning_tokens: Internal thinking tokens (if reported by provider).
         is_provider_reported: True if numbers originate directly from the API;
@@ -94,17 +94,20 @@ class LLMUsage:
         cache_write_tokens: General cache creation tokens (if reported).
         cache_write_tokens_30m: 30-minute retention cache write tokens (if reported).
         cache_write_tokens_12h: 12-hour retention cache write tokens (if reported).
+        derived_total_tokens: Derived sum (input_tokens + output_tokens) with explicit derived provenance,
+                             used when the provider API omits a native total_tokens count.
     """
 
     input_tokens: int
     output_tokens: int
-    total_tokens: int
+    total_tokens: Optional[int] = None
     cached_input_tokens: Optional[int] = None
     reasoning_tokens: Optional[int] = None
     is_provider_reported: bool = True
     cache_write_tokens: Optional[int] = None
     cache_write_tokens_30m: Optional[int] = None
     cache_write_tokens_12h: Optional[int] = None
+    derived_total_tokens: Optional[int] = None
 
 
 def aggregate_usages(usages: List[Optional[LLMUsage]]) -> Optional[LLMUsage]:
@@ -120,7 +123,13 @@ def aggregate_usages(usages: List[Optional[LLMUsage]]) -> Optional[LLMUsage]:
 
     input_tokens = sum(u.input_tokens for u in valid_usages)
     output_tokens = sum(u.output_tokens for u in valid_usages)
-    total_tokens = sum(u.total_tokens for u in valid_usages)
+
+    has_total = any(u.total_tokens is not None for u in valid_usages)
+    total_tokens = (
+        sum(u.total_tokens for u in valid_usages if u.total_tokens is not None)
+        if has_total
+        else None
+    )
 
     has_cached = any(u.cached_input_tokens is not None for u in valid_usages)
     cached_input_tokens = (
@@ -159,6 +168,16 @@ def aggregate_usages(usages: List[Optional[LLMUsage]]) -> Optional[LLMUsage]:
 
     is_provider_reported = all(u.is_provider_reported for u in valid_usages)
 
+    has_derived = any(u.derived_total_tokens is not None for u in valid_usages)
+    derived_total_tokens = (
+        sum(
+            (u.derived_total_tokens if u.derived_total_tokens is not None else (u.input_tokens + u.output_tokens))
+            for u in valid_usages
+        )
+        if (has_derived or total_tokens is None)
+        else None
+    )
+
     return LLMUsage(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
@@ -169,6 +188,7 @@ def aggregate_usages(usages: List[Optional[LLMUsage]]) -> Optional[LLMUsage]:
         cache_write_tokens=cache_write_tokens,
         cache_write_tokens_30m=cache_write_tokens_30m,
         cache_write_tokens_12h=cache_write_tokens_12h,
+        derived_total_tokens=derived_total_tokens,
     )
 
 
@@ -184,6 +204,8 @@ def usage_to_dict(usage: Optional[LLMUsage]) -> Optional[Dict[str, Any]]:
         "reasoning_tokens": usage.reasoning_tokens,
         "is_provider_reported": usage.is_provider_reported,
     }
+    if usage.derived_total_tokens is not None:
+        res["derived_total_tokens"] = usage.derived_total_tokens
     if usage.cache_write_tokens is not None:
         res["cache_write_tokens"] = usage.cache_write_tokens
     if usage.cache_write_tokens_30m is not None:
@@ -718,6 +740,447 @@ class OpenAIProvider:
             usage=usage,
             model_identifier=model_id,
             system_fingerprint=sys_fp,
+            provider_request_id=req_id,
+            latency_ms=latency_ms,
+            finish_reason=finish_reason,
+            raw_response=raw_meta,
+        )
+
+
+# =============================================================================
+# 6. GOOGLE GEMINI PROVIDER ADAPTER
+# =============================================================================
+
+def convert_to_gemini_tools(tools: Optional[List[Dict[str, Any]]]) -> Optional[List[Any]]:
+    """Convert Stage 4/5/6 tool specifications to google-genai Tool declarations.
+
+    Ensures compatibility with client.models.generate_content(config=...).
+    Does not enable grounding, code execution, web search, or other paid tools.
+    """
+    if not tools:
+        return None
+    from google.genai import types
+
+    func_decls: List[Dict[str, Any]] = []
+    for tool in tools:
+        if tool.get("type") == "function":
+            fn = tool.get("function", tool)
+            func_decls.append({
+                "name": fn["name"],
+                "description": fn.get("description", ""),
+                "parameters": fn.get("parameters", {}),
+            })
+        elif "name" in tool:
+            func_decls.append({
+                "name": tool["name"],
+                "description": tool.get("description", ""),
+                "parameters": tool.get("parameters", {}),
+            })
+
+    if not func_decls:
+        return None
+
+    return [types.Tool(function_declarations=func_decls)]
+
+
+class GeminiProvider:
+    """Provider adapter connecting to Google GenAI SDK for gemini-3.8-flash.
+
+    Enforces ShopConnect architectural constraints:
+    - Target model: gemini-3.8-flash (default).
+    - Thinking level: 'low' by default via types.ThinkingConfig(thinking_level=...).
+    - Manual function calling: automatic_function_calling disabled so trusted Python
+      and condition agents retain exclusive control over tool dispatch and policy validation.
+    - Output token ceiling: 2048 default (types.GenerateContentConfig.max_output_tokens).
+    - Temperature parameter omitted.
+    - Credentials loaded strictly from GEMINI_API_KEY environment variable.
+    - Secrets never logged, echoed, or exposed in exceptions.
+    - Exact provider-reported usage capture (input, output, cached, thinking/reasoning).
+    - Missing usage fields left as None (never fabricated).
+    - Supports dependency injection of client for 100% offline unit testing.
+    """
+
+    DEFAULT_MODEL: str = "gemini-3.8-flash"
+    DEFAULT_OUTPUT_TOKEN_CEILING: int = 2048
+    DEFAULT_THINKING_LEVEL: str = "low"
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: str = DEFAULT_MODEL,
+        thinking_level: str = DEFAULT_THINKING_LEVEL,
+        max_output_tokens: Optional[int] = DEFAULT_OUTPUT_TOKEN_CEILING,
+        timeout_seconds: float = 60.0,
+        client: Optional[Any] = None,
+    ) -> None:
+        """Initialize GeminiProvider.
+
+        Args:
+            api_key: Optional explicit API key. If omitted, reads GEMINI_API_KEY from env.
+            model: Target model identifier (default: 'gemini-3.8-flash').
+            thinking_level: Thinking effort level ('low', 'medium', 'high', default: 'low').
+            max_output_tokens: Output token ceiling per request (default: 2048).
+            timeout_seconds: Request timeout in seconds.
+            client: Optional injected GenAI client or test double for offline testing.
+        """
+        self.model = model
+        self.thinking_level = thinking_level
+        self.max_output_tokens = max_output_tokens
+        self.timeout_seconds = timeout_seconds
+        self._explicit_api_key = api_key
+        self._injected_client = client
+        self._client: Optional[Any] = client
+
+    def __repr__(self) -> str:
+        """Return safe string representation without exposing API credentials."""
+        return f"GeminiProvider(model={self.model!r}, thinking_level={self.thinking_level!r})"
+
+    def _get_client(self) -> Any:
+        """Obtain or lazily instantiate the GenAI client with credential validation."""
+        if self._client is not None:
+            return self._client
+
+        api_key = self._explicit_api_key or os.environ.get("GEMINI_API_KEY")
+        if not api_key or not api_key.strip():
+            raise ConfigurationError(
+                "GEMINI_API_KEY environment variable is not set. "
+                "Provide an API key or inject a client for testing."
+            )
+
+        from google import genai
+        self._client = genai.Client(api_key=api_key.strip())
+        return self._client
+
+    @property
+    def sdk_version(self) -> Optional[str]:
+        """Return the installed version of the official google-genai SDK."""
+        try:
+            from google import genai
+            return getattr(genai, "__version__", None)
+        except ImportError:
+            return None
+
+    def complete(
+        self,
+        messages: List[LLMMessage],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        reasoning_effort: Optional[str] = None,
+        max_output_tokens: Optional[int] = None,
+        **kwargs: Any,
+    ) -> LLMCompletionResult:
+        """Execute a completion using the Google GenAI SDK.
+
+        Strictly enforces:
+        - Manual tool-call handling (automatic_function_calling disabled).
+        - Thinking level configuration (effort='low').
+        - Temperature parameter omitted.
+        - Error mapping with zero secret leakage.
+        """
+        client = self._get_client()
+        effort = (reasoning_effort or self.thinking_level).lower()
+        effective_max_tokens = max_output_tokens if max_output_tokens is not None else self.max_output_tokens
+
+        from google.genai import types
+
+        # 1. Format contents and separate system instructions
+        instructions_parts: List[str] = []
+        contents: List[types.Content] = []
+
+        for msg in messages:
+            if msg.role == "system":
+                if msg.content:
+                    instructions_parts.append(msg.content)
+            elif msg.role in ("user", "human"):
+                parts: List[types.Part] = []
+                if msg.content:
+                    parts.append(types.Part.from_text(text=msg.content))
+                contents.append(types.Content(role="user", parts=parts))
+            elif msg.role in ("assistant", "model"):
+                parts = []
+                if msg.content:
+                    parts.append(types.Part.from_text(text=msg.content))
+                if msg.tool_calls:
+                    for tc in msg.tool_calls:
+                        cid = tc.get("id") or tc.get("call_id")
+                        fn_data = tc.get("function", tc)
+                        fn_name = fn_data.get("name", tc.get("name", ""))
+                        raw_args = fn_data.get("arguments", tc.get("arguments", {}))
+                        if isinstance(raw_args, str):
+                            try:
+                                args_dict = json.loads(raw_args)
+                            except Exception:
+                                args_dict = {"raw_arguments": raw_args}
+                        elif isinstance(raw_args, dict):
+                            args_dict = dict(raw_args)
+                        else:
+                            args_dict = {}
+                        parts.append(
+                            types.Part(
+                                function_call=types.FunctionCall(
+                                    id=cid,
+                                    name=fn_name,
+                                    args=args_dict,
+                                )
+                            )
+                        )
+                contents.append(types.Content(role="model", parts=parts))
+            elif msg.role == "tool":
+                cid = msg.tool_call_id
+                fn_name = msg.name or "tool_response"
+                raw_out = msg.content or ""
+                if isinstance(raw_out, str):
+                    try:
+                        resp_dict = json.loads(raw_out)
+                        if not isinstance(resp_dict, dict):
+                            resp_dict = {"output": raw_out}
+                    except Exception:
+                        resp_dict = {"output": raw_out}
+                elif isinstance(raw_out, dict):
+                    resp_dict = dict(raw_out)
+                else:
+                    resp_dict = {"output": str(raw_out)}
+
+                fr_part = types.Part(
+                    function_response=types.FunctionResponse(
+                        id=cid,
+                        name=fn_name,
+                        response=resp_dict,
+                    )
+                )
+                contents.append(types.Content(role="tool", parts=[fr_part]))
+
+        instructions = "\n\n".join(instructions_parts) if instructions_parts else None
+
+        # 2. Build GenerateContentConfig
+        config_kwargs: Dict[str, Any] = {
+            "max_output_tokens": effective_max_tokens,
+            "automatic_function_calling": types.AutomaticFunctionCallingConfig(disable=True),
+        }
+        if instructions:
+            config_kwargs["system_instruction"] = instructions
+
+        # Thinking config (low / medium / high)
+        if effort in ("low", "minimal"):
+            config_kwargs["thinking_config"] = types.ThinkingConfig(
+                thinking_level=types.ThinkingLevel.LOW,
+            )
+        elif effort == "medium":
+            config_kwargs["thinking_config"] = types.ThinkingConfig(
+                thinking_level=types.ThinkingLevel.MEDIUM,
+            )
+        elif effort == "high":
+            config_kwargs["thinking_config"] = types.ThinkingConfig(
+                thinking_level=types.ThinkingLevel.HIGH,
+            )
+
+        gemini_tools = convert_to_gemini_tools(tools)
+        if gemini_tools:
+            config_kwargs["tools"] = gemini_tools
+
+        if tool_choice:
+            tc_lower = tool_choice.lower()
+            if tc_lower == "auto":
+                config_kwargs["tool_config"] = types.ToolConfig(
+                    function_calling_config=types.FunctionCallingConfig(mode=types.FunctionCallingConfigMode.AUTO)
+                )
+            elif tc_lower in ("required", "any"):
+                config_kwargs["tool_config"] = types.ToolConfig(
+                    function_calling_config=types.FunctionCallingConfig(mode=types.FunctionCallingConfigMode.ANY)
+                )
+            elif tc_lower == "none":
+                config_kwargs["tool_config"] = types.ToolConfig(
+                    function_calling_config=types.FunctionCallingConfig(mode=types.FunctionCallingConfigMode.NONE)
+                )
+            else:
+                config_kwargs["tool_config"] = types.ToolConfig(
+                    function_calling_config=types.FunctionCallingConfig(
+                        mode=types.FunctionCallingConfigMode.ANY,
+                        allowed_function_names=[tool_choice],
+                    )
+                )
+
+        if response_format:
+            fmt_type = response_format.get("type")
+            if fmt_type in ("json_object", "application/json"):
+                config_kwargs["response_mime_type"] = "application/json"
+            if "schema" in response_format:
+                config_kwargs["response_schema"] = response_format["schema"]
+
+        gen_config = types.GenerateContentConfig(**config_kwargs)
+
+        # 3. Execute request with stopwatch timing and exception mapping
+        t0 = time.perf_counter()
+        try:
+            raw_response = client.models.generate_content(
+                model=self.model,
+                contents=contents,
+                config=gen_config,
+            )
+        except Exception as exc:
+            self._handle_api_exception(exc)
+
+        latency_ms = (time.perf_counter() - t0) * 1000.0
+
+        # 4. Parse response output text and tool calls
+        return self._parse_response(raw_response, latency_ms)
+
+    def _handle_api_exception(self, exc: Exception) -> None:
+        """Map underlying SDK exceptions to typed ProviderError classes without leaking credentials."""
+        exc_type = type(exc).__name__
+        exc_msg = str(exc)
+        status_code = getattr(exc, "code", getattr(exc, "status_code", getattr(exc, "status", None)))
+
+        clean_detail = exc_msg.split("\n")[0] if exc_msg else exc_type
+        for secret in filter(None, [self._explicit_api_key, os.environ.get("GEMINI_API_KEY")]):
+            clean_detail = clean_detail.replace(secret, "[REDACTED_API_KEY]")
+
+        # 1. Authentication / Unauthorized (401, 403, API_KEY_INVALID, PERMISSION_DENIED)
+        if (
+            status_code in (401, 403)
+            or "API_KEY_INVALID" in exc_msg
+            or "PERMISSION_DENIED" in exc_msg
+            or "Unauthorized" in exc_msg
+            or "unauthenticated" in exc_msg.lower()
+        ):
+            raise AuthenticationError("Authentication failed: invalid or unauthorized Gemini API key.") from None
+
+        # 2. Rate limit / Quota exceeded (429, RESOURCE_EXHAUSTED)
+        if (
+            status_code == 429
+            or "RESOURCE_EXHAUSTED" in exc_msg
+            or "429" in exc_msg
+            or "rate limit" in exc_msg.lower()
+            or "quota" in exc_msg.lower()
+        ):
+            raise RateLimitError("Gemini API rate limit or quota exceeded.") from None
+
+        # 3. Timeout (408, 504, DEADLINE_EXCEEDED)
+        if (
+            status_code in (408, 504)
+            or "DEADLINE_EXCEEDED" in exc_msg
+            or "timed out" in exc_msg.lower()
+            or "timeout" in exc_msg.lower()
+        ):
+            raise TimeoutError("Gemini API request timed out.") from None
+
+        # 4. Connection failure
+        if (
+            "connection" in exc_msg.lower()
+            or "unavailable" in exc_msg.lower()
+            or "connect" in exc_msg.lower()
+            or "httpx" in exc_type.lower()
+        ):
+            raise ConnectionError("Failed to connect to Gemini API endpoint.") from None
+
+        # 5. Configuration / Model not found (404, NOT_FOUND)
+        if status_code == 404 or "NOT_FOUND" in exc_msg:
+            raise ConfigurationError(f"Gemini model '{self.model}' not found or unavailable.") from None
+
+        # 6. Safety block
+        if "safety" in exc_msg.lower() or "blocked" in exc_msg.lower():
+            raise ProviderError(f"Gemini request blocked by safety policy: {clean_detail}") from None
+
+        raise ProviderError(f"Gemini API provider error ({exc_type}): {clean_detail}") from None
+
+    def _parse_response(self, response: Any, latency_ms: float) -> LLMCompletionResult:
+        """Extract standardized LLMCompletionResult from Gemini GenerateContentResponse object."""
+        tool_calls: List[Dict[str, Any]] = []
+        content_parts: List[str] = []
+        finish_reason = "stop"
+
+        candidates = getattr(response, "candidates", None) or []
+        if candidates:
+            cand = candidates[0]
+            raw_fr = getattr(cand, "finish_reason", None)
+            if raw_fr is not None:
+                fr_str = str(raw_fr.value if hasattr(raw_fr, "value") else raw_fr)
+                finish_reason = fr_str.lower()
+                if "safety" in finish_reason or "blocked" in finish_reason:
+                    raise ProviderError(f"Gemini generation was blocked by safety filters (finish_reason: {fr_str}).")
+
+            content_obj = getattr(cand, "content", None)
+            if content_obj:
+                parts = getattr(content_obj, "parts", None) or []
+                for part in parts:
+                    fc = getattr(part, "function_call", None)
+                    if fc is not None:
+                        cid = getattr(fc, "id", None)
+                        fn_name = getattr(fc, "name", "")
+                        raw_args = getattr(fc, "args", {})
+                        if isinstance(raw_args, dict):
+                            args_str = json.dumps(raw_args)
+                        elif isinstance(raw_args, str):
+                            args_str = raw_args
+                        else:
+                            args_str = "{}"
+                        tool_calls.append({
+                            "id": cid,
+                            "call_id": cid,
+                            "type": "function",
+                            "function": {
+                                "name": fn_name,
+                                "arguments": args_str,
+                            },
+                        })
+                    else:
+                        is_thought = getattr(part, "thought", False)
+                        text_val = getattr(part, "text", None)
+                        if text_val and not is_thought:
+                            content_parts.append(text_val)
+
+        text_content = "".join(content_parts) if content_parts else getattr(response, "text", None)
+        if not text_content and not tool_calls and candidates:
+            text_content = getattr(response, "text", None)
+
+        msg = LLMMessage(
+            role="assistant",
+            content=text_content,
+            tool_calls=tuple(tool_calls) if tool_calls else None,
+        )
+
+        # 2. Token usage extraction
+        usage: Optional[LLMUsage] = None
+        usage_meta = getattr(response, "usage_metadata", None)
+        if usage_meta is not None:
+            in_tok = getattr(usage_meta, "prompt_token_count", None) or 0
+            out_tok = getattr(usage_meta, "candidates_token_count", None) or 0
+            tot_tok = getattr(usage_meta, "total_token_count", None)
+
+            cached_tok = getattr(usage_meta, "cached_content_token_count", None)
+            reasoning_tok = getattr(usage_meta, "thoughts_token_count", None)
+
+            # Strict provenance: If Gemini does not return total_token_count,
+            # preserve LLMUsage.total_tokens as None. Do not silently label a derived
+            # input + output sum as provider-reported usage. Expose derived_total_tokens separately.
+            total_tokens_val = int(tot_tok) if tot_tok is not None else None
+            derived_total = int(in_tok + out_tok)
+
+            usage = LLMUsage(
+                input_tokens=int(in_tok),
+                output_tokens=int(out_tok),
+                total_tokens=total_tokens_val,
+                cached_input_tokens=int(cached_tok) if cached_tok is not None else None,
+                reasoning_tokens=int(reasoning_tok) if reasoning_tok is not None else None,
+                is_provider_reported=True,
+                derived_total_tokens=derived_total,
+            )
+
+        model_id = getattr(response, "model_version", None) or self.model
+        req_id = getattr(response, "response_id", None)
+
+        raw_meta: Dict[str, Any] = {}
+        if req_id:
+            raw_meta["response_id"] = req_id
+        if hasattr(response, "create_time") and response.create_time:
+            raw_meta["create_time"] = str(response.create_time)
+
+        return LLMCompletionResult(
+            message=msg,
+            usage=usage,
+            model_identifier=model_id,
+            system_fingerprint=None,  # Gemini API does not expose system fingerprint; None documented
             provider_request_id=req_id,
             latency_ms=latency_ms,
             finish_reason=finish_reason,

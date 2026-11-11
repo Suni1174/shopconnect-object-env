@@ -10,6 +10,13 @@ Exports:
 - load_plan_fixtures
 """
 
+from shopconnect_env.evaluation.gemini_pilot import (
+    GeminiPilotRequestGuardrailProvider,
+    create_gemini_pilot_mock_provider,
+    run_gemini_pilot_dry_run,
+    run_gemini_pilot_preflight,
+    run_live_gemini_pilot,
+)
 from shopconnect_env.evaluation.metrics import (
     AggregateMetrics,
     PricingConfig,
@@ -17,6 +24,7 @@ from shopconnect_env.evaluation.metrics import (
     calculate_cost,
     calculate_percentile,
     compute_aggregate_metrics,
+    create_gemini_38_flash_pricing,
     create_gpt6_luna_pricing,
 )
 from shopconnect_env.evaluation.pilot import (
@@ -58,6 +66,7 @@ __all__ = [
     "ExpectedOutcome",
     "ExperimentRunner",
     "FixtureValidationError",
+    "GeminiPilotRequestGuardrailProvider",
     "MAX_PILOT_RUNS",
     "MAX_TOTAL_PROVIDER_REQUESTS",
     "OutcomeEvaluator",
@@ -76,10 +85,15 @@ __all__ = [
     "calculate_cost",
     "calculate_percentile",
     "compute_aggregate_metrics",
+    "create_gemini_38_flash_pricing",
+    "create_gemini_pilot_mock_provider",
     "create_gpt6_luna_pricing",
     "create_pilot_mock_provider",
     "load_benchmark_tasks",
     "load_plan_fixtures",
+    "run_gemini_pilot_dry_run",
+    "run_gemini_pilot_preflight",
+    "run_live_gemini_pilot",
     "run_live_pilot",
     "run_offline_smoke_test",
     "run_pilot_dry_run",
