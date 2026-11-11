@@ -107,6 +107,7 @@ class AgentResponse:
     rationale: str = ""
     raw_output: str = ""
     inspection_calls_made: int = 0
+    clarification_message: Optional[str] = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -123,6 +124,11 @@ class AgentResponse:
         return self.proposal is not None
 
     @property
+    def is_clarification(self) -> bool:
+        """Return True if an explicit clarification request was made."""
+        return self.clarification_message is not None and bool(str(self.clarification_message).strip())
+
+    @property
     def metadata_dict(self) -> Dict[str, Any]:
         """Return an unfrozen, JSON-serializable dictionary copy of metadata."""
         return _unfreeze_value(self.metadata)
@@ -137,6 +143,7 @@ class AgentResponse:
             "rationale": self.rationale,
             "raw_output": self.raw_output,
             "inspection_calls_made": self.inspection_calls_made,
+            "clarification_message": self.clarification_message,
             "metadata": self.metadata_dict,
         }
 

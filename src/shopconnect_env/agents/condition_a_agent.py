@@ -237,7 +237,63 @@ class ConditionAAgent(BaseAgent):
         completion = self.provider.complete(messages=messages)
         raw_text = completion.message.content or ""
 
-        # 3. Parse JSON schedule
+        base_meta: Dict[str, Any] = {
+            "condition_id": "A",
+            "plan_version": plan_version,
+            "usage": usage_to_dict(completion.usage),
+            "model_identifier": completion.model_identifier,
+            "system_fingerprint": completion.system_fingerprint,
+            "provider_request_ids": (completion.provider_request_id,) if completion.provider_request_id else (),
+            "per_request_latencies_ms": (completion.latency_ms,) if completion.latency_ms else (),
+        }
+
+        # 3. Parse JSON schedule or explicit clarification
+        try:
+            clean_text = raw_text.strip()
+            if clean_text.startswith("```"):
+                clean_lines = clean_text.splitlines()
+                if clean_lines[0].startswith("```"):
+                    clean_lines = clean_lines[1:]
+                if clean_lines and clean_lines[-1].startswith("```"):
+                    clean_lines = clean_lines[:-1]
+                clean_text = "\n".join(clean_lines).strip()
+            parsed_raw = json.loads(clean_text)
+            if isinstance(parsed_raw, dict):
+                clar_msg = (
+                    parsed_raw.get("clarification")
+                    or parsed_raw.get("clarification_request")
+                    or parsed_raw.get("question")
+                )
+                if clar_msg:
+                    return AgentResponse(
+                        proposal=None,
+                        rationale=f"Clarification requested: {clar_msg}",
+                        raw_output=raw_text,
+                        clarification_message=str(clar_msg),
+                        metadata={
+                            **base_meta,
+                            "status": "clarification_requested",
+                        },
+                    )
+        except Exception:
+            pass
+
+        if (
+            not raw_text.strip().startswith("[")
+            and not raw_text.strip().startswith("```")
+            and any(p in raw_text.lower() for p in ["clarif", "could you specify", "please specify", "unclear which meal", "which meal slot"])
+        ):
+            return AgentResponse(
+                proposal=None,
+                rationale=f"Clarification requested: {raw_text.strip()}",
+                raw_output=raw_text,
+                clarification_message=raw_text.strip(),
+                metadata={
+                    **base_meta,
+                    "status": "clarification_requested",
+                },
+            )
+
         raw_slots = _parse_regenerated_json(raw_text)
         if raw_slots is None:
             return AgentResponse(
@@ -245,10 +301,8 @@ class ConditionAAgent(BaseAgent):
                 rationale="Failed to parse regenerated schedule: invalid JSON structure.",
                 raw_output=raw_text,
                 metadata={
+                    **base_meta,
                     "status": "json_parse_error",
-                    "condition_id": "A",
-                    "plan_version": plan_version,
-                    "usage": usage_to_dict(completion.usage),
                 },
             )
 
@@ -260,11 +314,9 @@ class ConditionAAgent(BaseAgent):
                 rationale=validation_err or "Invalid slot representation.",
                 raw_output=raw_text,
                 metadata={
+                    **base_meta,
                     "status": "slot_validation_error",
                     "error": validation_err,
-                    "condition_id": "A",
-                    "plan_version": plan_version,
-                    "usage": usage_to_dict(completion.usage),
                 },
             )
 
@@ -310,13 +362,11 @@ class ConditionAAgent(BaseAgent):
                 ),
                 raw_output=raw_text,
                 metadata={
+                    **base_meta,
                     "status": "unintended_drift",
                     "unintended_mutations_count": raw_drift_count,
                     "unintended_slots": raw_drift_slots,
                     "total_modifications": len(modified_slots),
-                    "condition_id": "A",
-                    "plan_version": plan_version,
-                    "usage": usage_to_dict(completion.usage),
                 },
             )
 
@@ -327,11 +377,9 @@ class ConditionAAgent(BaseAgent):
                 rationale="No schedule changes detected in regenerated plan.",
                 raw_output=raw_text,
                 metadata={
+                    **base_meta,
                     "status": "target_not_modified",
                     "unintended_mutations_count": 0,
-                    "condition_id": "A",
-                    "plan_version": plan_version,
-                    "usage": usage_to_dict(completion.usage),
                 },
             )
 
@@ -362,12 +410,10 @@ class ConditionAAgent(BaseAgent):
                 rationale=proposal.reason,
                 raw_output=raw_text,
                 metadata={
+                    **base_meta,
                     "status": "ok",
                     "operation": "replace_meal",
                     "unintended_mutations_count": 0,
-                    "condition_id": "A",
-                    "plan_version": plan_version,
-                    "usage": usage_to_dict(completion.usage),
                 },
             )
 
@@ -388,12 +434,10 @@ class ConditionAAgent(BaseAgent):
                 rationale=proposal.reason,
                 raw_output=raw_text,
                 metadata={
+                    **base_meta,
                     "status": "ok",
                     "operation": "change_servings",
                     "unintended_mutations_count": 0,
-                    "condition_id": "A",
-                    "plan_version": plan_version,
-                    "usage": usage_to_dict(completion.usage),
                 },
             )
 
@@ -403,10 +447,8 @@ class ConditionAAgent(BaseAgent):
             rationale="Unrecognized modification pattern in target slot.",
             raw_output=raw_text,
             metadata={
+                **base_meta,
                 "status": "unsupported_modification",
-                "condition_id": "A",
-                "plan_version": plan_version,
-                "usage": usage_to_dict(completion.usage),
             },
         )
 

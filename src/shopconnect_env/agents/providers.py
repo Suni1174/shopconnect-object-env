@@ -197,6 +197,11 @@ class LLMCompletionResult:
 class LLMProvider(Protocol):
     """Abstract interface isolating LLM network execution from agent logic."""
 
+    @property
+    def sdk_version(self) -> Optional[str]:
+        """Return SDK version string if applicable."""
+        ...
+
     def complete(
         self,
         messages: List[LLMMessage],
@@ -252,6 +257,11 @@ class MockLLMProvider:
         self.canned_responses: Dict[str, LLMCompletionResult] = dict(canned_responses) if canned_responses else {}
         self.default_response = default_response
         self.call_history: List[Dict[str, Any]] = []
+
+    @property
+    def sdk_version(self) -> Optional[str]:
+        """Return None for mock provider to avoid fabricating external SDK metadata."""
+        return None
 
     def complete(
         self,
@@ -401,6 +411,15 @@ class OpenAIProvider:
             timeout=self.timeout_seconds,
         )
         return self._client
+
+    @property
+    def sdk_version(self) -> Optional[str]:
+        """Return the installed version of the official OpenAI SDK."""
+        try:
+            import openai
+            return getattr(openai, "__version__", None)
+        except ImportError:
+            return None
 
     def complete(
         self,

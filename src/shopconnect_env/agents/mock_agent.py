@@ -73,9 +73,14 @@ class MockAgent(BaseAgent):
         re.IGNORECASE,
     )
 
-    def __init__(self, canned_tasks: Optional[Dict[str, ActionProposal]] = None) -> None:
-        """Initialize MockAgent with optional canned task mappings."""
+    def __init__(
+        self,
+        canned_tasks: Optional[Dict[str, ActionProposal]] = None,
+        canned_clarifications: Optional[Dict[str, str]] = None,
+    ) -> None:
+        """Initialize MockAgent with optional canned task mappings and clarifications."""
         self.canned_tasks: Dict[str, ActionProposal] = dict(canned_tasks) if canned_tasks else {}
+        self.canned_clarifications: Dict[str, str] = dict(canned_clarifications) if canned_clarifications else {}
 
     def propose_action(
         self,
@@ -101,8 +106,22 @@ class MockAgent(BaseAgent):
             )
 
         # ---------------------------------------------------------------------
-        # 2. Canned task matching
+        # 2. Canned task matching & Clarification
         # ---------------------------------------------------------------------
+        if task in self.canned_clarifications:
+            clar_msg = self.canned_clarifications[task]
+            return AgentResponse(
+                proposal=None,
+                rationale=f"Clarification requested: {clar_msg}",
+                raw_output=clar_msg,
+                clarification_message=clar_msg,
+                metadata={
+                    "status": "clarification_requested",
+                    "condition_id": context.condition_id,
+                    "plan_version": plan_version,
+                },
+            )
+
         if task in self.canned_tasks:
             base_prop = self.canned_tasks[task]
             # All ordinary canned/custom proposals dynamically receive plan_version from context.

@@ -85,18 +85,36 @@ class ConditionBAgent(BaseAgent):
         completion = self.provider.complete(messages=messages, tools=tools, tool_choice="auto")
         raw_output = completion.message.content or ""
 
+        base_meta: Dict[str, Any] = {
+            "condition_id": "B",
+            "plan_version": plan_version,
+            "usage": usage_to_dict(completion.usage),
+            "model_identifier": completion.model_identifier,
+            "system_fingerprint": completion.system_fingerprint,
+            "provider_request_ids": (completion.provider_request_id,) if completion.provider_request_id else (),
+            "per_request_latencies_ms": (completion.latency_ms,) if completion.latency_ms else (),
+        }
+
         # 3. Check for tool calls
         tool_calls = completion.message.tool_calls
         if not tool_calls:
+            content = completion.message.content or ""
+            is_clarify = bool(content.strip()) and (
+                "clarif" in content.lower()
+                or "question" in content.lower()
+                or "which" in content.lower()
+                or "unclear" in content.lower()
+                or "ambiguous" in content.lower()
+                or "specify" in content.lower()
+            )
             return AgentResponse(
                 proposal=None,
-                rationale=completion.message.content or "No tool call was emitted by the model.",
+                rationale=content or "No tool call was emitted by the model.",
                 raw_output=raw_output,
+                clarification_message=content.strip() if is_clarify else None,
                 metadata={
-                    "status": "no_tool_call",
-                    "condition_id": "B",
-                    "plan_version": plan_version,
-                    "usage": usage_to_dict(completion.usage),
+                    **base_meta,
+                    "status": "clarification_requested" if is_clarify else "no_tool_call",
                 },
             )
 
@@ -124,12 +142,10 @@ class ConditionBAgent(BaseAgent):
                 ),
                 raw_output=raw_output,
                 metadata={
+                    **base_meta,
                     "status": "unsupported_multiple_tool_calls",
                     "tool_calls_count": len(tool_calls),
                     "all_tool_calls": all_calls_summary,
-                    "condition_id": "B",
-                    "plan_version": plan_version,
-                    "usage": usage_to_dict(completion.usage),
                 },
             )
 
@@ -149,13 +165,11 @@ class ConditionBAgent(BaseAgent):
                     rationale=f"Malformed tool call arguments JSON: {err}",
                     raw_output=raw_output,
                     metadata={
+                        **base_meta,
                         "status": "malformed_tool_arguments",
                         "call_id": call_id,
                         "tool_calls_count": len(tool_calls),
                         "all_tool_calls": all_calls_summary,
-                        "condition_id": "B",
-                        "plan_version": plan_version,
-                        "usage": usage_to_dict(completion.usage),
                     },
                 )
         elif isinstance(raw_args, dict):
@@ -173,25 +187,27 @@ class ConditionBAgent(BaseAgent):
                     rationale=f"Invalid arguments for replace_meal: {val_err}",
                     raw_output=raw_output,
                     metadata={
+                        **base_meta,
                         "status": "invalid_arguments",
                         "error": str(val_err),
                         "tool_name": tool_name,
                         "call_id": call_id,
                         "tool_calls_count": len(tool_calls),
                         "all_tool_calls": all_calls_summary,
-                        "condition_id": "B",
-                        "plan_version": plan_version,
-                        "usage": usage_to_dict(completion.usage),
                     },
                 )
 
+            args_payload = {
+                "day": validated_args.day,
+                "meal_type": validated_args.meal_type,
+                "recipe_id": validated_args.recipe_id,
+            }
+            if validated_args.servings is not None:
+                args_payload["servings"] = validated_args.servings
+
             proposal = ActionProposal(
                 operation=OperationType.REPLACE_MEAL,
-                arguments={
-                    "day": validated_args.day,
-                    "meal_type": validated_args.meal_type,
-                    "recipe_id": validated_args.recipe_id,
-                },
+                arguments=args_payload,
                 reason=f"Tool call replace_meal({validated_args.day}, {validated_args.meal_type}, {validated_args.recipe_id})",
                 expected_plan_version=plan_version,
             )
@@ -205,15 +221,13 @@ class ConditionBAgent(BaseAgent):
                     rationale=f"Invalid arguments for change_servings: {val_err}",
                     raw_output=raw_output,
                     metadata={
+                        **base_meta,
                         "status": "invalid_arguments",
                         "error": str(val_err),
                         "tool_name": tool_name,
                         "call_id": call_id,
                         "tool_calls_count": len(tool_calls),
                         "all_tool_calls": all_calls_summary,
-                        "condition_id": "B",
-                        "plan_version": plan_version,
-                        "usage": usage_to_dict(completion.usage),
                     },
                 )
 
@@ -228,20 +242,35 @@ class ConditionBAgent(BaseAgent):
                 expected_plan_version=plan_version,
             )
 
+        elif tool_name == "request_clarification":
+            q = (
+                args_dict.get("question")
+                or args_dict.get("clarification")
+                or "Clarification requested."
+            )
+            return AgentResponse(
+                proposal=None,
+                rationale=f"Clarification requested: {q}",
+                raw_output=raw_output,
+                clarification_message=q,
+                metadata={
+                    **base_meta,
+                    "status": "clarification_requested",
+                },
+            )
+
         else:
             return AgentResponse(
                 proposal=None,
                 rationale=f"Unknown or unsupported tool name: '{tool_name}'.",
                 raw_output=raw_output,
                 metadata={
+                    **base_meta,
                     "status": "unknown_tool",
                     "tool_name": tool_name,
                     "call_id": call_id,
                     "tool_calls_count": len(tool_calls),
                     "all_tool_calls": all_calls_summary,
-                    "condition_id": "B",
-                    "plan_version": plan_version,
-                    "usage": usage_to_dict(completion.usage),
                 },
             )
 
@@ -250,14 +279,12 @@ class ConditionBAgent(BaseAgent):
             rationale=proposal.reason,
             raw_output=raw_output or proposal.model_dump_json(),
             metadata={
+                **base_meta,
                 "status": "ok",
                 "tool_name": tool_name,
                 "call_id": call_id,
                 "tool_calls_count": len(tool_calls),
                 "all_tool_calls": all_calls_summary,
-                "condition_id": "B",
-                "plan_version": plan_version,
-                "usage": usage_to_dict(completion.usage),
             },
         )
 

@@ -238,8 +238,13 @@ class ConditionCAgent(BaseAgent):
         inspection_calls_count = 0
         inspection_steps: List[Dict[str, Any]] = []
         usages: List[Optional[LLMUsage]] = []
+        request_ids: List[str] = []
+        latencies: List[float] = []
+        fingerprints: List[str] = []
+        model_ids: List[str] = []
         final_proposal: Optional[ActionProposal] = None
         final_rationale: str = ""
+        final_clarification: Optional[str] = None
         last_raw_output: str = ""
 
         # Multi-turn interaction loop
@@ -248,6 +253,14 @@ class ConditionCAgent(BaseAgent):
             completion = self.provider.complete(messages=messages, tools=tools, tool_choice="auto")
             last_raw_output = completion.message.content or ""
             usages.append(completion.usage)
+            if completion.provider_request_id:
+                request_ids.append(completion.provider_request_id)
+            if completion.system_fingerprint:
+                fingerprints.append(completion.system_fingerprint)
+            if completion.latency_ms:
+                latencies.append(completion.latency_ms)
+            if completion.model_identifier:
+                model_ids.append(completion.model_identifier)
 
             tool_calls = completion.message.tool_calls
             if not tool_calls:
@@ -350,9 +363,32 @@ class ConditionCAgent(BaseAgent):
                     )
                     break
 
+                elif tool_name == "request_clarification":
+                    final_proposal = None
+                    final_clarification = (
+                        args_dict.get("question")
+                        or args_dict.get("clarification")
+                        or "Clarification requested."
+                    )
+                    final_rationale = f"Clarification requested: {final_clarification}"
+                    messages.append(
+                        LLMMessage(
+                            role="tool",
+                            tool_call_id=cid,
+                            content=json.dumps({"status": "clarification_requested", "question": final_clarification}),
+                        )
+                    )
+                    break
+
                 elif tool_name == "finalize_no_action":
                     final_proposal = None
-                    final_rationale = args_dict.get("reason", "Agent concluded no action should be taken.")
+                    reason = args_dict.get("reason", "Agent concluded no action should be taken.")
+                    action_type = args_dict.get("action_type")
+                    if action_type == "clarify" or "clarif" in reason.lower():
+                        final_clarification = reason
+                        final_rationale = f"Clarification requested: {reason}"
+                    else:
+                        final_rationale = reason
                     messages.append(
                         LLMMessage(
                             role="tool",
@@ -439,13 +475,21 @@ class ConditionCAgent(BaseAgent):
         aggregated_usage = aggregate_usages(usages)
 
         metadata: Dict[str, Any] = {
-            "status": "ok" if final_proposal is not None else "no_proposal",
+            "status": (
+                "ok"
+                if final_proposal is not None
+                else ("clarification_requested" if final_clarification is not None else "no_proposal")
+            ),
             "condition_id": "C",
             "total_model_requests": model_requests_count,
             "inspection_calls_count": inspection_calls_count,
             "inspection_steps": tuple(inspection_steps),
             "plan_version": plan_version,
             "usage": usage_to_dict(aggregated_usage),
+            "model_identifier": model_ids[-1] if model_ids else None,
+            "system_fingerprint": fingerprints[-1] if fingerprints else None,
+            "provider_request_ids": tuple(request_ids),
+            "per_request_latencies_ms": tuple(latencies),
         }
 
         return AgentResponse(
@@ -453,6 +497,7 @@ class ConditionCAgent(BaseAgent):
             rationale=final_rationale or "Interaction completed.",
             raw_output=last_raw_output or (final_proposal.model_dump_json() if final_proposal else ""),
             inspection_calls_made=inspection_calls_count,
+            clarification_message=final_clarification,
             metadata=metadata,
         )
 
