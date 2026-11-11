@@ -1,0 +1,1266 @@
+{
+  "fixture_standard": {
+    "fixture_id": "fixture_standard",
+    "name": "Normal Baseline Meal Plan",
+    "description": "Standard omnivore baseline weekly plan with 4 scheduled meals and peanut allergy.",
+    "plan_id": "plan_fixture_standard",
+    "plan_version": 1,
+    "preferences": {
+      "diet_tags": [],
+      "allergies": [
+        "peanuts"
+      ],
+      "weekly_budget": "150.00",
+      "household_size": 2
+    },
+    "meals": [
+      {
+        "day": "Monday",
+        "meal_type": "breakfast",
+        "recipe_id": "rec_berry_oatmeal",
+        "servings": 2
+      },
+      {
+        "day": "Monday",
+        "meal_type": "lunch",
+        "recipe_id": "rec_chicken_salad_wrap",
+        "servings": 2
+      },
+      {
+        "day": "Wednesday",
+        "meal_type": "dinner",
+        "recipe_id": "rec_hearty_veggie_soup",
+        "servings": 4
+      },
+      {
+        "day": "Friday",
+        "meal_type": "dinner",
+        "recipe_id": "rec_baked_chicken_rice",
+        "servings": 2
+      }
+    ],
+    "schedule": [
+      {
+        "slot_key": "Monday_breakfast",
+        "day": "Monday",
+        "meal_type": "breakfast",
+        "status": "assigned",
+        "recipe_id": "rec_berry_oatmeal",
+        "recipe_name": "Berry Cinnamon Oatmeal Bowl",
+        "servings": 2,
+        "estimated_cost": "4.20"
+      },
+      {
+        "slot_key": "Monday_lunch",
+        "day": "Monday",
+        "meal_type": "lunch",
+        "status": "assigned",
+        "recipe_id": "rec_chicken_salad_wrap",
+        "recipe_name": "Grilled Chicken & Spinach Wrap",
+        "servings": 2,
+        "estimated_cost": "8.50"
+      },
+      {
+        "slot_key": "Monday_dinner",
+        "day": "Monday",
+        "meal_type": "dinner",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Tuesday_breakfast",
+        "day": "Tuesday",
+        "meal_type": "breakfast",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Tuesday_lunch",
+        "day": "Tuesday",
+        "meal_type": "lunch",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Tuesday_dinner",
+        "day": "Tuesday",
+        "meal_type": "dinner",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Wednesday_breakfast",
+        "day": "Wednesday",
+        "meal_type": "breakfast",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Wednesday_lunch",
+        "day": "Wednesday",
+        "meal_type": "lunch",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Wednesday_dinner",
+        "day": "Wednesday",
+        "meal_type": "dinner",
+        "status": "assigned",
+        "recipe_id": "rec_hearty_veggie_soup",
+        "recipe_name": "Hearty Vegetable & Bean Soup",
+        "servings": 4,
+        "estimated_cost": "7.00"
+      },
+      {
+        "slot_key": "Thursday_breakfast",
+        "day": "Thursday",
+        "meal_type": "breakfast",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Thursday_lunch",
+        "day": "Thursday",
+        "meal_type": "lunch",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Thursday_dinner",
+        "day": "Thursday",
+        "meal_type": "dinner",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Friday_breakfast",
+        "day": "Friday",
+        "meal_type": "breakfast",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Friday_lunch",
+        "day": "Friday",
+        "meal_type": "lunch",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Friday_dinner",
+        "day": "Friday",
+        "meal_type": "dinner",
+        "status": "assigned",
+        "recipe_id": "rec_baked_chicken_rice",
+        "recipe_name": "Herb-Roasted Chicken Breast with Brown Rice",
+        "servings": 2,
+        "estimated_cost": "9.80"
+      },
+      {
+        "slot_key": "Saturday_breakfast",
+        "day": "Saturday",
+        "meal_type": "breakfast",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Saturday_lunch",
+        "day": "Saturday",
+        "meal_type": "lunch",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Saturday_dinner",
+        "day": "Saturday",
+        "meal_type": "dinner",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Sunday_breakfast",
+        "day": "Sunday",
+        "meal_type": "breakfast",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Sunday_lunch",
+        "day": "Sunday",
+        "meal_type": "lunch",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Sunday_dinner",
+        "day": "Sunday",
+        "meal_type": "dinner",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      }
+    ],
+    "grocery_basket": {
+      "basket_version": 1,
+      "total_items": 14,
+      "items": [
+        {
+          "ingredient_id": "ing_almond_milk",
+          "name": "Unsweetened Almond Milk",
+          "category": "Dairy Alternatives",
+          "quantity": "300.0",
+          "unit": "ml"
+        },
+        {
+          "ingredient_id": "ing_berries",
+          "name": "Mixed Berries",
+          "category": "Produce",
+          "quantity": "100.0",
+          "unit": "g"
+        },
+        {
+          "ingredient_id": "ing_brown_rice",
+          "name": "Brown Rice",
+          "category": "Grains",
+          "quantity": "150.0",
+          "unit": "g"
+        },
+        {
+          "ingredient_id": "ing_canned_black_beans",
+          "name": "Canned Black Beans",
+          "category": "Canned Goods",
+          "quantity": "400.0",
+          "unit": "g"
+        },
+        {
+          "ingredient_id": "ing_carrot",
+          "name": "Carrot",
+          "category": "Produce",
+          "quantity": "4",
+          "unit": "unit"
+        },
+        {
+          "ingredient_id": "ing_cherry_tomatoes",
+          "name": "Cherry Tomatoes",
+          "category": "Produce",
+          "quantity": "100.0",
+          "unit": "g"
+        },
+        {
+          "ingredient_id": "ing_chia_seeds",
+          "name": "Chia Seeds",
+          "category": "Seeds",
+          "quantity": "15.0",
+          "unit": "g"
+        },
+        {
+          "ingredient_id": "ing_chicken_breast",
+          "name": "Chicken Breast Fillet",
+          "category": "Meat",
+          "quantity": "650.0",
+          "unit": "g"
+        },
+        {
+          "ingredient_id": "ing_olive_oil",
+          "name": "Extra Virgin Olive Oil",
+          "category": "Oils & Vinegars",
+          "quantity": "15.0",
+          "unit": "ml"
+        },
+        {
+          "ingredient_id": "ing_onion",
+          "name": "Yellow Onion",
+          "category": "Produce",
+          "quantity": "1",
+          "unit": "unit"
+        },
+        {
+          "ingredient_id": "ing_rolled_oats",
+          "name": "Rolled Oats",
+          "category": "Grains",
+          "quantity": "100.0",
+          "unit": "g"
+        },
+        {
+          "ingredient_id": "ing_spinach",
+          "name": "Baby Spinach",
+          "category": "Produce",
+          "quantity": "200.0",
+          "unit": "g"
+        },
+        {
+          "ingredient_id": "ing_vegetable_broth",
+          "name": "Vegetable Broth",
+          "category": "Soups & Broths",
+          "quantity": "750.0",
+          "unit": "ml"
+        },
+        {
+          "ingredient_id": "ing_whole_wheat_bread",
+          "name": "Whole Wheat Bread",
+          "category": "Bakery",
+          "quantity": "4",
+          "unit": "slice"
+        }
+      ]
+    }
+  },
+  "fixture_vegetarian_profile": {
+    "fixture_id": "fixture_vegetarian_profile",
+    "name": "Vegetarian Profile Scenario",
+    "description": "Strict vegetarian household with 4 scheduled vegetarian meals.",
+    "plan_id": "plan_fixture_vegetarian",
+    "plan_version": 1,
+    "preferences": {
+      "diet_tags": [
+        "vegetarian"
+      ],
+      "allergies": [],
+      "weekly_budget": "150.00",
+      "household_size": 2
+    },
+    "meals": [
+      {
+        "day": "Monday",
+        "meal_type": "breakfast",
+        "recipe_id": "rec_berry_oatmeal",
+        "servings": 2
+      },
+      {
+        "day": "Monday",
+        "meal_type": "lunch",
+        "recipe_id": "rec_mediterranean_chickpea_salad",
+        "servings": 2
+      },
+      {
+        "day": "Wednesday",
+        "meal_type": "dinner",
+        "recipe_id": "rec_red_lentil_dahl",
+        "servings": 4
+      },
+      {
+        "day": "Friday",
+        "meal_type": "dinner",
+        "recipe_id": "rec_hearty_veggie_soup",
+        "servings": 4
+      }
+    ],
+    "schedule": [
+      {
+        "slot_key": "Monday_breakfast",
+        "day": "Monday",
+        "meal_type": "breakfast",
+        "status": "assigned",
+        "recipe_id": "rec_berry_oatmeal",
+        "recipe_name": "Berry Cinnamon Oatmeal Bowl",
+        "servings": 2,
+        "estimated_cost": "4.20"
+      },
+      {
+        "slot_key": "Monday_lunch",
+        "day": "Monday",
+        "meal_type": "lunch",
+        "status": "assigned",
+        "recipe_id": "rec_mediterranean_chickpea_salad",
+        "recipe_name": "Mediterranean Chickpea Salad",
+        "servings": 2,
+        "estimated_cost": "5.80"
+      },
+      {
+        "slot_key": "Monday_dinner",
+        "day": "Monday",
+        "meal_type": "dinner",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Tuesday_breakfast",
+        "day": "Tuesday",
+        "meal_type": "breakfast",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Tuesday_lunch",
+        "day": "Tuesday",
+        "meal_type": "lunch",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Tuesday_dinner",
+        "day": "Tuesday",
+        "meal_type": "dinner",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Wednesday_breakfast",
+        "day": "Wednesday",
+        "meal_type": "breakfast",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Wednesday_lunch",
+        "day": "Wednesday",
+        "meal_type": "lunch",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Wednesday_dinner",
+        "day": "Wednesday",
+        "meal_type": "dinner",
+        "status": "assigned",
+        "recipe_id": "rec_red_lentil_dahl",
+        "recipe_name": "Golden Red Lentil Dahl",
+        "servings": 4,
+        "estimated_cost": "7.80"
+      },
+      {
+        "slot_key": "Thursday_breakfast",
+        "day": "Thursday",
+        "meal_type": "breakfast",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Thursday_lunch",
+        "day": "Thursday",
+        "meal_type": "lunch",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Thursday_dinner",
+        "day": "Thursday",
+        "meal_type": "dinner",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Friday_breakfast",
+        "day": "Friday",
+        "meal_type": "breakfast",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Friday_lunch",
+        "day": "Friday",
+        "meal_type": "lunch",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Friday_dinner",
+        "day": "Friday",
+        "meal_type": "dinner",
+        "status": "assigned",
+        "recipe_id": "rec_hearty_veggie_soup",
+        "recipe_name": "Hearty Vegetable & Bean Soup",
+        "servings": 4,
+        "estimated_cost": "7.00"
+      },
+      {
+        "slot_key": "Saturday_breakfast",
+        "day": "Saturday",
+        "meal_type": "breakfast",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Saturday_lunch",
+        "day": "Saturday",
+        "meal_type": "lunch",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Saturday_dinner",
+        "day": "Saturday",
+        "meal_type": "dinner",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Sunday_breakfast",
+        "day": "Sunday",
+        "meal_type": "breakfast",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Sunday_lunch",
+        "day": "Sunday",
+        "meal_type": "lunch",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Sunday_dinner",
+        "day": "Sunday",
+        "meal_type": "dinner",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      }
+    ],
+    "grocery_basket": {
+      "basket_version": 1,
+      "total_items": 16,
+      "items": [
+        {
+          "ingredient_id": "ing_almond_milk",
+          "name": "Unsweetened Almond Milk",
+          "category": "Dairy Alternatives",
+          "quantity": "300.0",
+          "unit": "ml"
+        },
+        {
+          "ingredient_id": "ing_bell_pepper",
+          "name": "Bell Pepper",
+          "category": "Produce",
+          "quantity": "1",
+          "unit": "unit"
+        },
+        {
+          "ingredient_id": "ing_berries",
+          "name": "Mixed Berries",
+          "category": "Produce",
+          "quantity": "100.0",
+          "unit": "g"
+        },
+        {
+          "ingredient_id": "ing_canned_black_beans",
+          "name": "Canned Black Beans",
+          "category": "Canned Goods",
+          "quantity": "400.0",
+          "unit": "g"
+        },
+        {
+          "ingredient_id": "ing_canned_chickpeas",
+          "name": "Canned Chickpeas",
+          "category": "Canned Goods",
+          "quantity": "400.0",
+          "unit": "g"
+        },
+        {
+          "ingredient_id": "ing_canned_tomatoes",
+          "name": "Canned Diced Tomatoes",
+          "category": "Canned Goods",
+          "quantity": "400.0",
+          "unit": "g"
+        },
+        {
+          "ingredient_id": "ing_carrot",
+          "name": "Carrot",
+          "category": "Produce",
+          "quantity": "2",
+          "unit": "unit"
+        },
+        {
+          "ingredient_id": "ing_cherry_tomatoes",
+          "name": "Cherry Tomatoes",
+          "category": "Produce",
+          "quantity": "150.0",
+          "unit": "g"
+        },
+        {
+          "ingredient_id": "ing_chia_seeds",
+          "name": "Chia Seeds",
+          "category": "Seeds",
+          "quantity": "15.0",
+          "unit": "g"
+        },
+        {
+          "ingredient_id": "ing_garlic",
+          "name": "Garlic Clove",
+          "category": "Produce",
+          "quantity": "3",
+          "unit": "unit"
+        },
+        {
+          "ingredient_id": "ing_olive_oil",
+          "name": "Extra Virgin Olive Oil",
+          "category": "Oils & Vinegars",
+          "quantity": "20.0",
+          "unit": "ml"
+        },
+        {
+          "ingredient_id": "ing_onion",
+          "name": "Yellow Onion",
+          "category": "Produce",
+          "quantity": "2",
+          "unit": "unit"
+        },
+        {
+          "ingredient_id": "ing_red_lentils",
+          "name": "Dry Red Lentils",
+          "category": "Legumes",
+          "quantity": "300.0",
+          "unit": "g"
+        },
+        {
+          "ingredient_id": "ing_rolled_oats",
+          "name": "Rolled Oats",
+          "category": "Grains",
+          "quantity": "100.0",
+          "unit": "g"
+        },
+        {
+          "ingredient_id": "ing_spinach",
+          "name": "Baby Spinach",
+          "category": "Produce",
+          "quantity": "100.0",
+          "unit": "g"
+        },
+        {
+          "ingredient_id": "ing_vegetable_broth",
+          "name": "Vegetable Broth",
+          "category": "Soups & Broths",
+          "quantity": "1350.0",
+          "unit": "ml"
+        }
+      ]
+    }
+  },
+  "fixture_pescatarian_profile": {
+    "fixture_id": "fixture_pescatarian_profile",
+    "name": "Pescatarian Profile Scenario",
+    "description": "Pescatarian household with pan-seared salmon scheduled.",
+    "plan_id": "plan_fixture_pescatarian",
+    "plan_version": 1,
+    "preferences": {
+      "diet_tags": [
+        "pescatarian"
+      ],
+      "allergies": [],
+      "weekly_budget": "150.00",
+      "household_size": 2
+    },
+    "meals": [
+      {
+        "day": "Friday",
+        "meal_type": "dinner",
+        "recipe_id": "rec_pan_seared_salmon",
+        "servings": 2
+      }
+    ],
+    "schedule": [
+      {
+        "slot_key": "Monday_breakfast",
+        "day": "Monday",
+        "meal_type": "breakfast",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Monday_lunch",
+        "day": "Monday",
+        "meal_type": "lunch",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Monday_dinner",
+        "day": "Monday",
+        "meal_type": "dinner",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Tuesday_breakfast",
+        "day": "Tuesday",
+        "meal_type": "breakfast",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Tuesday_lunch",
+        "day": "Tuesday",
+        "meal_type": "lunch",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Tuesday_dinner",
+        "day": "Tuesday",
+        "meal_type": "dinner",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Wednesday_breakfast",
+        "day": "Wednesday",
+        "meal_type": "breakfast",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Wednesday_lunch",
+        "day": "Wednesday",
+        "meal_type": "lunch",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Wednesday_dinner",
+        "day": "Wednesday",
+        "meal_type": "dinner",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Thursday_breakfast",
+        "day": "Thursday",
+        "meal_type": "breakfast",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Thursday_lunch",
+        "day": "Thursday",
+        "meal_type": "lunch",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Thursday_dinner",
+        "day": "Thursday",
+        "meal_type": "dinner",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Friday_breakfast",
+        "day": "Friday",
+        "meal_type": "breakfast",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Friday_lunch",
+        "day": "Friday",
+        "meal_type": "lunch",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Friday_dinner",
+        "day": "Friday",
+        "meal_type": "dinner",
+        "status": "assigned",
+        "recipe_id": "rec_pan_seared_salmon",
+        "recipe_name": "Pan-Seared Salmon with Steamed Broccoli & Rice",
+        "servings": 2,
+        "estimated_cost": "14.50"
+      },
+      {
+        "slot_key": "Saturday_breakfast",
+        "day": "Saturday",
+        "meal_type": "breakfast",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Saturday_lunch",
+        "day": "Saturday",
+        "meal_type": "lunch",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Saturday_dinner",
+        "day": "Saturday",
+        "meal_type": "dinner",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Sunday_breakfast",
+        "day": "Sunday",
+        "meal_type": "breakfast",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Sunday_lunch",
+        "day": "Sunday",
+        "meal_type": "lunch",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Sunday_dinner",
+        "day": "Sunday",
+        "meal_type": "dinner",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      }
+    ],
+    "grocery_basket": {
+      "basket_version": 1,
+      "total_items": 4,
+      "items": [
+        {
+          "ingredient_id": "ing_broccoli",
+          "name": "Broccoli Florets",
+          "category": "Produce",
+          "quantity": "250.0",
+          "unit": "g"
+        },
+        {
+          "ingredient_id": "ing_brown_rice",
+          "name": "Brown Rice",
+          "category": "Grains",
+          "quantity": "150.0",
+          "unit": "g"
+        },
+        {
+          "ingredient_id": "ing_olive_oil",
+          "name": "Extra Virgin Olive Oil",
+          "category": "Oils & Vinegars",
+          "quantity": "15.0",
+          "unit": "ml"
+        },
+        {
+          "ingredient_id": "ing_salmon_fillet",
+          "name": "Fresh Salmon Fillet",
+          "category": "Seafood",
+          "quantity": "350.0",
+          "unit": "g"
+        }
+      ]
+    }
+  },
+  "fixture_tight_budget": {
+    "fixture_id": "fixture_tight_budget",
+    "name": "Constrained Budget Scenario",
+    "description": "Constrained budget of .00 with 2-serving salmon meal committed (.50 committed, .50 remaining).",
+    "plan_id": "plan_fixture_tight_budget",
+    "plan_version": 1,
+    "preferences": {
+      "diet_tags": [],
+      "allergies": [],
+      "weekly_budget": "20.00",
+      "household_size": 2
+    },
+    "meals": [
+      {
+        "day": "Friday",
+        "meal_type": "dinner",
+        "recipe_id": "rec_pan_seared_salmon",
+        "servings": 2
+      }
+    ],
+    "schedule": [
+      {
+        "slot_key": "Monday_breakfast",
+        "day": "Monday",
+        "meal_type": "breakfast",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Monday_lunch",
+        "day": "Monday",
+        "meal_type": "lunch",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Monday_dinner",
+        "day": "Monday",
+        "meal_type": "dinner",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Tuesday_breakfast",
+        "day": "Tuesday",
+        "meal_type": "breakfast",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Tuesday_lunch",
+        "day": "Tuesday",
+        "meal_type": "lunch",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Tuesday_dinner",
+        "day": "Tuesday",
+        "meal_type": "dinner",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Wednesday_breakfast",
+        "day": "Wednesday",
+        "meal_type": "breakfast",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Wednesday_lunch",
+        "day": "Wednesday",
+        "meal_type": "lunch",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Wednesday_dinner",
+        "day": "Wednesday",
+        "meal_type": "dinner",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Thursday_breakfast",
+        "day": "Thursday",
+        "meal_type": "breakfast",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Thursday_lunch",
+        "day": "Thursday",
+        "meal_type": "lunch",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Thursday_dinner",
+        "day": "Thursday",
+        "meal_type": "dinner",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Friday_breakfast",
+        "day": "Friday",
+        "meal_type": "breakfast",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Friday_lunch",
+        "day": "Friday",
+        "meal_type": "lunch",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Friday_dinner",
+        "day": "Friday",
+        "meal_type": "dinner",
+        "status": "assigned",
+        "recipe_id": "rec_pan_seared_salmon",
+        "recipe_name": "Pan-Seared Salmon with Steamed Broccoli & Rice",
+        "servings": 2,
+        "estimated_cost": "14.50"
+      },
+      {
+        "slot_key": "Saturday_breakfast",
+        "day": "Saturday",
+        "meal_type": "breakfast",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Saturday_lunch",
+        "day": "Saturday",
+        "meal_type": "lunch",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Saturday_dinner",
+        "day": "Saturday",
+        "meal_type": "dinner",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Sunday_breakfast",
+        "day": "Sunday",
+        "meal_type": "breakfast",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Sunday_lunch",
+        "day": "Sunday",
+        "meal_type": "lunch",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      },
+      {
+        "slot_key": "Sunday_dinner",
+        "day": "Sunday",
+        "meal_type": "dinner",
+        "status": "unfilled",
+        "recipe_id": null,
+        "recipe_name": null,
+        "servings": 0,
+        "estimated_cost": "0.00"
+      }
+    ],
+    "grocery_basket": {
+      "basket_version": 1,
+      "total_items": 4,
+      "items": [
+        {
+          "ingredient_id": "ing_broccoli",
+          "name": "Broccoli Florets",
+          "category": "Produce",
+          "quantity": "250.0",
+          "unit": "g"
+        },
+        {
+          "ingredient_id": "ing_brown_rice",
+          "name": "Brown Rice",
+          "category": "Grains",
+          "quantity": "150.0",
+          "unit": "g"
+        },
+        {
+          "ingredient_id": "ing_olive_oil",
+          "name": "Extra Virgin Olive Oil",
+          "category": "Oils & Vinegars",
+          "quantity": "15.0",
+          "unit": "ml"
+        },
+        {
+          "ingredient_id": "ing_salmon_fillet",
+          "name": "Fresh Salmon Fillet",
+          "category": "Seafood",
+          "quantity": "350.0",
+          "unit": "g"
+        }
+      ]
+    }
+  }
+}
