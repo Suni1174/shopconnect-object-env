@@ -9,6 +9,9 @@ from shopconnect_env.agents.base import (
     BaseAgent,
     ObjectInspector,
 )
+from shopconnect_env.agents.condition_a_agent import ConditionAAgent
+from shopconnect_env.agents.condition_b_agent import ConditionBAgent
+from shopconnect_env.agents.condition_c_agent import ConditionCAgent
 from shopconnect_env.agents.mock_agent import MockAgent
 from shopconnect_env.agents.providers import (
     AuthenticationError,
@@ -24,13 +27,18 @@ from shopconnect_env.agents.providers import (
     ProviderError,
     RateLimitError,
     TimeoutError,
+    aggregate_usages,
     convert_to_responses_api_tools,
+    usage_to_dict,
 )
 
 __all__ = [
     "AgentResponse",
     "AuthenticationError",
     "BaseAgent",
+    "ConditionAAgent",
+    "ConditionBAgent",
+    "ConditionCAgent",
     "ConfigurationError",
     "ConnectionError",
     "LLMCompletionResult",
@@ -45,5 +53,7 @@ __all__ = [
     "ProviderError",
     "RateLimitError",
     "TimeoutError",
+    "aggregate_usages",
     "convert_to_responses_api_tools",
+    "usage_to_dict",
 ]

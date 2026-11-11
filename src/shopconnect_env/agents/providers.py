@@ -101,6 +101,61 @@ class LLMUsage:
     is_provider_reported: bool = True
 
 
+def aggregate_usages(usages: List[Optional[LLMUsage]]) -> Optional[LLMUsage]:
+    """Aggregate multiple LLMUsage records into a single cumulative total.
+
+    Preserves unknown (None) fields when no record reports them.
+    Guarantees that simulated mock usage (is_provider_reported=False) is never
+    falsely aggregated into a provider-reported (True) record.
+    """
+    valid_usages = [u for u in usages if u is not None]
+    if not valid_usages:
+        return None
+
+    input_tokens = sum(u.input_tokens for u in valid_usages)
+    output_tokens = sum(u.output_tokens for u in valid_usages)
+    total_tokens = sum(u.total_tokens for u in valid_usages)
+
+    has_cached = any(u.cached_input_tokens is not None for u in valid_usages)
+    cached_input_tokens = (
+        sum(u.cached_input_tokens for u in valid_usages if u.cached_input_tokens is not None)
+        if has_cached
+        else None
+    )
+
+    has_reasoning = any(u.reasoning_tokens is not None for u in valid_usages)
+    reasoning_tokens = (
+        sum(u.reasoning_tokens for u in valid_usages if u.reasoning_tokens is not None)
+        if has_reasoning
+        else None
+    )
+
+    is_provider_reported = all(u.is_provider_reported for u in valid_usages)
+
+    return LLMUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+        cached_input_tokens=cached_input_tokens,
+        reasoning_tokens=reasoning_tokens,
+        is_provider_reported=is_provider_reported,
+    )
+
+
+def usage_to_dict(usage: Optional[LLMUsage]) -> Optional[Dict[str, Any]]:
+    """Convert an LLMUsage instance to a serializable dictionary, or None if usage is None."""
+    if usage is None:
+        return None
+    return {
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "total_tokens": usage.total_tokens,
+        "cached_input_tokens": usage.cached_input_tokens,
+        "reasoning_tokens": usage.reasoning_tokens,
+        "is_provider_reported": usage.is_provider_reported,
+    }
+
+
 @dataclass(frozen=True)
 class LLMCompletionResult:
     """Standardized result of an LLM completion request.

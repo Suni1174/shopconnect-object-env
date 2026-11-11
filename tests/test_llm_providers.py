@@ -30,7 +30,9 @@ from shopconnect_env.agents.providers import (
     ProviderError,
     RateLimitError,
     TimeoutError,
+    aggregate_usages,
     convert_to_responses_api_tools,
+    usage_to_dict,
 )
 
 
@@ -463,3 +465,60 @@ def test_convert_to_responses_api_tools_preserves_plain_or_empty():
 
     plain = [{"type": "custom", "data": 123}]
     assert convert_to_responses_api_tools(plain) == plain
+
+
+def test_aggregate_usages_logic():
+    """aggregate_usages correctly aggregates sums, preserves unknown fields, and tracks provenance."""
+    # 1. Empty or None returns None (no token fabrication)
+    assert aggregate_usages([]) is None
+    assert aggregate_usages([None, None]) is None
+
+    # 2. Pure provider-reported aggregation with some optional fields
+    u1 = LLMUsage(input_tokens=100, output_tokens=50, total_tokens=150, cached_input_tokens=25, reasoning_tokens=None, is_provider_reported=True)
+    u2 = LLMUsage(input_tokens=80, output_tokens=30, total_tokens=110, cached_input_tokens=None, reasoning_tokens=15, is_provider_reported=True)
+
+    agg = aggregate_usages([u1, u2])
+    assert agg is not None
+    assert agg.input_tokens == 180
+    assert agg.output_tokens == 80
+    assert agg.total_tokens == 260
+    assert agg.cached_input_tokens == 25
+    assert agg.reasoning_tokens == 15
+    assert agg.is_provider_reported is True
+
+    # 3. All optional fields unknown (None) preserved as None
+    u3 = LLMUsage(input_tokens=50, output_tokens=20, total_tokens=70, cached_input_tokens=None, reasoning_tokens=None, is_provider_reported=True)
+    u4 = LLMUsage(input_tokens=50, output_tokens=20, total_tokens=70, cached_input_tokens=None, reasoning_tokens=None, is_provider_reported=True)
+    agg_none = aggregate_usages([u3, u4])
+    assert agg_none is not None
+    assert agg_none.cached_input_tokens is None
+    assert agg_none.reasoning_tokens is None
+
+    # 4. Provenance preservation: if any usage is simulated, aggregate is simulated
+    u_mock = LLMUsage(input_tokens=10, output_tokens=5, total_tokens=15, is_provider_reported=False)
+    agg_mixed = aggregate_usages([u1, u_mock])
+    assert agg_mixed is not None
+    assert agg_mixed.is_provider_reported is False
+
+
+def test_usage_to_dict_conversion():
+    """usage_to_dict converts LLMUsage to dictionary or returns None if usage is None."""
+    assert usage_to_dict(None) is None
+
+    usage = LLMUsage(
+        input_tokens=120,
+        output_tokens=40,
+        total_tokens=160,
+        cached_input_tokens=30,
+        reasoning_tokens=20,
+        is_provider_reported=True,
+    )
+    d = usage_to_dict(usage)
+    assert d == {
+        "input_tokens": 120,
+        "output_tokens": 40,
+        "total_tokens": 160,
+        "cached_input_tokens": 30,
+        "reasoning_tokens": 20,
+        "is_provider_reported": True,
+    }
