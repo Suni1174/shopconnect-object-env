@@ -306,6 +306,90 @@ def create_gemini_38_flash_pricing(
     )
 
 
+def create_openrouter_free_pricing(
+    version: str = "2026-04-openrouter-free-v1",
+    source: str = "OpenRouter Documentation (qwen/qwen3.8-27b:free)",
+    source_url: str = "https://openrouter.ai/qwen/qwen3.8-27b:free",
+    effective_date: str = "2026-04-15",
+    verification_date: Optional[str] = "2026-04-15",
+    model_name: str = "qwen/qwen3.8-27b:free",
+    pricing_mode: str = "Free Variant",
+    currency: str = "USD",
+    api_type: str = "chat_completions",
+    privacy_notice: str = (
+        "Free tier model hosted on OpenRouter. Subject to free quota limits "
+        "(documented 20 RPM, 50 RPD) and upstream host availability. Benchmark uses synthetic data only."
+    ),
+    input_cost_per_million: Optional[Decimal] = None,
+    cached_input_cost_per_million: Optional[Decimal] = None,
+    output_cost_per_million: Optional[Decimal] = None,
+) -> PricingConfig:
+    """Create pricing configuration for OpenRouter hosted free variant (qwen/qwen3.8-27b:free).
+
+    Billing tier is strictly 'free' with base rates set to $0.00.
+    """
+    in_rate = Decimal("0.00") if input_cost_per_million is None else input_cost_per_million
+    cached_rate = Decimal("0.00") if cached_input_cost_per_million is None else cached_input_cost_per_million
+    out_rate = Decimal("0.00") if output_cost_per_million is None else output_cost_per_million
+
+    return PricingConfig(
+        version=version,
+        source=source,
+        effective_date=effective_date,
+        currency=currency,
+        input_cost_per_million=in_rate,
+        cached_input_cost_per_million=cached_rate,
+        output_cost_per_million=out_rate,
+        verification_date=verification_date,
+        model_name=model_name,
+        pricing_mode=pricing_mode,
+        source_url=source_url,
+        provider_name="OpenRouter",
+        billing_tier="free",
+        api_type=api_type,
+        privacy_notice=privacy_notice,
+    )
+
+
+def create_ollama_local_pricing(
+    version: str = "2026-04-ollama-local-v1",
+    source: str = "Local Inference Resource Model",
+    source_url: str = "https://ollama.com/library/qwen3.5:0.8b",
+    effective_date: str = "2026-04-15",
+    verification_date: Optional[str] = "2026-04-15",
+    model_name: str = "qwen3.5:0.8b",
+    pricing_mode: str = "Local",
+    currency: str = "USD",
+    api_type: str = "chat_completions",
+    privacy_notice: str = (
+        "Local inference runs 100% on localhost. No network calls or cloud token billing. "
+        "Hardware amortization and energy costs are unmeasured and not falsely declared as zero."
+    ),
+) -> PricingConfig:
+    """Create pricing configuration for local Ollama inference (qwen3.5:0.8b).
+
+    Rates are None because local hardware and electricity costs are unmeasured.
+    Monetary cost calculations strictly evaluate to None, preventing false zero-cost claims.
+    """
+    return PricingConfig(
+        version=version,
+        source=source,
+        effective_date=effective_date,
+        currency=currency,
+        input_cost_per_million=None,
+        cached_input_cost_per_million=None,
+        output_cost_per_million=None,
+        verification_date=verification_date,
+        model_name=model_name,
+        pricing_mode=pricing_mode,
+        source_url=source_url,
+        provider_name="Ollama",
+        billing_tier="local_inference",
+        api_type=api_type,
+        privacy_notice=privacy_notice,
+    )
+
+
 def calculate_percentile(values: List[Any], percentile: float) -> Optional[float]:
     """Calculate percentile from a list of values using standard linear interpolation.
 

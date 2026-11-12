@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -1292,3 +1293,620 @@ class GeminiProvider:
             finish_reason=finish_reason,
             raw_response=raw_meta,
         )
+
+
+# =============================================================================
+# 7. OPENAI-COMPATIBLE CHAT COMPLETIONS HELPERS
+# =============================================================================
+
+def convert_to_chat_completions_tools(
+    tools: Optional[List[Dict[str, Any]]],
+) -> Optional[List[Dict[str, Any]]]:
+    """Convert tool definitions to OpenAI-compatible Chat Completions function tool format.
+
+    Compatible with client.chat.completions.create(tools=...).
+    """
+    if not tools:
+        return None
+
+    converted: List[Dict[str, Any]] = []
+    for tool in tools:
+        if tool.get("type") == "function":
+            fn = tool.get("function", tool)
+            converted.append({
+                "type": "function",
+                "function": {
+                    "name": fn["name"],
+                    "description": fn.get("description", ""),
+                    "parameters": fn.get("parameters", {}),
+                },
+            })
+        else:
+            converted.append(tool)
+    return converted
+
+
+def convert_to_chat_completions_messages(
+    messages: List[LLMMessage],
+) -> List[Dict[str, Any]]:
+    """Convert internal LLMMessage sequence to standard Chat Completions message list.
+
+    Preserves:
+    - System messages.
+    - User messages.
+    - Assistant messages with text and/or multiple tool_calls.
+    - Tool response messages with tool_call_id and string output.
+    """
+    formatted: List[Dict[str, Any]] = []
+    for msg in messages:
+        if msg.role == "system":
+            formatted.append({"role": "system", "content": msg.content or ""})
+        elif msg.role == "user":
+            formatted.append({"role": "user", "content": msg.content or ""})
+        elif msg.role == "assistant":
+            m: Dict[str, Any] = {"role": "assistant"}
+            m["content"] = msg.content if msg.content is not None else None
+            if msg.tool_calls:
+                formatted_calls: List[Dict[str, Any]] = []
+                for tc in msg.tool_calls:
+                    cid = tc.get("id") or tc.get("call_id") or "call_unknown"
+                    fn_data = tc.get("function")
+                    if fn_data and isinstance(fn_data, dict):
+                        fn_name = fn_data.get("name", "")
+                        fn_args = fn_data.get("arguments", "{}")
+                    else:
+                        fn_name = tc.get("name", "")
+                        fn_args = tc.get("arguments", "{}")
+                    if not isinstance(fn_args, str):
+                        fn_args = json.dumps(fn_args)
+                    formatted_calls.append({
+                        "id": cid,
+                        "type": "function",
+                        "function": {
+                            "name": fn_name,
+                            "arguments": fn_args,
+                        },
+                    })
+                m["tool_calls"] = formatted_calls
+            formatted.append(m)
+        elif msg.role == "tool":
+            formatted.append({
+                "role": "tool",
+                "tool_call_id": msg.tool_call_id or "",
+                "content": msg.content or "",
+            })
+        else:
+            formatted.append({"role": msg.role, "content": msg.content or ""})
+    return formatted
+
+
+def parse_chat_completions_response(
+    response: Any,
+    latency_ms: float,
+    default_model: str,
+    is_provider_reported: bool = True,
+    deployment_mode: Optional[str] = None,
+) -> LLMCompletionResult:
+    """Extract standardized LLMCompletionResult from a Chat Completions response object or dict."""
+    choices = getattr(response, "choices", None)
+    if choices is None and isinstance(response, dict):
+        choices = response.get("choices")
+    choices = choices or []
+
+    raw_msg = None
+    finish_reason = "stop"
+    if choices:
+        first_choice = choices[0]
+        raw_msg = getattr(first_choice, "message", None)
+        if raw_msg is None and isinstance(first_choice, dict):
+            raw_msg = first_choice.get("message")
+        raw_fr = getattr(first_choice, "finish_reason", None)
+        if raw_fr is None and isinstance(first_choice, dict):
+            raw_fr = first_choice.get("finish_reason")
+        if raw_fr:
+            finish_reason = str(raw_fr).lower()
+
+    text_content: Optional[str] = None
+    tool_calls: List[Dict[str, Any]] = []
+
+    if raw_msg is not None:
+        text_content = getattr(raw_msg, "content", None)
+        if text_content is None and isinstance(raw_msg, dict):
+            text_content = raw_msg.get("content")
+
+        raw_tc_list = getattr(raw_msg, "tool_calls", None)
+        if raw_tc_list is None and isinstance(raw_msg, dict):
+            raw_tc_list = raw_msg.get("tool_calls")
+
+        if raw_tc_list:
+            for tc in raw_tc_list:
+                cid = getattr(tc, "id", None) or (tc.get("id") if isinstance(tc, dict) else None) or ""
+                fn = getattr(tc, "function", None) or (tc.get("function") if isinstance(tc, dict) else None)
+                if fn is not None:
+                    fn_name = getattr(fn, "name", None) or (fn.get("name") if isinstance(fn, dict) else "")
+                    fn_args = getattr(fn, "arguments", None) or (fn.get("arguments") if isinstance(fn, dict) else "{}")
+                else:
+                    fn_name = getattr(tc, "name", None) or (tc.get("name") if isinstance(tc, dict) else "")
+                    fn_args = getattr(tc, "arguments", None) or (tc.get("arguments") if isinstance(tc, dict) else "{}")
+
+                if not isinstance(fn_args, str):
+                    fn_args = json.dumps(fn_args)
+
+                tool_calls.append({
+                    "id": cid,
+                    "call_id": cid,
+                    "type": "function",
+                    "name": fn_name,
+                    "arguments": fn_args,
+                    "function": {
+                        "name": fn_name,
+                        "arguments": fn_args,
+                    },
+                })
+
+    msg = LLMMessage(
+        role="assistant",
+        content=text_content,
+        tool_calls=tuple(tool_calls) if tool_calls else None,
+    )
+
+    # Usage extraction
+    usage: Optional[LLMUsage] = None
+    reasoning_tok = None
+    usage_obj = getattr(response, "usage", None)
+    if usage_obj is None and isinstance(response, dict):
+        usage_obj = response.get("usage")
+
+    if usage_obj is not None:
+        in_tok = getattr(usage_obj, "prompt_tokens", None)
+        if in_tok is None and isinstance(usage_obj, dict):
+            in_tok = usage_obj.get("prompt_tokens")
+
+        out_tok = getattr(usage_obj, "completion_tokens", None)
+        if out_tok is None and isinstance(usage_obj, dict):
+            out_tok = usage_obj.get("completion_tokens")
+
+        tot_tok = getattr(usage_obj, "total_tokens", None)
+        if tot_tok is None and isinstance(usage_obj, dict):
+            tot_tok = usage_obj.get("total_tokens")
+
+        cached_tok = None
+        prompt_details = getattr(usage_obj, "prompt_tokens_details", None)
+        if prompt_details is None and isinstance(usage_obj, dict):
+            prompt_details = usage_obj.get("prompt_tokens_details")
+        if prompt_details is not None:
+            cached_tok = getattr(prompt_details, "cached_tokens", None)
+            if cached_tok is None and isinstance(prompt_details, dict):
+                cached_tok = prompt_details.get("cached_tokens")
+
+        reasoning_tok = None
+        comp_details = getattr(usage_obj, "completion_tokens_details", None)
+        if comp_details is None and isinstance(usage_obj, dict):
+            comp_details = usage_obj.get("completion_tokens_details")
+        if comp_details is not None:
+            reasoning_tok = getattr(comp_details, "reasoning_tokens", None)
+            if reasoning_tok is None and isinstance(comp_details, dict):
+                reasoning_tok = comp_details.get("reasoning_tokens")
+
+        if in_tok is not None and out_tok is not None:
+            derived_total = int(in_tok + out_tok) if tot_tok is None else None
+            usage = LLMUsage(
+                input_tokens=int(in_tok),
+                output_tokens=int(out_tok),
+                total_tokens=int(tot_tok) if tot_tok is not None else None,
+                cached_input_tokens=int(cached_tok) if cached_tok is not None else None,
+                reasoning_tokens=int(reasoning_tok) if reasoning_tok is not None else None,
+                is_provider_reported=is_provider_reported,
+                derived_total_tokens=derived_total,
+            )
+
+    model_id = getattr(response, "model", None)
+    if model_id is None and isinstance(response, dict):
+        model_id = response.get("model")
+    actual_model_identifier = str(model_id).strip() if model_id else None
+
+    req_id = getattr(response, "id", None)
+    if req_id is None and isinstance(response, dict):
+        req_id = response.get("id")
+
+    sys_fp = getattr(response, "system_fingerprint", None)
+    if sys_fp is None and isinstance(response, dict):
+        sys_fp = response.get("system_fingerprint")
+
+    raw_meta: Dict[str, Any] = {}
+    if req_id:
+        raw_meta["id"] = req_id
+    if actual_model_identifier:
+        raw_meta["model"] = actual_model_identifier
+    if sys_fp:
+        raw_meta["system_fingerprint"] = sys_fp
+    if deployment_mode:
+        raw_meta["deployment_mode"] = deployment_mode
+
+    # Inspect reasoning metadata from raw message without exposing hidden reasoning text
+    reasoning_text = None
+    if raw_msg is not None:
+        reasoning_text = getattr(raw_msg, "reasoning", None) or getattr(raw_msg, "reasoning_content", None)
+        if reasoning_text is None and isinstance(raw_msg, dict):
+            reasoning_text = raw_msg.get("reasoning") or raw_msg.get("reasoning_content")
+        if reasoning_text is None:
+            msg_extra = getattr(raw_msg, "model_extra", None)
+            if msg_extra and isinstance(msg_extra, dict):
+                reasoning_text = msg_extra.get("reasoning") or msg_extra.get("reasoning_content")
+
+    has_reasoning = bool(reasoning_text) or bool(reasoning_tok and int(reasoning_tok) > 0)
+    reasoning_length = len(reasoning_text) if isinstance(reasoning_text, str) else 0
+
+    raw_meta["finish_reason"] = finish_reason
+    raw_meta["reasoning_present"] = has_reasoning
+    raw_meta["reasoning_length"] = reasoning_length
+
+    upstream_provider = getattr(response, "provider", None) or (response.get("provider") if isinstance(response, dict) else None)
+    if upstream_provider:
+        raw_meta["upstream_provider"] = upstream_provider
+
+    model_extra = getattr(response, "model_extra", None)
+    for extra_field in (
+        "created_at",
+        "total_duration",
+        "load_duration",
+        "prompt_eval_duration",
+        "eval_duration",
+        "digest",
+        "model_digest",
+    ):
+        val = getattr(response, extra_field, None) or (response.get(extra_field) if isinstance(response, dict) else None)
+        if val is None and model_extra and isinstance(model_extra, dict):
+            val = model_extra.get(extra_field)
+        if val is not None:
+            raw_meta[extra_field] = val
+
+    return LLMCompletionResult(
+        message=msg,
+        usage=usage,
+        model_identifier=actual_model_identifier,
+        system_fingerprint=sys_fp,
+        provider_request_id=req_id,
+        latency_ms=latency_ms,
+        finish_reason=finish_reason,
+        raw_response=raw_meta,
+    )
+
+
+# =============================================================================
+# 8. OPENROUTER HOSTED FREE API PROVIDER ADAPTER
+# =============================================================================
+
+class OpenRouterProvider:
+    """Provider adapter connecting to OpenRouter hosted API for qwen/qwen3.8-27b:free.
+
+    Enforces research integrity:
+    - Target model: 'qwen/qwen3.8-27b:free' (never drop ':free').
+    - Rejects non-free models or dynamic routing ('openrouter/free').
+    - No automatic fallback to paid models.
+    - Credentials loaded strictly from OPENROUTER_API_KEY.
+    - Secrets never logged, echoed, or exposed in exceptions.
+    - Uses OpenAI-compatible Chat Completions interface.
+    - Supports dependency injection of client for 100% offline unit testing.
+    """
+
+    DEFAULT_MODEL: str = "qwen/qwen3.8-27b:free"
+    DEFAULT_BASE_URL: str = "https://openrouter.ai/api/v1"
+    DEFAULT_OUTPUT_TOKEN_CEILING: int = 2048
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: str = DEFAULT_MODEL,
+        base_url: str = DEFAULT_BASE_URL,
+        timeout_seconds: float = 60.0,
+        client: Optional[Any] = None,
+        max_output_tokens: Optional[int] = DEFAULT_OUTPUT_TOKEN_CEILING,
+        max_retries: int = 0,
+    ) -> None:
+        if model == "openrouter/free":
+            raise ConfigurationError(
+                "Dynamic routing model 'openrouter/free' is prohibited for reproducible benchmark evaluation. "
+                f"Use exact free model identifier: {self.DEFAULT_MODEL!r}"
+            )
+        if not model.endswith(":free"):
+            raise ConfigurationError(
+                f"OpenRouter model must have ':free' suffix to prevent unexpected billing. Got: {model!r}. "
+                f"Expected: {self.DEFAULT_MODEL!r}"
+            )
+
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.timeout_seconds = timeout_seconds
+        self._explicit_api_key = api_key
+        self._injected_client = client
+        self._client: Optional[Any] = client
+        self.max_output_tokens = max_output_tokens
+        self.max_retries = max_retries
+
+    def __repr__(self) -> str:
+        """Return safe string representation without exposing API credentials."""
+        return f"OpenRouterProvider(model={self.model!r}, base_url={self.base_url!r})"
+
+    def _get_client(self) -> Any:
+        """Obtain or lazily instantiate OpenAI client targeting OpenRouter base URL."""
+        if self._client is not None:
+            return self._client
+
+        api_key = self._explicit_api_key or os.environ.get("OPENROUTER_API_KEY")
+        if not api_key or not api_key.strip():
+            raise ConfigurationError(
+                "OPENROUTER_API_KEY environment variable is not set. "
+                "Provide an API key or inject a client for testing."
+            )
+
+        import openai
+        self._client = openai.OpenAI(
+            base_url=self.base_url,
+            api_key=api_key.strip(),
+            timeout=self.timeout_seconds,
+            max_retries=self.max_retries,
+        )
+        return self._client
+
+    @property
+    def sdk_version(self) -> Optional[str]:
+        """Return the installed version of the underlying OpenAI SDK."""
+        try:
+            import openai
+            return getattr(openai, "__version__", None)
+        except ImportError:
+            return None
+
+    def complete(
+        self,
+        messages: List[LLMMessage],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        reasoning_effort: str = "low",
+        max_output_tokens: Optional[int] = None,
+        **kwargs: Any,
+    ) -> LLMCompletionResult:
+        """Execute completion request against OpenRouter Chat Completions API."""
+        client = self._get_client()
+        effective_max_tokens = max_output_tokens if max_output_tokens is not None else self.max_output_tokens
+
+        chat_messages = convert_to_chat_completions_messages(messages)
+        formatted_tools = convert_to_chat_completions_tools(tools)
+
+        request_kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "messages": chat_messages,
+        }
+        if effective_max_tokens is not None:
+            request_kwargs["max_tokens"] = effective_max_tokens
+
+        if formatted_tools:
+            request_kwargs["tools"] = formatted_tools
+        if tool_choice:
+            request_kwargs["tool_choice"] = tool_choice
+        if response_format:
+            request_kwargs["response_format"] = response_format
+
+        t0 = time.perf_counter()
+        try:
+            raw_response = client.chat.completions.create(**request_kwargs)
+        except Exception as exc:
+            self._handle_api_exception(exc)
+
+        latency_ms = (time.perf_counter() - t0) * 1000.0
+        return parse_chat_completions_response(
+            raw_response,
+            latency_ms=latency_ms,
+            default_model=self.model,
+            is_provider_reported=True,
+            deployment_mode="hosted_api",
+        )
+
+    def _handle_api_exception(self, exc: Exception) -> None:
+        """Map underlying SDK exceptions to typed ProviderError classes with secret redaction."""
+        exc_type = type(exc).__name__
+        exc_msg = str(exc)
+
+        if "Authentication" in exc_type or "Unauthorized" in exc_msg or getattr(exc, "status_code", None) == 401:
+            raise AuthenticationError("Authentication failed: invalid or unauthorized OpenRouter API key.") from None
+
+        if "RateLimit" in exc_type or "429" in exc_msg or getattr(exc, "status_code", None) == 429:
+            raise RateLimitError("OpenRouter API rate limit or quota exceeded.") from None
+
+        if "Timeout" in exc_type or "timed out" in exc_msg.lower():
+            raise TimeoutError("OpenRouter API request timed out.") from None
+
+        if "Connection" in exc_type or "connection" in exc_msg.lower() or "connect" in exc_msg.lower():
+            raise ConnectionError("Failed to connect to OpenRouter API endpoint.") from None
+
+        clean_detail = exc_msg.split("\n")[0] if exc_msg else exc_type
+        for secret in filter(None, [self._explicit_api_key, os.environ.get("OPENROUTER_API_KEY")]):
+            clean_detail = clean_detail.replace(secret, "[REDACTED_API_KEY]")
+
+        raise ProviderError(f"OpenRouter API provider error ({exc_type}): {clean_detail}") from None
+
+
+# =============================================================================
+# 9. OLLAMA LOCAL INFERENCE PROVIDER ADAPTER
+# =============================================================================
+
+class OllamaProvider:
+    """Provider adapter connecting to local Ollama instance for qwen3.5:0.8b.
+
+    Enforces local research integrity:
+    - Target model: 'qwen3.5:0.8b'.
+    - Local endpoint: 'http://localhost:11434/v1'.
+    - No API key required (dummy value supplied to satisfy SDK interface).
+    - Zero remote cloud inference fallback.
+    - Enforces sequential execution via class-level lock (one request at a time).
+    - Conservative context length: 4096 tokens via extra_body options num_ctx.
+    - Thinking: disabled by default (think=False).
+    - Captures model tag / digest and distinguishes local latency and runtime durations.
+    - Clean detection of offline Ollama server with explicit setup instructions.
+    - Supports dependency injection of client for 100% offline unit testing.
+    """
+
+    DEFAULT_MODEL: str = "qwen3.5:0.8b"
+    DEFAULT_BASE_URL: str = "http://localhost:11434/v1"
+    DEFAULT_CONTEXT_LENGTH: int = 4096
+    DEFAULT_TIMEOUT_SECONDS: float = 180.0
+    DEFAULT_OUTPUT_TOKEN_CEILING: int = 2048
+
+    # Process-wide execution lock to ensure strict sequential inference on local host hardware
+    _global_execution_lock = threading.Lock()
+
+    def __init__(
+        self,
+        model: str = DEFAULT_MODEL,
+        base_url: str = DEFAULT_BASE_URL,
+        context_length: int = DEFAULT_CONTEXT_LENGTH,
+        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        client: Optional[Any] = None,
+        max_output_tokens: Optional[int] = DEFAULT_OUTPUT_TOKEN_CEILING,
+        enable_thinking: bool = False,
+        think: Optional[bool] = None,
+        reasoning_effort: Optional[str] = None,
+    ) -> None:
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.context_length = context_length
+        self.timeout_seconds = timeout_seconds
+        self.enable_thinking = think if think is not None else enable_thinking
+        self.reasoning_effort = reasoning_effort
+        self._injected_client = client
+        self._client: Optional[Any] = client
+        self.max_output_tokens = max_output_tokens
+
+    def __repr__(self) -> str:
+        return (
+            f"OllamaProvider(model={self.model!r}, "
+            f"base_url={self.base_url!r}, "
+            f"context_length={self.context_length}, "
+            f"enable_thinking={self.enable_thinking})"
+        )
+
+    def _get_client(self) -> Any:
+        """Obtain or lazily instantiate OpenAI client targeting local Ollama endpoint."""
+        if self._client is not None:
+            return self._client
+
+        import openai
+        # Ollama local endpoint requires no key, but openai client expects a non-empty string
+        self._client = openai.OpenAI(
+            base_url=self.base_url,
+            api_key="ollama",
+            timeout=self.timeout_seconds,
+            max_retries=0,
+        )
+        return self._client
+
+    @property
+    def sdk_version(self) -> Optional[str]:
+        """Return the installed version of the underlying client SDK."""
+        try:
+            import openai
+            return getattr(openai, "__version__", None)
+        except ImportError:
+            return None
+
+    def complete(
+        self,
+        messages: List[LLMMessage],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        reasoning_effort: Optional[str] = None,
+        max_output_tokens: Optional[int] = None,
+        **kwargs: Any,
+    ) -> LLMCompletionResult:
+        """Execute completion request against local Ollama under concurrency lock."""
+        with self._global_execution_lock:
+            client = self._get_client()
+            effective_max_tokens = max_output_tokens if max_output_tokens is not None else self.max_output_tokens
+
+            chat_messages = convert_to_chat_completions_messages(messages)
+            formatted_tools = convert_to_chat_completions_tools(tools)
+
+            explicit_think = kwargs.get("think", kwargs.get("enable_thinking"))
+            effective_enable_thinking = self.enable_thinking if explicit_think is None else bool(explicit_think)
+
+            # Documented Ollama OpenAI-compatibility control:
+            # - For /v1/chat/completions, reasoning_effort="none" disables thinking.
+            # - Native /api/chat uses think=false, but /v1/chat/completions must NOT send think in extra_body.
+            # - When thinking is disabled, pass reasoning_effort="none".
+            # - When thinking is enabled, pass designated reasoning_effort (or "low" as default).
+            if not effective_enable_thinking:
+                effective_reasoning_effort: Optional[str] = "none"
+            else:
+                effective_reasoning_effort = (
+                    reasoning_effort
+                    or kwargs.get("reasoning_effort")
+                    or self.reasoning_effort
+                    or "low"
+                )
+
+            extra_body: Dict[str, Any] = {
+                "options": {
+                    "num_ctx": self.context_length,
+                },
+            }
+            if "extra_body" in kwargs and isinstance(kwargs["extra_body"], dict):
+                clean_extra = {k: v for k, v in kwargs["extra_body"].items() if k != "think"}
+                extra_body.update(clean_extra)
+
+            request_kwargs: Dict[str, Any] = {
+                "model": self.model,
+                "messages": chat_messages,
+                "reasoning_effort": effective_reasoning_effort,
+                "extra_body": extra_body,
+            }
+            if effective_max_tokens is not None:
+                request_kwargs["max_tokens"] = effective_max_tokens
+            if formatted_tools:
+                request_kwargs["tools"] = formatted_tools
+            if tool_choice:
+                request_kwargs["tool_choice"] = tool_choice
+            if response_format:
+                request_kwargs["response_format"] = response_format
+
+            t0 = time.perf_counter()
+            try:
+                raw_response = client.chat.completions.create(**request_kwargs)
+            except Exception as exc:
+                self._handle_api_exception(exc)
+
+            latency_ms = (time.perf_counter() - t0) * 1000.0
+            return parse_chat_completions_response(
+                raw_response,
+                latency_ms=latency_ms,
+                default_model=self.model,
+                is_provider_reported=True,
+                deployment_mode="local_inference",
+            )
+
+    def _handle_api_exception(self, exc: Exception) -> None:
+        """Map SDK errors to typed exceptions; detect offline server with setup instructions."""
+        exc_type = type(exc).__name__
+        exc_msg = str(exc).lower()
+
+        if (
+            "connect" in exc_type.lower()
+            or "connection" in exc_type.lower()
+            or "connect" in exc_msg
+            or "refused" in exc_msg
+            or "unavailable" in exc_msg
+            or "unreachable" in exc_msg
+        ):
+            raise ConnectionError(
+                f"Ollama server is unavailable at {self.base_url}. "
+                "Please verify Ollama is installed and running ('ollama serve') "
+                f"and the model is pulled ('ollama pull {self.model}'). "
+                "Strict invariant: never falling back to remote cloud inference."
+            ) from exc
+
+        if "timeout" in exc_type.lower() or "timeout" in exc_msg or "timed out" in exc_msg:
+            raise TimeoutError(f"Local Ollama inference request timed out after {self.timeout_seconds}s.") from exc
+
+        raise ProviderError(f"Ollama local provider error ({exc_type}): {exc}") from exc
