@@ -398,6 +398,33 @@ def test_gemini_missing_usage_metadata():
     assert res.message.content == "No usage"
 
 
+def test_gemini_missing_model_version_preserves_none():
+    """When Gemini response omits model_version, preserve model_identifier as None."""
+    fake_client = MagicMock()
+    mock_resp = SimpleNamespace(
+        candidates=[
+            SimpleNamespace(
+                finish_reason="STOP",
+                content=SimpleNamespace(
+                    role="model",
+                    parts=[SimpleNamespace(text="Response without model version", thought=False, function_call=None)],
+                ),
+            )
+        ],
+        text="Response without model version",
+        usage_metadata=None,
+        model_version=None,
+        response_id="req_no_model_version",
+    )
+    fake_client.models.generate_content.return_value = mock_resp
+
+    provider = GeminiProvider(client=fake_client)
+    res = provider.complete([LLMMessage(role="user", content="Test")])
+
+    assert res.model_identifier is None
+    assert "model_version" not in res.raw_response
+
+
 def test_gemini_usage_missing_total_tokens_preserves_none_with_derived_total():
     """When Gemini omits total_token_count, preserve total_tokens as None without fabricating provider usage."""
     fake_client = MagicMock()
@@ -542,3 +569,140 @@ def test_gemini_secret_redaction_in_exception_messages():
     err_str = str(exc_info.value)
     assert secret_key not in err_str
     assert "[REDACTED_API_KEY]" in err_str
+
+
+def test_gemini_connect_timeout_classification_and_cause_preservation():
+    """httpx.ConnectTimeout maps to TimeoutError (not ConnectionError) with cause preserved."""
+    import httpx
+    fake_client = MagicMock()
+    original_err = httpx.ConnectTimeout("Connection timed out while connecting to 142.250.190.42:443")
+    fake_client.models.generate_content.side_effect = original_err
+
+    provider = GeminiProvider(client=fake_client)
+    with pytest.raises(TimeoutError) as exc_info:
+        provider.complete([LLMMessage(role="user", content="test")])
+
+    err_str = str(exc_info.value)
+    assert "connection timed out (ConnectTimeout)" in err_str
+    assert exc_info.value.__cause__ is original_err
+    assert isinstance(exc_info.value, TimeoutError)
+    assert not isinstance(exc_info.value, ConnectionError)
+
+
+def test_gemini_read_timeout_classification_and_cause_preservation():
+    """httpx.ReadTimeout maps to TimeoutError with cause preserved."""
+    import httpx
+    fake_client = MagicMock()
+    original_err = httpx.ReadTimeout("Read timed out after 30.0 seconds")
+    fake_client.models.generate_content.side_effect = original_err
+
+    provider = GeminiProvider(client=fake_client)
+    with pytest.raises(TimeoutError) as exc_info:
+        provider.complete([LLMMessage(role="user", content="test")])
+
+    err_str = str(exc_info.value)
+    assert "read timed out (ReadTimeout)" in err_str
+    assert exc_info.value.__cause__ is original_err
+
+
+def test_gemini_tls_ssl_error_classification_and_cause_preservation():
+    """SSL verification errors map to ConnectionError identifying TLS/SSL failure."""
+    import ssl
+    fake_client = MagicMock()
+    original_err = ssl.SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
+    fake_client.models.generate_content.side_effect = original_err
+
+    provider = GeminiProvider(client=fake_client)
+    with pytest.raises(ConnectionError) as exc_info:
+        provider.complete([LLMMessage(role="user", content="test")])
+
+    err_str = str(exc_info.value)
+    assert "TLS/SSL error (SSLCertVerificationError)" in err_str
+    assert exc_info.value.__cause__ is original_err
+
+
+def test_gemini_connect_error_classification_and_cause_preservation():
+    """httpx.ConnectError maps to ConnectionError identifying connect failure."""
+    import httpx
+    fake_client = MagicMock()
+    original_err = httpx.ConnectError("[WinError 10061] No connection could be made because the target machine actively refused it")
+    fake_client.models.generate_content.side_effect = original_err
+
+    provider = GeminiProvider(client=fake_client)
+    with pytest.raises(ConnectionError) as exc_info:
+        provider.complete([LLMMessage(role="user", content="test")])
+
+    err_str = str(exc_info.value)
+    assert "Failed to connect to Gemini API endpoint (ConnectError)" in err_str
+    assert exc_info.value.__cause__ is original_err
+
+
+def test_gemini_http_5xx_server_error_classification_and_cause_preservation():
+    """HTTP 500 and 503 ServerError map to ProviderError identifying server status."""
+    fake_client = MagicMock()
+    err_500 = ServerError(code=500, response_json={"error": {"message": "Internal server error"}}, response=None)
+    fake_client.models.generate_content.side_effect = err_500
+
+    provider = GeminiProvider(client=fake_client)
+    with pytest.raises(ProviderError) as exc_info:
+        provider.complete([LLMMessage(role="user", content="test")])
+
+    assert "server error (HTTP 500)" in str(exc_info.value)
+    assert exc_info.value.__cause__ is err_500
+
+    err_503 = ServerError(code=503, response_json={"error": {"message": "Service unavailable"}}, response=None)
+    fake_client.models.generate_content.side_effect = err_503
+    with pytest.raises(ProviderError) as exc_info2:
+        provider.complete([LLMMessage(role="user", content="test")])
+
+    assert "server error (HTTP 503)" in str(exc_info2.value)
+    assert exc_info2.value.__cause__ is err_503
+
+
+def test_gemini_timeout_units_and_retries_configuration(monkeypatch):
+    """Verify timeout is converted to milliseconds and retries=0 sets attempts=1."""
+    captured_client_kwargs = {}
+
+    def fake_genai_client(*args, **kwargs):
+        captured_client_kwargs.update(kwargs)
+        mock = MagicMock()
+        return mock
+
+    monkeypatch.setattr("google.genai.Client", fake_genai_client)
+
+    # 1. 30 seconds -> 30,000 ms, max_retries=0 -> attempts=1
+    prov30 = GeminiProvider(api_key="AIzaSyTestKey", timeout_seconds=30.0, max_retries=0)
+    _ = prov30._get_client()
+
+    http_opts = captured_client_kwargs.get("http_options")
+    assert http_opts is not None
+    assert http_opts.timeout == 30000  # Exactly 30 seconds in milliseconds
+    assert http_opts.retry_options is not None
+    assert http_opts.retry_options.attempts == 1  # 0 retries = 1 single attempt
+
+    # 2. Per-request GenerateContentConfig http_options check
+    fake_client = MagicMock()
+    mock_resp = SimpleNamespace(
+        candidates=[
+            SimpleNamespace(
+                finish_reason="STOP",
+                content=SimpleNamespace(
+                    role="model",
+                    parts=[SimpleNamespace(text="OK", thought=False, function_call=None)],
+                ),
+            )
+        ],
+        text="OK",
+        usage_metadata=None,
+        model_version="gemini-3.8-flash",
+        response_id="req_ok",
+    )
+    fake_client.models.generate_content.return_value = mock_resp
+
+    prov_req = GeminiProvider(client=fake_client, timeout_seconds=30.0, max_retries=0)
+    prov_req.complete([LLMMessage(role="user", content="test")])
+
+    config_passed = fake_client.models.generate_content.call_args.kwargs["config"]
+    assert config_passed.http_options is not None
+    assert config_passed.http_options.timeout == 30000
+    assert config_passed.http_options.retry_options.attempts == 1

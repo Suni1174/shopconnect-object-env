@@ -222,7 +222,7 @@ class LLMCompletionResult:
     Attributes:
         message: The LLMMessage returned by the model.
         usage: Token consumption breakdown, or None if unavailable.
-        model_identifier: The model string (e.g. 'gpt-6-luna' or mock ID).
+        model_identifier: The model string reported by provider (or None if unavailable).
         system_fingerprint: System fingerprint reported by provider for traceability.
         provider_request_id: Unique request ID returned by provider for audit logging.
         latency_ms: Measured end-to-end request duration in milliseconds.
@@ -232,7 +232,7 @@ class LLMCompletionResult:
 
     message: LLMMessage
     usage: Optional[LLMUsage]
-    model_identifier: str
+    model_identifier: Optional[str] = None
     system_fingerprint: Optional[str] = None
     provider_request_id: Optional[str] = None
     latency_ms: float = 0.0
@@ -851,7 +851,28 @@ class GeminiProvider:
             )
 
         from google import genai
-        self._client = genai.Client(api_key=api_key.strip())
+        from google.genai import types
+
+        # google-genai SDK HttpOptions.timeout expects milliseconds
+        timeout_ms = int(self.timeout_seconds * 1000) if self.timeout_seconds else None
+
+        # google-genai SDK HttpRetryOptions: attempts=1 means 1 attempt total (0 retries)
+        if self.max_retries == 0:
+            retry_opts = types.HttpRetryOptions(attempts=1)
+        elif self.max_retries > 0:
+            retry_opts = types.HttpRetryOptions(attempts=self.max_retries + 1)
+        else:
+            retry_opts = None
+
+        http_options = types.HttpOptions(
+            timeout=timeout_ms,
+            retry_options=retry_opts,
+        )
+
+        self._client = genai.Client(
+            api_key=api_key.strip(),
+            http_options=http_options,
+        )
         return self._client
 
     @property
@@ -1011,6 +1032,20 @@ class GeminiProvider:
             if "schema" in response_format:
                 config_kwargs["response_schema"] = response_format["schema"]
 
+        # HTTP options for request timeout (in milliseconds) and retries
+        if self.timeout_seconds or self.max_retries is not None:
+            timeout_ms = int(self.timeout_seconds * 1000) if self.timeout_seconds else None
+            if self.max_retries == 0:
+                retry_opts = types.HttpRetryOptions(attempts=1)
+            elif self.max_retries > 0:
+                retry_opts = types.HttpRetryOptions(attempts=self.max_retries + 1)
+            else:
+                retry_opts = None
+            config_kwargs["http_options"] = types.HttpOptions(
+                timeout=timeout_ms,
+                retry_options=retry_opts,
+            )
+
         gen_config = types.GenerateContentConfig(**config_kwargs)
 
         # 3. Execute request with stopwatch timing and exception mapping
@@ -1029,63 +1064,128 @@ class GeminiProvider:
         # 4. Parse response output text and tool calls
         return self._parse_response(raw_response, latency_ms)
 
+    def _sanitize_message(self, text: str) -> str:
+        """Sanitize API keys and sensitive credentials from error text."""
+        sanitized = text
+        for secret in filter(None, [
+            self._explicit_api_key,
+            os.environ.get("GEMINI_API_KEY"),
+            os.environ.get("GOOGLE_API_KEY"),
+        ]):
+            if secret:
+                sanitized = sanitized.replace(secret, "[REDACTED_API_KEY]")
+        return sanitized
+
     def _handle_api_exception(self, exc: Exception) -> None:
-        """Map underlying SDK exceptions to typed ProviderError classes without leaking credentials."""
+        """Map underlying SDK exceptions to typed ProviderError classes without leaking credentials.
+
+        Preserves:
+        - Specific exception classification (ConnectTimeout, ReadTimeout, TLS/SSL, ConnectError, 401, 403, 429, 5xx).
+        - Original exception chaining (raises ... from exc).
+        - Original exception type name and sanitized detail in the message.
+        - Strict redaction of secrets and credentials.
+        """
         exc_type = type(exc).__name__
         exc_msg = str(exc)
         status_code = getattr(exc, "code", getattr(exc, "status_code", getattr(exc, "status", None)))
 
-        clean_detail = exc_msg.split("\n")[0] if exc_msg else exc_type
-        for secret in filter(None, [self._explicit_api_key, os.environ.get("GEMINI_API_KEY")]):
-            clean_detail = clean_detail.replace(secret, "[REDACTED_API_KEY]")
+        clean_detail = self._sanitize_message(exc_msg.split("\n")[0] if exc_msg else exc_type)
 
-        # 1. Authentication / Unauthorized (401, 403, API_KEY_INVALID, PERMISSION_DENIED)
+        # 1. Authentication / Permission Denied (401, 403, API_KEY_INVALID, PERMISSION_DENIED)
         if (
             status_code in (401, 403)
             or "API_KEY_INVALID" in exc_msg
             or "PERMISSION_DENIED" in exc_msg
-            or "Unauthorized" in exc_msg
+            or "unauthorized" in exc_msg.lower()
             or "unauthenticated" in exc_msg.lower()
+            or "unauthorized" in exc_type.lower()
         ):
-            raise AuthenticationError("Authentication failed: invalid or unauthorized Gemini API key.") from None
+            raise AuthenticationError(
+                f"Authentication failed: invalid or unauthorized Gemini API key ({clean_detail})."
+            ) from exc
 
         # 2. Rate limit / Quota exceeded (429, RESOURCE_EXHAUSTED)
         if (
             status_code == 429
             or "RESOURCE_EXHAUSTED" in exc_msg
-            or "429" in exc_msg
             or "rate limit" in exc_msg.lower()
             or "quota" in exc_msg.lower()
+            or "ratelimit" in exc_type.lower()
         ):
-            raise RateLimitError("Gemini API rate limit or quota exceeded.") from None
+            raise RateLimitError(
+                f"Gemini API rate limit or quota exceeded ({clean_detail})."
+            ) from exc
 
-        # 3. Timeout (408, 504, DEADLINE_EXCEEDED)
+        # 3. Model Not Found / Configuration (404, NOT_FOUND)
+        if status_code == 404 or "NOT_FOUND" in exc_msg:
+            raise ConfigurationError(
+                f"Gemini model '{self.model}' not found or unavailable ({clean_detail})."
+            ) from exc
+
+        # 4. HTTP 5xx Server Error (500, 502, 503; 504 handled as timeout)
+        if status_code is not None and 500 <= status_code < 600 and status_code != 504:
+            raise ProviderError(
+                f"Gemini API server error (HTTP {status_code}): {clean_detail}"
+            ) from exc
+
+        # 5. Connect Timeout (httpx/httpx2/httpcore ConnectTimeout)
+        if "connecttimeout" in exc_type.lower() or "connection timed out" in exc_msg.lower():
+            raise TimeoutError(
+                f"Gemini API connection timed out ({exc_type}): {clean_detail}"
+            ) from exc
+
+        # 6. Read Timeout (httpx/httpx2/httpcore ReadTimeout)
+        if "readtimeout" in exc_type.lower() or "read timed out" in exc_msg.lower():
+            raise TimeoutError(
+                f"Gemini API read timed out ({exc_type}): {clean_detail}"
+            ) from exc
+
+        # 7. General Timeout (WriteTimeout, PoolTimeout, TimeoutException, 408, 504, DEADLINE_EXCEEDED, etc.)
         if (
             status_code in (408, 504)
             or "DEADLINE_EXCEEDED" in exc_msg
+            or "timeout" in exc_type.lower()
             or "timed out" in exc_msg.lower()
             or "timeout" in exc_msg.lower()
         ):
-            raise TimeoutError("Gemini API request timed out.") from None
+            raise TimeoutError(
+                f"Gemini API request timed out ({exc_type}): {clean_detail}"
+            ) from exc
 
-        # 4. Connection failure
+        # 8. TLS / SSL Error
         if (
-            "connection" in exc_msg.lower()
-            or "unavailable" in exc_msg.lower()
-            or "connect" in exc_msg.lower()
-            or "httpx" in exc_type.lower()
+            "ssl" in exc_type.lower()
+            or "certificate" in exc_type.lower()
+            or "cert" in exc_msg.lower()
+            or "ssl" in exc_msg.lower()
+            or "tls" in exc_msg.lower()
         ):
-            raise ConnectionError("Failed to connect to Gemini API endpoint.") from None
+            raise ConnectionError(
+                f"Gemini API TLS/SSL error ({exc_type}): {clean_detail}"
+            ) from exc
 
-        # 5. Configuration / Model not found (404, NOT_FOUND)
-        if status_code == 404 or "NOT_FOUND" in exc_msg:
-            raise ConfigurationError(f"Gemini model '{self.model}' not found or unavailable.") from None
+        # 9. Connection Failure (ConnectError, ConnectionRefused, ConnectionReset, NetworkError)
+        if (
+            "connect" in exc_type.lower()
+            or "connection" in exc_type.lower()
+            or "networkerror" in exc_type.lower()
+            or "connect" in exc_msg.lower()
+            or "unavailable" in exc_msg.lower()
+        ):
+            raise ConnectionError(
+                f"Failed to connect to Gemini API endpoint ({exc_type}): {clean_detail}"
+            ) from exc
 
-        # 6. Safety block
+        # 10. Safety block
         if "safety" in exc_msg.lower() or "blocked" in exc_msg.lower():
-            raise ProviderError(f"Gemini request blocked by safety policy: {clean_detail}") from None
+            raise ProviderError(
+                f"Gemini request blocked by safety policy: {clean_detail}"
+            ) from exc
 
-        raise ProviderError(f"Gemini API provider error ({exc_type}): {clean_detail}") from None
+        # 11. Generic fallback
+        raise ProviderError(
+            f"Gemini API provider error ({exc_type}): {clean_detail}"
+        ) from exc
 
     def _parse_response(self, response: Any, latency_ms: float) -> LLMCompletionResult:
         """Extract standardized LLMCompletionResult from Gemini GenerateContentResponse object."""
@@ -1170,10 +1270,13 @@ class GeminiProvider:
                 derived_total_tokens=derived_total,
             )
 
-        model_id = getattr(response, "model_version", None) or self.model
+        model_version = getattr(response, "model_version", None)
+        model_id = str(model_version).strip() if model_version else None
         req_id = getattr(response, "response_id", None)
 
         raw_meta: Dict[str, Any] = {}
+        if model_id:
+            raw_meta["model_version"] = model_id
         if req_id:
             raw_meta["response_id"] = req_id
         if hasattr(response, "create_time") and response.create_time:

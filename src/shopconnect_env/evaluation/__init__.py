@@ -11,11 +11,14 @@ Exports:
 """
 
 from shopconnect_env.evaluation.gemini_pilot import (
+    CONNECTION_TEST_PROMPT,
+    EXPECTED_CONNECTION_TEST_TOKEN,
     GeminiPilotRequestGuardrailProvider,
     MAX_REQUESTS_PER_CONDITION_C,
     MAX_THEORETICAL_TOTAL_REQUESTS,
     SequentialRateLimiter,
     create_gemini_pilot_mock_provider,
+    run_gemini_connection_test,
     run_gemini_pilot_dry_run,
     run_gemini_pilot_preflight,
     run_live_gemini_pilot,
@@ -65,7 +68,9 @@ from shopconnect_env.evaluation.tasks import (
 __all__ = [
     "AggregateMetrics",
     "BenchmarkTask",
+    "CONNECTION_TEST_PROMPT",
     "DEFAULT_OUTPUT_TOKEN_CEILING",
+    "EXPECTED_CONNECTION_TEST_TOKEN",
     "ExpectedOutcome",
     "ExperimentRunner",
     "FixtureValidationError",
@@ -97,6 +102,7 @@ __all__ = [
     "create_pilot_mock_provider",
     "load_benchmark_tasks",
     "load_plan_fixtures",
+    "run_gemini_connection_test",
     "run_gemini_pilot_dry_run",
     "run_gemini_pilot_preflight",
     "run_live_gemini_pilot",

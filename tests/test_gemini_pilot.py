@@ -33,7 +33,10 @@ from shopconnect_env.agents.providers import (
 )
 from shopconnect_env.evaluation.gemini_pilot import (
     CONFIGURED_SAFE_TARGET_RPM,
+    CONNECTION_TEST_OUTPUT_TOKEN_CEILING,
+    CONNECTION_TEST_PROMPT,
     DEFAULT_OUTPUT_TOKEN_CEILING,
+    EXPECTED_CONNECTION_TEST_TOKEN,
     MAX_INSPECTIONS_PER_CONDITION_C,
     MAX_PILOT_RUNS,
     MAX_REQUESTS_PER_CONDITION_A,
@@ -54,6 +57,7 @@ from shopconnect_env.evaluation.gemini_pilot import (
     create_gemini_pilot_mock_provider,
     main,
     parse_args,
+    run_gemini_connection_test,
     run_gemini_pilot_dry_run,
     run_gemini_pilot_preflight,
     run_live_gemini_pilot,
@@ -774,3 +778,507 @@ def test_gemini_pilot_run_failure_records_incomplete_status(tmp_path):
     assert "INCOMPLETE PILOT EXECUTION NOTICE" in analysis_text
     assert "incomplete_run_failed" in analysis_text
     assert "**NOT** be reported as a completed nine-run pilot" in analysis_text
+
+
+# =============================================================================
+# 10. STANDALONE ONE-REQUEST CONNECTION TEST
+# =============================================================================
+
+def test_gemini_connection_test_dual_confirmation_gate(capsys):
+    """Connection test strictly requires BOTH connection_test=True and confirm_connection_test=True."""
+    # 1. Neither flag passed
+    with pytest.raises(ValueError) as exc1:
+        run_gemini_connection_test(connection_test=False, confirm_connection_test=False)
+    assert "SAFETY VIOLATION" in str(exc1.value)
+
+    # 2. Only connection_test=True
+    with pytest.raises(ValueError) as exc2:
+        run_gemini_connection_test(connection_test=True, confirm_connection_test=False)
+    assert "SAFETY VIOLATION" in str(exc2.value)
+
+    # 3. Only confirm_connection_test=True
+    with pytest.raises(ValueError) as exc3:
+        run_gemini_connection_test(connection_test=False, confirm_connection_test=True)
+    assert "SAFETY VIOLATION" in str(exc3.value)
+
+    # 4. CLI with only --connection-test
+    exit_code1 = main(["--connection-test"])
+    assert exit_code1 == 1
+    err1 = capsys.readouterr().err
+    assert "ERROR: Connection test requires dual confirmation" in err1
+
+    # 5. CLI with only --confirm-connection-test
+    exit_code2 = main(["--confirm-connection-test"])
+    assert exit_code2 == 1
+    err2 = capsys.readouterr().err
+    assert "ERROR: Connection test requires dual confirmation" in err2
+
+
+def test_gemini_connection_test_missing_api_key(tmp_path, monkeypatch):
+    """When GEMINI_API_KEY is not configured and no client injected, cleanly fails without network."""
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+
+    out_dir = tmp_path / "connection_test_missing_key"
+    res = run_gemini_connection_test(
+        connection_test=True,
+        confirm_connection_test=True,
+        api_key=None,
+        client=None,
+        output_dir=out_dir,
+    )
+
+    assert res["status"] == "failed"
+    assert res["success"] is False
+    assert res["error_type"] == "MissingAPIKeyError"
+    assert "GEMINI_API_KEY environment variable is not configured" in res["error"]
+    assert res["requests_made"] == 0
+    assert res["max_requests_allowed"] == 1
+    assert res["model_requested"] == "gemini-3.8-flash"
+    assert res["billing_tier"] == "unknown"
+
+    # Artifact file must exist and contain the JSON
+    artifact_path = Path(res["artifact_file"])
+    assert artifact_path.exists()
+    loaded = json.loads(artifact_path.read_text(encoding="utf-8"))
+    assert loaded["status"] == "failed"
+    assert loaded["error_type"] == "MissingAPIKeyError"
+
+
+def test_gemini_connection_test_successful_run(tmp_path):
+    """Test successful connection test with injected client, verifying usage, latency, and tokens."""
+    out_dir = tmp_path / "connection_test_success"
+
+    mock_resp = SimpleNamespace(
+        candidates=[
+            SimpleNamespace(
+                finish_reason="STOP",
+                content=SimpleNamespace(
+                    role="model",
+                    parts=[SimpleNamespace(text="SHOPCONNECT_GEMINI_CONNECTION_OK", thought=False, function_call=None)],
+                ),
+            )
+        ],
+        text="SHOPCONNECT_GEMINI_CONNECTION_OK",
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=12,
+            candidates_token_count=6,
+            total_token_count=18,
+            cached_content_token_count=0,
+            thoughts_token_count=2,
+        ),
+        model_version="gemini-3.8-flash",
+        response_id="conn_test_resp_123",
+    )
+
+    fake_client = MagicMock()
+    fake_client.models.generate_content.return_value = mock_resp
+
+    res = run_gemini_connection_test(
+        connection_test=True,
+        confirm_connection_test=True,
+        client=fake_client,
+        billing_tier="free_tier",
+        output_dir=out_dir,
+    )
+
+    assert res["status"] == "passed"
+    assert res["success"] is True
+    assert res["error"] is None
+    assert res["error_type"] is None
+    assert res["model_requested"] == "gemini-3.8-flash"
+    assert res["actual_model_identifier"] == "gemini-3.8-flash"
+    assert res["provider_request_id"] == "conn_test_resp_123"
+    assert res["system_fingerprint"] is None
+    assert res["prompt_sent"] == CONNECTION_TEST_PROMPT
+    assert res["response_text"] == "SHOPCONNECT_GEMINI_CONNECTION_OK"
+    assert res["requests_made"] == 1
+    assert res["max_requests_allowed"] == 1
+    assert res["latency_ms"] >= 0.0
+
+    # Token usage verification
+    assert res["token_usage"]["input_tokens"] == 12
+    assert res["token_usage"]["output_tokens"] == 6
+    assert res["token_usage"]["total_tokens"] == 18
+    assert res["token_usage"]["derived_total_tokens"] == 18
+    assert res["token_usage"]["cached_input_tokens"] == 0
+    assert res["token_usage"]["reasoning_tokens"] == 2
+    assert res["token_usage"]["is_provider_reported"] is True
+    assert res["usage_provenance"] == "provider_reported"
+    assert res["billing_tier"] == "free_tier"
+
+    # Verify provider call kwargs
+    assert fake_client.models.generate_content.call_count == 1
+    call_kwargs = fake_client.models.generate_content.call_args.kwargs
+    assert call_kwargs["model"] == "gemini-3.8-flash"
+    config = call_kwargs["config"]
+    assert config.max_output_tokens == CONNECTION_TEST_OUTPUT_TOKEN_CEILING
+    assert config.max_output_tokens == 64
+    thinking_level_val = str(getattr(config.thinking_config.thinking_level, "value", config.thinking_config.thinking_level)).lower()
+    assert thinking_level_val == "low"
+
+    # Verify artifact on disk
+    artifact_path = Path(res["artifact_file"])
+    assert artifact_path.exists()
+    loaded = json.loads(artifact_path.read_text(encoding="utf-8"))
+    assert loaded["status"] == "passed"
+    assert loaded["success"] is True
+    assert loaded["response_text"] == "SHOPCONNECT_GEMINI_CONNECTION_OK"
+
+
+def test_gemini_connection_test_response_validation_failure(tmp_path):
+    """If the model returns unexpected text without the confirmation token, status is failed."""
+    out_dir = tmp_path / "connection_test_val_fail"
+
+    mock_resp = SimpleNamespace(
+        candidates=[
+            SimpleNamespace(
+                finish_reason="STOP",
+                content=SimpleNamespace(
+                    role="model",
+                    parts=[SimpleNamespace(text="Hello! How can I help you today?", thought=False, function_call=None)],
+                ),
+            )
+        ],
+        text="Hello! How can I help you today?",
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=12,
+            candidates_token_count=8,
+            total_token_count=20,
+            cached_content_token_count=None,
+            thoughts_token_count=None,
+        ),
+        model_version="gemini-3.8-flash",
+        response_id="conn_test_resp_fail",
+    )
+
+    fake_client = MagicMock()
+    fake_client.models.generate_content.return_value = mock_resp
+
+    res = run_gemini_connection_test(
+        connection_test=True,
+        confirm_connection_test=True,
+        client=fake_client,
+        output_dir=out_dir,
+    )
+
+    assert res["status"] == "failed"
+    assert res["success"] is False
+    assert res["error_type"] == "ResponseValidationError"
+    assert EXPECTED_CONNECTION_TEST_TOKEN in res["error"]
+    assert "not found in response text" in res["error"]
+    assert res["requests_made"] == 1
+    assert res["max_requests_allowed"] == 1
+
+    # Verify artifact written
+    loaded = json.loads(Path(res["artifact_file"]).read_text(encoding="utf-8"))
+    assert loaded["status"] == "failed"
+    assert loaded["error_type"] == "ResponseValidationError"
+
+
+def test_gemini_connection_test_api_error_handling(tmp_path):
+    """Test 401 auth error and 429 quota error handling without retrying."""
+    out_dir = tmp_path / "connection_test_errors"
+
+    # 1. 401 Unauthorized
+    fake_client_401 = MagicMock()
+    fake_client_401.models.generate_content.side_effect = RuntimeError("401 Unauthorized: Invalid API key")
+
+    res_401 = run_gemini_connection_test(
+        connection_test=True,
+        confirm_connection_test=True,
+        client=fake_client_401,
+        output_dir=out_dir,
+    )
+    assert res_401["status"] == "failed"
+    assert res_401["success"] is False
+    assert res_401["error_type"] == "AuthenticationError"
+    assert "Authentication failed" in res_401["error"]
+    assert fake_client_401.models.generate_content.call_count == 1
+
+    # 2. 429 Quota Exceeded
+    fake_client_429 = MagicMock()
+    fake_client_429.models.generate_content.side_effect = RuntimeError("ResourceExhausted 429: Quota exceeded")
+
+    res_429 = run_gemini_connection_test(
+        connection_test=True,
+        confirm_connection_test=True,
+        client=fake_client_429,
+        output_dir=out_dir,
+    )
+    assert res_429["status"] == "failed"
+    assert res_429["success"] is False
+    assert res_429["error_type"] == "RateLimitError"
+    assert "rate limit or quota exceeded" in res_429["error"]
+    assert fake_client_429.models.generate_content.call_count == 1
+
+    # 3. ConnectTimeout -> TimeoutError (not generic ConnectionError)
+    import httpx
+    fake_client_conn_to = MagicMock()
+    fake_client_conn_to.models.generate_content.side_effect = httpx.ConnectTimeout("Connection timed out after 30.0s")
+
+    res_conn_to = run_gemini_connection_test(
+        connection_test=True,
+        confirm_connection_test=True,
+        client=fake_client_conn_to,
+        output_dir=out_dir,
+    )
+    assert res_conn_to["status"] == "failed"
+    assert res_conn_to["success"] is False
+    assert res_conn_to["error_type"] == "TimeoutError"
+    assert "connection timed out" in res_conn_to["error"]
+
+    # 4. ReadTimeout -> TimeoutError
+    fake_client_read_to = MagicMock()
+    fake_client_read_to.models.generate_content.side_effect = httpx.ReadTimeout("Read timed out after 30.0s")
+
+    res_read_to = run_gemini_connection_test(
+        connection_test=True,
+        confirm_connection_test=True,
+        client=fake_client_read_to,
+        output_dir=out_dir,
+    )
+    assert res_read_to["status"] == "failed"
+    assert res_read_to["success"] is False
+    assert res_read_to["error_type"] == "TimeoutError"
+    assert "read timed out" in res_read_to["error"]
+
+
+def test_gemini_connection_test_secret_redaction(tmp_path):
+    """API key must never appear in error messages or the saved artifact file."""
+    out_dir = tmp_path / "connection_test_redaction"
+    secret_key = "AIzaSySecretTestingCredentialKey999"
+
+    fake_client = MagicMock()
+    fake_client.models.generate_content.side_effect = RuntimeError(
+        f"Authentication failure with key: {secret_key}"
+    )
+
+    res = run_gemini_connection_test(
+        connection_test=True,
+        confirm_connection_test=True,
+        api_key=secret_key,
+        client=fake_client,
+        output_dir=out_dir,
+    )
+
+    assert res["status"] == "failed"
+    assert secret_key not in res["error"]
+    assert "[REDACTED_API_KEY]" in res["error"]
+
+    raw_file_content = Path(res["artifact_file"]).read_text(encoding="utf-8")
+    assert secret_key not in raw_file_content
+    assert "[REDACTED_API_KEY]" in raw_file_content
+
+
+def test_gemini_connection_test_cli_execution_passed(monkeypatch, tmp_path, capsys):
+    """CLI with --connection-test --confirm-connection-test returns 0 on success."""
+    out_dir = tmp_path / "cli_conn_test_success"
+    mock_resp = SimpleNamespace(
+        candidates=[
+            SimpleNamespace(
+                finish_reason="STOP",
+                content=SimpleNamespace(
+                    role="model",
+                    parts=[SimpleNamespace(text="SHOPCONNECT_GEMINI_CONNECTION_OK", thought=False, function_call=None)],
+                ),
+            )
+        ],
+        text="SHOPCONNECT_GEMINI_CONNECTION_OK",
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=10,
+            candidates_token_count=5,
+            total_token_count=15,
+            cached_content_token_count=None,
+            thoughts_token_count=None,
+        ),
+        model_version="gemini-3.8-flash",
+        response_id="cli_resp_ok",
+        system_fingerprint=None,
+    )
+
+    fake_client = MagicMock()
+    fake_client.models.generate_content.return_value = mock_resp
+
+    monkeypatch.setattr(GeminiProvider, "_get_client", lambda self: fake_client)
+    monkeypatch.setenv("GEMINI_API_KEY", "dummy_env_key")
+
+    exit_code = main([
+        "--connection-test",
+        "--confirm-connection-test",
+        "--output-dir",
+        str(out_dir),
+    ])
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "SUCCESS: Gemini connection test passed" in captured.out
+    assert "Executing standalone one-request Gemini connectivity test" in captured.out
+
+
+def test_gemini_connection_test_cli_execution_failed(monkeypatch, tmp_path, capsys):
+    """CLI with --connection-test --confirm-connection-test returns 2 on failure."""
+    out_dir = tmp_path / "cli_conn_test_fail"
+    fake_client = MagicMock()
+    fake_client.models.generate_content.side_effect = RuntimeError("Connection refused")
+
+    monkeypatch.setattr(GeminiProvider, "_get_client", lambda self: fake_client)
+    monkeypatch.setenv("GEMINI_API_KEY", "dummy_env_key")
+
+    exit_code = main([
+        "--connection-test",
+        "--confirm-connection-test",
+        "--output-dir",
+        str(out_dir),
+    ])
+
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert "FAILED: Gemini connection test failed" in captured.err
+
+
+def test_gemini_connection_test_does_not_mutate_benchmarks_or_trigger_pilot(tmp_path):
+    """Connection test never loads or alters frozen fixtures/tasks, and does not invoke full pilot."""
+    data_dir = Path("data")
+    fixtures_file = data_dir / "plan_fixtures.json"
+    tasks_file = data_dir / "tasks.jsonl"
+    catalog_file = data_dir / "catalog_seed.json"
+
+    # Compute baseline mtimes and contents
+    fixtures_before = fixtures_file.read_bytes()
+    tasks_before = tasks_file.read_bytes()
+    catalog_before = catalog_file.read_bytes()
+
+    out_dir = tmp_path / "conn_test_isolation"
+    mock_resp = SimpleNamespace(
+        candidates=[
+            SimpleNamespace(
+                finish_reason="STOP",
+                content=SimpleNamespace(
+                    role="model",
+                    parts=[SimpleNamespace(text="SHOPCONNECT_GEMINI_CONNECTION_OK", thought=False, function_call=None)],
+                ),
+            )
+        ],
+        text="SHOPCONNECT_GEMINI_CONNECTION_OK",
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=10,
+            candidates_token_count=5,
+            total_token_count=15,
+            cached_content_token_count=None,
+            thoughts_token_count=None,
+        ),
+        model_version="gemini-3.8-flash",
+        response_id="iso_resp",
+    )
+    fake_client = MagicMock()
+    fake_client.models.generate_content.return_value = mock_resp
+
+    res = run_gemini_connection_test(
+        connection_test=True,
+        confirm_connection_test=True,
+        client=fake_client,
+        output_dir=out_dir,
+    )
+    assert res["status"] == "passed"
+
+    # Verify frozen benchmark files are completely untouched
+    assert fixtures_file.read_bytes() == fixtures_before
+    assert tasks_file.read_bytes() == tasks_before
+    assert catalog_file.read_bytes() == catalog_before
+
+
+def test_gemini_connection_test_socket_blocked(tmp_path, monkeypatch):
+    """Guarantees connection test tests do not touch the network."""
+    def guarded_socket(*args, **kwargs):
+        raise RuntimeError("NETWORK CALL ATTEMPTED!")
+
+    monkeypatch.setattr(socket, "socket", guarded_socket)
+
+    mock_resp = SimpleNamespace(
+        candidates=[
+            SimpleNamespace(
+                finish_reason="STOP",
+                content=SimpleNamespace(
+                    role="model",
+                    parts=[SimpleNamespace(text="SHOPCONNECT_GEMINI_CONNECTION_OK", thought=False, function_call=None)],
+                ),
+            )
+        ],
+        text="SHOPCONNECT_GEMINI_CONNECTION_OK",
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=10,
+            candidates_token_count=5,
+            total_token_count=15,
+            cached_content_token_count=None,
+            thoughts_token_count=None,
+        ),
+        model_version="gemini-3.8-flash",
+        response_id="socket_resp",
+    )
+    fake_client = MagicMock()
+    fake_client.models.generate_content.return_value = mock_resp
+
+    res = run_gemini_connection_test(
+        connection_test=True,
+        confirm_connection_test=True,
+        client=fake_client,
+        output_dir=tmp_path / "conn_test_socket",
+    )
+    assert res["status"] == "passed"
+
+
+def test_gemini_connection_test_missing_actual_model_metadata(tmp_path):
+    """When Google response omits model_version, actual_model_identifier must be None.
+
+    Verifies:
+    1. model_requested remains 'gemini-3.8-flash'.
+    2. actual_model_identifier is strictly None (not substituted with requested model).
+    3. The saved artifact JSON accurately reflects actual_model_identifier: null.
+    """
+    out_dir = tmp_path / "conn_test_missing_model_id"
+
+    # Response has no model_version attribute / model_version=None
+    mock_resp = SimpleNamespace(
+        candidates=[
+            SimpleNamespace(
+                finish_reason="STOP",
+                content=SimpleNamespace(
+                    role="model",
+                    parts=[SimpleNamespace(text="SHOPCONNECT_GEMINI_CONNECTION_OK", thought=False, function_call=None)],
+                ),
+            )
+        ],
+        text="SHOPCONNECT_GEMINI_CONNECTION_OK",
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=12,
+            candidates_token_count=6,
+            total_token_count=18,
+            cached_content_token_count=0,
+            thoughts_token_count=2,
+        ),
+        model_version=None,
+        response_id="conn_test_resp_no_model",
+    )
+
+    fake_client = MagicMock()
+    fake_client.models.generate_content.return_value = mock_resp
+
+    res = run_gemini_connection_test(
+        connection_test=True,
+        confirm_connection_test=True,
+        client=fake_client,
+        output_dir=out_dir,
+    )
+
+    assert res["status"] == "passed"
+    assert res["success"] is True
+    assert res["model_requested"] == "gemini-3.8-flash"
+    assert res["actual_model_identifier"] is None
+    assert res["model_requested"] != res["actual_model_identifier"]
+
+    # Verify JSON file on disk
+    artifact_path = Path(res["artifact_file"])
+    assert artifact_path.exists()
+    loaded = json.loads(artifact_path.read_text(encoding="utf-8"))
+    assert loaded["model_requested"] == "gemini-3.8-flash"
+    assert loaded["actual_model_identifier"] is None

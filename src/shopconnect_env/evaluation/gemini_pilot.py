@@ -99,6 +99,12 @@ DEFAULT_OUTPUT_TOKEN_CEILING: int = 2048
 PILOT_MODEL: str = "gemini-3.8-flash"
 PILOT_TAG: str = "REAL_API_PILOT (GEMINI) — LIMITED_SAMPLE — NOT_FULL_EXPERIMENT"
 
+# Standalone One-Request Connection Test Specifications
+CONNECTION_TEST_PROMPT: str = "Reply with exactly: SHOPCONNECT_GEMINI_CONNECTION_OK"
+EXPECTED_CONNECTION_TEST_TOKEN: str = "SHOPCONNECT_GEMINI_CONNECTION_OK"
+CONNECTION_TEST_OUTPUT_TOKEN_CEILING: int = 64
+DEFAULT_CONNECTION_TEST_ARTIFACT_DIR: str = "artifacts/phase6_5_gemini_connection_test"
+
 # Google AI Studio Free-Tier Quotas & Safe Rate Limiting Target
 QUOTA_RPM_LIMIT: int = 5
 QUOTA_TPM_LIMIT: int = 250_000
@@ -900,6 +906,178 @@ def run_live_gemini_pilot(
     }
 
 
+# =============================================================================
+# 6. STANDALONE ONE-REQUEST CONNECTION TEST (DUAL CONFIRMATION REQUIRED)
+# =============================================================================
+
+def run_gemini_connection_test(
+    connection_test: bool = False,
+    confirm_connection_test: bool = False,
+    api_key: Optional[str] = None,
+    billing_tier: str = "unknown",
+    output_dir: Optional[Union[str, Path]] = None,
+    client: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Execute a standalone, single-request live connectivity test against Gemini 3.8 Flash.
+
+    Strict Invariants:
+    1. Requires BOTH connection_test=True AND confirm_connection_test=True.
+       Without dual confirmation, raises ValueError without making any network calls.
+    2. Sends exactly one prompt: 'Reply with exactly: SHOPCONNECT_GEMINI_CONNECTION_OK'.
+    3. Model: gemini-3.8-flash, thinking_level='low', max_output_tokens=64, max_retries=0.
+    4. Exactly one provider request maximum (enforced by request guardrail).
+    5. Validates response text contains 'SHOPCONNECT_GEMINI_CONNECTION_OK'.
+    6. Saves structured result JSON under artifacts/phase6_5_gemini_connection_test/.
+    7. Never logs, prints, or serializes the API key.
+    8. Any failure (auth, quota, network, unexpected response) records cleanly without retry.
+    """
+    if not (connection_test and confirm_connection_test):
+        raise ValueError(
+            "SAFETY VIOLATION: Gemini connection test requires BOTH connection_test=True and "
+            "confirm_connection_test=True. Without explicit dual confirmation, network requests "
+            "are strictly prohibited."
+        )
+
+    ts_utc = datetime.now(timezone.utc).isoformat()
+    ts_file = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    target_dir = Path(output_dir) if output_dir else Path(DEFAULT_CONNECTION_TEST_ARTIFACT_DIR)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    result_path = target_dir / f"connection_test_{ts_file}.json"
+
+    resolved_key = api_key or os.environ.get("GEMINI_API_KEY")
+    key_configured = bool(resolved_key) or (client is not None)
+
+    if not key_configured:
+        payload = {
+            "status": "failed",
+            "success": False,
+            "error": "GEMINI_API_KEY environment variable is not configured.",
+            "error_type": "MissingAPIKeyError",
+            "model_requested": PILOT_MODEL,
+            "actual_model_identifier": None,
+            "provider_request_id": None,
+            "system_fingerprint": None,
+            "latency_ms": 0.0,
+            "timestamp_utc": ts_utc,
+            "prompt_sent": CONNECTION_TEST_PROMPT,
+            "response_text": None,
+            "token_usage": None,
+            "usage_provenance": None,
+            "billing_tier": billing_tier,
+            "billing_tier_note": "User-provided reporting assumption, NOT an account-billing verification.",
+            "artifact_file": str(result_path),
+            "requests_made": 0,
+            "max_requests_allowed": 1,
+        }
+        result_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return payload
+
+    base_provider = GeminiProvider(
+        api_key=api_key,
+        model=PILOT_MODEL,
+        thinking_level="low",
+        timeout_seconds=30.0,
+        client=client,
+        max_output_tokens=CONNECTION_TEST_OUTPUT_TOKEN_CEILING,
+        max_retries=0,
+    )
+    guardrail = GeminiPilotRequestGuardrailProvider(
+        provider=base_provider,
+        max_requests=1,
+    )
+
+    t_start = time.perf_counter()
+    try:
+        completion: LLMCompletionResult = guardrail.complete(
+            messages=[LLMMessage(role="user", content=CONNECTION_TEST_PROMPT)],
+            tools=None,
+            tool_choice=None,
+        )
+        latency_ms = round((time.perf_counter() - t_start) * 1000.0, 2)
+        response_text = (completion.message.content or "").strip()
+
+        contains_expected_token = EXPECTED_CONNECTION_TEST_TOKEN in response_text
+        if contains_expected_token:
+            status = "passed"
+            success = True
+            error = None
+            error_type = None
+        else:
+            status = "failed"
+            success = False
+            error = (
+                f"Response validation failed: expected confirmation token '{EXPECTED_CONNECTION_TEST_TOKEN}' "
+                f"was not found in response text: {response_text[:200]!r}"
+            )
+            error_type = "ResponseValidationError"
+
+        usage = completion.usage
+        token_usage_dict = {
+            "input_tokens": usage.input_tokens if usage else None,
+            "output_tokens": usage.output_tokens if usage else None,
+            "total_tokens": usage.total_tokens if usage else None,
+            "derived_total_tokens": usage.derived_total_tokens if usage else None,
+            "cached_input_tokens": usage.cached_input_tokens if usage else None,
+            "reasoning_tokens": usage.reasoning_tokens if usage else None,
+            "is_provider_reported": usage.is_provider_reported if usage else False,
+        }
+        provenance = "provider_reported" if (usage and usage.is_provider_reported) else "simulated"
+
+        payload = {
+            "status": status,
+            "success": success,
+            "model_requested": PILOT_MODEL,
+            "actual_model_identifier": completion.model_identifier,
+            "provider_request_id": completion.provider_request_id,
+            "system_fingerprint": completion.system_fingerprint,
+            "latency_ms": latency_ms,
+            "timestamp_utc": ts_utc,
+            "prompt_sent": CONNECTION_TEST_PROMPT,
+            "response_text": response_text,
+            "token_usage": token_usage_dict,
+            "usage_provenance": provenance,
+            "billing_tier": billing_tier,
+            "billing_tier_note": "User-provided reporting assumption, NOT an account-billing verification.",
+            "artifact_file": str(result_path),
+            "requests_made": guardrail.total_requests,
+            "max_requests_allowed": 1,
+            "error": error,
+            "error_type": error_type,
+        }
+
+    except Exception as exc:
+        latency_ms = round((time.perf_counter() - t_start) * 1000.0, 2)
+        exc_type_name = type(exc).__name__
+        exc_msg = str(exc)
+        if resolved_key:
+            exc_msg = exc_msg.replace(resolved_key, "[REDACTED_API_KEY]")
+
+        payload = {
+            "status": "failed",
+            "success": False,
+            "error": exc_msg,
+            "error_type": exc_type_name,
+            "model_requested": PILOT_MODEL,
+            "actual_model_identifier": None,
+            "provider_request_id": None,
+            "system_fingerprint": None,
+            "latency_ms": latency_ms,
+            "timestamp_utc": ts_utc,
+            "prompt_sent": CONNECTION_TEST_PROMPT,
+            "response_text": None,
+            "token_usage": None,
+            "usage_provenance": None,
+            "billing_tier": billing_tier,
+            "billing_tier_note": "User-provided reporting assumption, NOT an account-billing verification.",
+            "artifact_file": str(result_path),
+            "requests_made": guardrail.total_requests,
+            "max_requests_allowed": 1,
+        }
+
+    result_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return payload
+
+
 def _patch_gemini_pilot_analysis_markdown(
     analysis_path: Path,
     run_id: str,
@@ -991,6 +1169,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         description="ShopConnect Stage 6 Phase 6.5 Controlled Gemini Pilot Runner",
     )
     parser.add_argument(
+        "--connection-test",
+        action="store_true",
+        help="Execute a standalone one-request live Gemini connection test. Requires --confirm-connection-test.",
+    )
+    parser.add_argument(
+        "--confirm-connection-test",
+        action="store_true",
+        help="Explicit confirmation flag required alongside --connection-test to authorize one live API request.",
+    )
+    parser.add_argument(
         "--preflight",
         action="store_true",
         help="Run offline preflight validation of environment, files, and pricing (0 network calls).",
@@ -1047,9 +1235,38 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     """Main CLI entrypoint enforcing safety confirmation."""
     args = parse_args(argv)
 
-    # 1. Dual-confirmation safety gate
-    if args.live:
-        if not args.confirm_live:
+    # 1. Connection-test dual confirmation safety gate
+    if args.connection_test or args.confirm_connection_test:
+        if not (args.connection_test and args.confirm_connection_test):
+            print(
+                "ERROR: Connection test requires dual confirmation.\n"
+                "Please specify BOTH --connection-test and --confirm-connection-test to authorize the single live API connection test.\n"
+                "Execution aborted safely.",
+                file=sys.stderr,
+            )
+            return 1
+
+        print("Executing standalone one-request Gemini connectivity test on gemini-3.8-flash...")
+        res = run_gemini_connection_test(
+            connection_test=True,
+            confirm_connection_test=True,
+            billing_tier=args.billing_tier,
+            output_dir=args.output_dir,
+        )
+        print(json.dumps(res, indent=2))
+        if res["status"] == "passed":
+            print(f"SUCCESS: Gemini connection test passed. Result saved to: {res['artifact_file']}")
+            return 0
+        else:
+            print(
+                f"FAILED: Gemini connection test failed ({res.get('error')}). Result saved to: {res['artifact_file']}",
+                file=sys.stderr,
+            )
+            return 2
+
+    # 2. Dual-confirmation safety gate for full pilot
+    if args.live or args.confirm_live:
+        if not (args.live and args.confirm_live):
             print(
                 "ERROR: Live execution requires dual confirmation.\n"
                 "Please specify BOTH --live and --confirm-live to authorize live API calls.\n"
@@ -1082,7 +1299,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"Live Gemini pilot failed: {e}", file=sys.stderr)
             return 2
 
-    # 2. Simulated dry-run
+    # 3. Simulated dry-run
     if args.dry_run:
         print("Executing simulated dry-run Gemini pilot (0 network calls)...")
         res = run_gemini_pilot_dry_run(
@@ -1102,7 +1319,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"Dry run completed successfully. Artifacts: {res['output_directory']}")
         return 0
 
-    # 3. Default or explicit preflight
+    # 4. Default or explicit preflight
     print("Executing Gemini pilot preflight validation (0 network calls)...")
     res = run_gemini_pilot_preflight(
         catalog_path=args.catalog,
