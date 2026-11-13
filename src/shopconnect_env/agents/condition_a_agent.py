@@ -400,6 +400,7 @@ class ConditionAAgent(BaseAgent):
                         **base_meta,
                         "status": "envelope_validation_error",
                         "error": str(val_err),
+                        "protocol_error": True,
                     },
                 )
 
@@ -487,6 +488,7 @@ class ConditionAAgent(BaseAgent):
                 metadata={
                     **base_meta,
                     "status": "json_parse_error",
+                    "protocol_error": True,
                 },
             )
 
@@ -501,6 +503,7 @@ class ConditionAAgent(BaseAgent):
                     **base_meta,
                     "status": "slot_validation_error",
                     "error": validation_err,
+                    "protocol_error": True,
                 },
             )
 

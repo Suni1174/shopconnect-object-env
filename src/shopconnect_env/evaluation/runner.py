@@ -424,7 +424,13 @@ class OutcomeEvaluator:
         status_meta = str(response.metadata.get("status", ""))
         is_protocol_error = bool(
             response.metadata.get("protocol_error")
-            or status_meta in ("unsupported_multiple_tool_calls", "max_requests_exceeded")
+            or status_meta in (
+                "unsupported_multiple_tool_calls",
+                "max_requests_exceeded",
+                "envelope_validation_error",
+                "json_parse_error",
+                "slot_validation_error",
+            )
         )
         if is_protocol_error and not response.has_proposal and not response.is_clarification and not response.metadata.get("agent_initiated_rejection"):
             return {
@@ -1169,6 +1175,7 @@ class ExperimentRunner:
             "non_target_recipe_overwrites",
             "policy_violations_count",
             "input_tokens",
+            "cached_input_tokens",
             "output_tokens",
             "total_tokens",
             "model_requests",
@@ -1206,6 +1213,7 @@ class ExperimentRunner:
                     "non_target_recipe_overwrites": m.get("non_target_recipe_overwrites", 0),
                     "policy_violations_count": m.get("committed_constraint_violations", 0),
                     "input_tokens": m.get("input_tokens"),
+                    "cached_input_tokens": m.get("cached_input_tokens"),
                     "output_tokens": m.get("output_tokens"),
                     "total_tokens": m.get("total_tokens"),
                     "model_requests": m.get("model_requests", 1),
@@ -1283,6 +1291,9 @@ class ExperimentRunner:
         def _fmt_p(val: Optional[float]) -> str:
             return f"{val:.1f}" if val is not None else "N/A"
 
+        def _fmt_pct_or_na(val: Optional[float]) -> str:
+            return f"{val * 100:.1f}%" if val is not None else "N/A"
+
         def _fmt_lat_pair(cond_key: str) -> str:
             agg = summary_by_cond.get(cond_key, compute_aggregate_metrics([], cond_key))
             return f"{_fmt_p(agg.latency_p50_ms)} / {_fmt_p(agg.latency_p95_ms)}"
@@ -1308,7 +1319,8 @@ class ExperimentRunner:
 | **System Safety Rate** | {summary_by_cond.get('A', compute_aggregate_metrics([], 'A')).system_safety_rate * 100:.1f}% | {summary_by_cond.get('B', compute_aggregate_metrics([], 'B')).system_safety_rate * 100:.1f}% | {summary_by_cond.get('C', compute_aggregate_metrics([], 'C')).system_safety_rate * 100:.1f}% |
 | **Model Decision Rate** | {summary_by_cond.get('A', compute_aggregate_metrics([], 'A')).model_decision_rate * 100:.1f}% | {summary_by_cond.get('B', compute_aggregate_metrics([], 'B')).model_decision_rate * 100:.1f}% | {summary_by_cond.get('C', compute_aggregate_metrics([], 'C')).model_decision_rate * 100:.1f}% |
 | **Legacy v1 Success Rate** | {summary_by_cond.get('A', compute_aggregate_metrics([], 'A')).legacy_v1_task_success_rate * 100:.1f}% | {summary_by_cond.get('B', compute_aggregate_metrics([], 'B')).legacy_v1_task_success_rate * 100:.1f}% | {summary_by_cond.get('C', compute_aggregate_metrics([], 'C')).legacy_v1_task_success_rate * 100:.1f}% |
-| **Target Accuracy Rate** | {summary_by_cond.get('A', compute_aggregate_metrics([], 'A')).target_accuracy_rate * 100:.1f}% | {summary_by_cond.get('B', compute_aggregate_metrics([], 'B')).target_accuracy_rate * 100:.1f}% | {summary_by_cond.get('C', compute_aggregate_metrics([], 'C')).target_accuracy_rate * 100:.1f}% |
+| **Target Coordinate Match Rate** | {summary_by_cond.get('A', compute_aggregate_metrics([], 'A')).target_coordinate_match_rate * 100:.1f}% | {summary_by_cond.get('B', compute_aggregate_metrics([], 'B')).target_coordinate_match_rate * 100:.1f}% | {summary_by_cond.get('C', compute_aggregate_metrics([], 'C')).target_coordinate_match_rate * 100:.1f}% |
+| **Target Operation Correctness** | {_fmt_pct_or_na(summary_by_cond.get('A', compute_aggregate_metrics([], 'A')).target_operation_correct_rate)} | {_fmt_pct_or_na(summary_by_cond.get('B', compute_aggregate_metrics([], 'B')).target_operation_correct_rate)} | {_fmt_pct_or_na(summary_by_cond.get('C', compute_aggregate_metrics([], 'C')).target_operation_correct_rate)} |
 | **False Rejection Rate** | {summary_by_cond.get('A', compute_aggregate_metrics([], 'A')).false_rejection_rate * 100:.1f}% | {summary_by_cond.get('B', compute_aggregate_metrics([], 'B')).false_rejection_rate * 100:.1f}% | {summary_by_cond.get('C', compute_aggregate_metrics([], 'C')).false_rejection_rate * 100:.1f}% |
 | **Rejection Category Match** | {summary_by_cond.get('A', compute_aggregate_metrics([], 'A')).rejection_accuracy_rate * 100:.1f}% | {summary_by_cond.get('B', compute_aggregate_metrics([], 'B')).rejection_accuracy_rate * 100:.1f}% | {summary_by_cond.get('C', compute_aggregate_metrics([], 'C')).rejection_accuracy_rate * 100:.1f}% |
 | **Clarification Accuracy** | {summary_by_cond.get('A', compute_aggregate_metrics([], 'A')).clarification_accuracy_rate * 100:.1f}% | {summary_by_cond.get('B', compute_aggregate_metrics([], 'B')).clarification_accuracy_rate * 100:.1f}% | {summary_by_cond.get('C', compute_aggregate_metrics([], 'C')).clarification_accuracy_rate * 100:.1f}% |
@@ -1317,6 +1329,7 @@ class ExperimentRunner:
 | **Total Recipe Overwrites** | {summary_by_cond.get('A', compute_aggregate_metrics([], 'A')).total_recipe_overwrites} | {summary_by_cond.get('B', compute_aggregate_metrics([], 'B')).total_recipe_overwrites} | {summary_by_cond.get('C', compute_aggregate_metrics([], 'C')).total_recipe_overwrites} |
 | **Committed Policy Violations** | {summary_by_cond.get('A', compute_aggregate_metrics([], 'A')).total_policy_violations} | {summary_by_cond.get('B', compute_aggregate_metrics([], 'B')).total_policy_violations} | {summary_by_cond.get('C', compute_aggregate_metrics([], 'C')).total_policy_violations} |
 | **Mean Input Tokens** | {summary_by_cond.get('A', compute_aggregate_metrics([], 'A')).mean_input_tokens if summary_by_cond.get('A', compute_aggregate_metrics([], 'A')).mean_input_tokens is not None else 'null'} | {summary_by_cond.get('B', compute_aggregate_metrics([], 'B')).mean_input_tokens if summary_by_cond.get('B', compute_aggregate_metrics([], 'B')).mean_input_tokens is not None else 'null'} | {summary_by_cond.get('C', compute_aggregate_metrics([], 'C')).mean_input_tokens if summary_by_cond.get('C', compute_aggregate_metrics([], 'C')).mean_input_tokens is not None else 'null'} |
+| **Mean Cached Input Tokens** | {summary_by_cond.get('A', compute_aggregate_metrics([], 'A')).mean_cached_input_tokens if summary_by_cond.get('A', compute_aggregate_metrics([], 'A')).mean_cached_input_tokens is not None else 'null'} | {summary_by_cond.get('B', compute_aggregate_metrics([], 'B')).mean_cached_input_tokens if summary_by_cond.get('B', compute_aggregate_metrics([], 'B')).mean_cached_input_tokens is not None else 'null'} | {summary_by_cond.get('C', compute_aggregate_metrics([], 'C')).mean_cached_input_tokens if summary_by_cond.get('C', compute_aggregate_metrics([], 'C')).mean_cached_input_tokens is not None else 'null'} |
 | **Mean Output Tokens** | {summary_by_cond.get('A', compute_aggregate_metrics([], 'A')).mean_output_tokens if summary_by_cond.get('A', compute_aggregate_metrics([], 'A')).mean_output_tokens is not None else 'null'} | {summary_by_cond.get('B', compute_aggregate_metrics([], 'B')).mean_output_tokens if summary_by_cond.get('B', compute_aggregate_metrics([], 'B')).mean_output_tokens is not None else 'null'} | {summary_by_cond.get('C', compute_aggregate_metrics([], 'C')).mean_output_tokens if summary_by_cond.get('C', compute_aggregate_metrics([], 'C')).mean_output_tokens is not None else 'null'} |
 | **Mean Model Requests** | {summary_by_cond.get('A', compute_aggregate_metrics([], 'A')).mean_model_requests:.1f} | {summary_by_cond.get('B', compute_aggregate_metrics([], 'B')).mean_model_requests:.1f} | {summary_by_cond.get('C', compute_aggregate_metrics([], 'C')).mean_model_requests:.1f} |
 | **Mean Inspection Queries** | 0.0 | 0.0 | {summary_by_cond.get('C', compute_aggregate_metrics([], 'C')).mean_inspection_calls:.1f} |
@@ -1330,6 +1343,7 @@ class ExperimentRunner:
 - **Pre-commit Gate Invariant:** Across all conditions, zero constraint-violating operations successfully committed to authoritative state.
 - **Rollback Symmetry:** Every rejected action left both the meal plan and the grocery basket completely identical to their pre-proposal states.
 - **Ground-Truth Non-Leakage:** Evaluator ground-truth fields were strictly isolated from agent prompts.
+- **Token Accounting Invariant:** `cached_input_tokens` is a billed subset of `input_tokens` served from the provider cache. Total token usage strictly equals `input_tokens + output_tokens`. Cached tokens are not added again to total usage.
 
 ## 3. Important Methodological Disclaimers
 

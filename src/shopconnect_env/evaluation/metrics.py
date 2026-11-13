@@ -528,6 +528,9 @@ class AggregateMetrics:
     system_safety_rate: float = 0.0
     model_decision_rate: float = 0.0
     legacy_v1_task_success_rate: float = 0.0
+    target_coordinate_match_rate: float = 0.0
+    target_operation_correct_rate: Optional[float] = None
+    mean_cached_input_tokens: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert aggregate summary to dictionary."""
@@ -557,6 +560,9 @@ def compute_aggregate_metrics(
             system_safety_rate=0.0,
             model_decision_rate=0.0,
             legacy_v1_task_success_rate=0.0,
+            target_coordinate_match_rate=0.0,
+            target_operation_correct_rate=None,
+            mean_cached_input_tokens=None,
             mean_drift_count=0.0,
             total_unintended_assignments=0,
             total_recipe_overwrites=0,
@@ -573,11 +579,22 @@ def compute_aggregate_metrics(
 
     successful = sum(1 for r in cond_runs if r.task_success)
     target_acc = sum(1 for r in cond_runs if r.target_accuracy)
+    target_coord_match_rate = round(target_acc / total, 4)
 
     # Sub-category rates
     commit_runs = [r for r in cond_runs if r.expected_outcome == "COMMIT"]
     reject_runs = [r for r in cond_runs if r.expected_outcome == "REJECT"]
     clarify_runs = [r for r in cond_runs if r.expected_outcome == "CLARIFY"]
+
+    target_op_rate = (
+        round(
+            sum(1 for r in commit_runs if getattr(r, "target_operation_correct", None) is True)
+            / len(commit_runs),
+            4,
+        )
+        if commit_runs
+        else None
+    )
 
     false_rejections = sum(1 for r in commit_runs if r.false_rejection)
     false_rejection_rate = (false_rejections / len(commit_runs)) if commit_runs else 0.0
@@ -625,6 +642,13 @@ def compute_aggregate_metrics(
     mean_requests = sum(r.model_requests for r in cond_runs) / total
     mean_inspections = sum(r.inspection_calls for r in cond_runs) / total
 
+    has_cached = any(getattr(r, "cached_input_tokens", None) is not None for r in cond_runs)
+    mean_cached = (
+        sum(r.cached_input_tokens for r in cond_runs if getattr(r, "cached_input_tokens", None) is not None) / total
+        if has_cached
+        else None
+    )
+
     # Latencies
     latencies = [r.wall_clock_latency_ms for r in cond_runs]
     p50 = calculate_percentile(latencies, 50.0)
@@ -644,18 +668,21 @@ def compute_aggregate_metrics(
         total_runs=total,
         successful_runs=successful,
         task_success_rate=round(successful / total, 4),
-        target_accuracy_rate=round(target_acc / total, 4),
+        target_accuracy_rate=target_coord_match_rate,
         false_rejection_rate=round(false_rejection_rate, 4),
         rejection_accuracy_rate=round(rejection_accuracy_rate, 4),
         clarification_accuracy_rate=round(clarification_accuracy_rate, 4),
         system_safety_rate=round(system_safety_rate, 4),
         model_decision_rate=round(model_decision_rate, 4),
         legacy_v1_task_success_rate=round(legacy_v1_task_success_rate, 4),
+        target_coordinate_match_rate=target_coord_match_rate,
+        target_operation_correct_rate=target_op_rate,
         mean_drift_count=round(mean_drift, 3),
         total_unintended_assignments=total_unintended,
         total_recipe_overwrites=total_overwrites,
         total_policy_violations=total_violations,
         mean_input_tokens=round(mean_input, 2) if mean_input is not None else None,
+        mean_cached_input_tokens=round(mean_cached, 2) if mean_cached is not None else None,
         mean_output_tokens=round(mean_output, 2) if mean_output is not None else None,
         mean_total_tokens=round(mean_total, 2) if mean_total is not None else None,
         mean_model_requests=round(mean_requests, 2),

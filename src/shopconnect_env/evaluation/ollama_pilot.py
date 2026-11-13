@@ -324,6 +324,7 @@ def run_ollama_pilot_preflight(
     tasks_path: Union[str, Path] = "data/tasks.jsonl",
     base_url: str = DEFAULT_BASE_URL,
     probe_fn: Optional[Callable[[str], Dict[str, Any]]] = None,
+    protocol_version: str = "v1",
 ) -> Dict[str, Any]:
     """Execute preflight configuration and data integrity validation for Ollama."""
     catalog_p = Path(catalog_path)
@@ -395,6 +396,11 @@ def run_ollama_pilot_preflight(
         pricing = None
         errors.append(f"Invalid pricing configuration: {e}")
 
+    c_reqs = PROTOCOL_V2_MAX_REQUESTS_PER_CONDITION_C if protocol_version == "v2" else MAX_REQUESTS_PER_CONDITION_C
+    c_insps = PROTOCOL_V2_MAX_INSPECTIONS_PER_CONDITION_C if protocol_version == "v2" else MAX_INSPECTIONS_PER_CONDITION_C
+    theor_reqs = PROTOCOL_V2_MAX_THEORETICAL_TOTAL_REQUESTS if protocol_version == "v2" else MAX_THEORETICAL_TOTAL_REQUESTS
+    ceil_reqs = PROTOCOL_V2_GLOBAL_REQUEST_CEILING if protocol_version == "v2" else MAX_TOTAL_PROVIDER_REQUESTS
+
     return {
         "status": "passed" if not errors else "failed",
         "server_online": status["server_online"],
@@ -408,14 +414,15 @@ def run_ollama_pilot_preflight(
         "planned_runs_count": MAX_PILOT_RUNS,
         "max_requests_per_condition_a": MAX_REQUESTS_PER_CONDITION_A,
         "max_requests_per_condition_b": MAX_REQUESTS_PER_CONDITION_B,
-        "max_requests_per_condition_c": MAX_REQUESTS_PER_CONDITION_C,
-        "max_inspections_per_condition_c": MAX_INSPECTIONS_PER_CONDITION_C,
-        "max_theoretical_requests": MAX_THEORETICAL_TOTAL_REQUESTS,
-        "max_possible_total_requests": MAX_THEORETICAL_TOTAL_REQUESTS,
-        "global_request_ceiling": MAX_TOTAL_PROVIDER_REQUESTS,
+        "max_requests_per_condition_c": c_reqs,
+        "max_inspections_per_condition_c": c_insps,
+        "max_theoretical_requests": theor_reqs,
+        "max_possible_total_requests": theor_reqs,
+        "global_request_ceiling": ceil_reqs,
         "pricing_complete": pricing.is_complete() if pricing else False,
         "billing_tier": "local_inference",
         "tasks_loaded": len(pilot_tasks),
+        "protocol_version": protocol_version,
         "errors": errors,
     }
 
@@ -996,6 +1003,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--fixtures", default="data/plan_fixtures.json")
     parser.add_argument("--tasks", default="data/tasks.jsonl")
     parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--protocol-version", default="v2", choices=["v1", "v2"], help="Protocol version (default: v2)")
 
     args = parser.parse_args(argv)
 
@@ -1014,12 +1022,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0 if res.get("success") else 1
 
     if args.preflight:
-        pf = run_ollama_pilot_preflight(args.catalog, args.fixtures, args.tasks, base_url=args.base_url)
+        pf = run_ollama_pilot_preflight(
+            args.catalog,
+            args.fixtures,
+            args.tasks,
+            base_url=args.base_url,
+            protocol_version=args.protocol_version,
+        )
         print(json.dumps(pf, indent=2))
         return 0 if pf["status"] == "passed" else 1
 
     if args.dry_run:
-        res = run_ollama_pilot_dry_run(args.catalog, args.fixtures, args.tasks, args.output_dir)
+        res = run_ollama_pilot_dry_run(
+            args.catalog,
+            args.fixtures,
+            args.tasks,
+            args.output_dir,
+            protocol_version=args.protocol_version,
+        )
         print(json.dumps(res, indent=2))
         return 0 if res["status"] == "completed" else 1
 
@@ -1036,6 +1056,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             output_dir=args.output_dir,
             live=True,
             confirm_live=True,
+            protocol_version=args.protocol_version,
         )
         print(json.dumps(res, indent=2))
         return 0 if res["status"] == "completed" else 1
