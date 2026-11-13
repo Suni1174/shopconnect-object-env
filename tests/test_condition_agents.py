@@ -796,9 +796,17 @@ def test_condition_c_inspection_limit_enforcement(catalog_data, broker):
     )
     context = builder.build(req)
 
-    # 6 sequential inspection attempts in a row
+    # 6 sequential distinct inspection attempts in a row
+    distinct_queries = [
+        ("inspect_slot", {"day": "Monday", "meal_type": "breakfast"}),
+        ("inspect_slot", {"day": "Monday", "meal_type": "lunch"}),
+        ("inspect_slot", {"day": "Wednesday", "meal_type": "dinner"}),
+        ("inspect_slot", {"day": "Friday", "meal_type": "dinner"}),
+        ("inspect_preferences", {}),
+        ("inspect_plan", {}),
+    ]
     calls = []
-    for i in range(6):
+    for i, (q_tool, q_args) in enumerate(distinct_queries):
         calls.append(
             LLMCompletionResult(
                 message=LLMMessage(
@@ -806,8 +814,8 @@ def test_condition_c_inspection_limit_enforcement(catalog_data, broker):
                     tool_calls=({
                         "id": f"call_{i}",
                         "call_id": f"call_{i}",
-                        "name": "inspect_preferences",
-                        "function": {"name": "inspect_preferences", "arguments": "{}"},
+                        "name": q_tool,
+                        "function": {"name": q_tool, "arguments": json.dumps(q_args)},
                     },),
                 ),
                 usage=None,
@@ -1021,25 +1029,16 @@ def test_condition_c_multiple_inspections_in_single_response(catalog_data, broke
     agent = ConditionCAgent(provider=MockLLMProvider(responses=[turn_1, turn_2]))
     response = agent.propose_action(context, inspector=builder)
 
-    # Both inspections were executed in 1 provider request
-    assert response.has_proposal is True
-    assert response.proposal.operation == OperationType.REPLACE_MEAL
-    assert response.metadata["total_model_requests"] == 2
-    assert response.metadata["inspection_calls_count"] == 2
-    assert response.inspection_calls_made == 2
-    assert builder.get_disclosure_count() == 2
-    assert len(response.metadata["inspection_steps"]) == 2
-
-    # Usage correctly aggregated across requests
-    assert response.metadata["usage"] is not None
-    assert response.metadata["usage"]["input_tokens"] == 250
-    assert response.metadata["usage"]["output_tokens"] == 70
-    assert response.metadata["usage"]["total_tokens"] == 320
-    assert response.metadata["usage"]["is_provider_reported"] is True
+    # Multi-action responses are rejected under atomic ActionBroker contract
+    assert response.has_proposal is False
+    assert response.metadata["status"] == "unsupported_multiple_tool_calls"
+    assert "Multiple tool calls" in response.rationale
+    assert response.metadata["rejected_inspection_calls"] == 2
+    assert builder.get_disclosure_count() == 0
 
 
 def test_condition_c_multiple_inspections_ceiling_in_single_turn(catalog_data, broker):
-    """Condition C enforces the 5-inspection ceiling even when multiple calls arrive in one turn."""
+    """Condition C enforces the single-tool atomic contract when multiple calls arrive in one turn."""
     ingredients, recipes = catalog_data
     builder = ObjectContextBuilder()
     req = ContextRequest(
@@ -1063,46 +1062,13 @@ def test_condition_c_multiple_inspections_ceiling_in_single_turn(catalog_data, b
         model_identifier="mock-c",
     )
 
-    # Turn 2: 3 inspection calls (should execute 2, and reject the 3rd to stay <= 5)
-    t2_calls = tuple({
-        "id": f"c_t2_{i}",
-        "call_id": f"c_t2_{i}",
-        "name": "inspect_preferences",
-        "function": {"name": "inspect_preferences", "arguments": "{}"},
-    } for i in range(3))
-    turn_2 = LLMCompletionResult(
-        message=LLMMessage(role="assistant", tool_calls=t2_calls),
-        usage=None,
-        model_identifier="mock-c",
-    )
-
-    # Turn 3: Final proposal
-    turn_3 = LLMCompletionResult(
-        message=LLMMessage(
-            role="assistant",
-            tool_calls=({
-                "id": "c_final",
-                "call_id": "c_final",
-                "name": "propose_change_servings",
-                "function": {
-                    "name": "propose_change_servings",
-                    "arguments": json.dumps({"day": "Monday", "meal_type": "breakfast", "servings": 3}),
-                },
-            },),
-        ),
-        usage=None,
-        model_identifier="mock-c",
-    )
-
-    agent = ConditionCAgent(provider=MockLLMProvider(responses=[turn_1, turn_2, turn_3]))
+    agent = ConditionCAgent(provider=MockLLMProvider(responses=[turn_1]))
     response = agent.propose_action(context, inspector=builder)
 
-    # Exactly 5 inspections executed against ObjectInspector
-    assert response.has_proposal is True
-    assert response.metadata["total_model_requests"] == 3
-    assert response.metadata["inspection_calls_count"] == 5
-    assert response.inspection_calls_made == 5
-    assert builder.get_disclosure_count() == 5
+    assert response.has_proposal is False
+    assert response.metadata["status"] == "unsupported_multiple_tool_calls"
+    assert response.metadata["rejected_inspection_calls"] == 3
+    assert builder.get_disclosure_count() == 0
 
 
 def test_condition_c_token_accounting_aggregation_and_provenance(catalog_data, broker):

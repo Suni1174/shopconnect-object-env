@@ -23,6 +23,7 @@ from shopconnect_env.agents.base import AgentResponse, BaseAgent, ObjectInspecto
 from shopconnect_env.agents.providers import LLMMessage, LLMProvider, usage_to_dict
 from shopconnect_env.context.base import ContextResult
 from shopconnect_env.context.tool_context import get_conventional_tool_definitions
+from shopconnect_env.domain.models import RejectionCategory
 from shopconnect_env.validation.broker import ActionBroker, ActionResult, ActionStatus
 from shopconnect_env.validation.schemas import (
     ActionProposal,
@@ -256,6 +257,30 @@ class ConditionBAgent(BaseAgent):
                 metadata={
                     **base_meta,
                     "status": "clarification_requested",
+                    "tool_name": tool_name,
+                    "call_id": call_id,
+                },
+            )
+
+        elif tool_name == "decline_request":
+            cat_raw = args_dict.get("rejection_category") or "other"
+            try:
+                cat_enum = RejectionCategory(str(cat_raw).strip())
+                rejection_category = cat_enum.value
+            except ValueError:
+                rejection_category = "other"
+            reason = str(args_dict.get("reason", "Request declined by agent.")).strip() or "Request declined by agent."
+            return AgentResponse(
+                proposal=None,
+                rationale=reason,
+                raw_output=raw_output,
+                metadata={
+                    **base_meta,
+                    "status": "agent_rejected",
+                    "rejection_category": rejection_category,
+                    "agent_initiated_rejection": True,
+                    "tool_name": tool_name,
+                    "call_id": call_id,
                 },
             )
 

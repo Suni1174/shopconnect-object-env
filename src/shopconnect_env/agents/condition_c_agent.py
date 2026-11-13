@@ -16,8 +16,9 @@ Enforces:
 
 from __future__ import annotations
 
+import copy
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import ValidationError
 
@@ -30,6 +31,7 @@ from shopconnect_env.agents.providers import (
     usage_to_dict,
 )
 from shopconnect_env.context.base import ContextResult
+from shopconnect_env.domain.models import RejectionCategory
 from shopconnect_env.validation.broker import ActionBroker, ActionResult, ActionStatus
 from shopconnect_env.validation.schemas import (
     ActionProposal,
@@ -53,9 +55,13 @@ def _extract_plan_version(serialized_context: str) -> Optional[int]:
     return v
 
 
-def get_condition_c_tools() -> List[Dict[str, Any]]:
-    """Return tool specifications for Condition C: selective inspection and action proposals."""
-    return [
+def get_condition_c_tools(terminal_only: bool = False) -> List[Dict[str, Any]]:
+    """Return tool specifications for Condition C: selective inspection and action proposals.
+
+    Args:
+        terminal_only: If True, returns only terminal finalization tools (stripped of inspect_*).
+    """
+    inspection_tools = [
         {
             "type": "function",
             "function": {
@@ -135,6 +141,9 @@ def get_condition_c_tools() -> List[Dict[str, Any]]:
                 },
             },
         },
+    ]
+
+    terminal_tools = [
         {
             "type": "function",
             "function": {
@@ -176,23 +185,56 @@ def get_condition_c_tools() -> List[Dict[str, Any]]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "reason": {"type": "string", "description": "Reason why no action was proposed"},
+                        "rejection_category": {
+                            "type": "string",
+                            "enum": [c.value for c in RejectionCategory],
+                            "description": "Taxonomic category of rejection.",
+                        },
+                        "reason": {"type": "string", "description": "Reason why no action was proposed or why request is rejected"},
                     },
-                    "required": ["reason"],
+                    "required": ["rejection_category", "reason"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "finalize_clarification",
+                "description": "Ask the user a clarification question when the request is ambiguous or missing required parameters.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "question": {
+                            "type": "string",
+                            "description": "Specific question addressing the ambiguous or missing information.",
+                        },
+                    },
+                    "required": ["question"],
                 },
             },
         },
     ]
 
+    if terminal_only:
+        return terminal_tools
+    return inspection_tools + terminal_tools
+
 
 class ConditionCAgent(BaseAgent):
     """Object-centric progressive disclosure agent interfacing with LLMProvider under Condition C.
 
-    Enforces:
-    - Hard limit of MAX_MODEL_REQUESTS = 6.
-    - Hard limit of MAX_INSPECTION_CALLS = 5.
-    - Independent tracking of model requests and inspection queries.
-    - Safe termination when limits are reached without valid proposals.
+    Enforces Protocol v2 specifications:
+    - Hard limit of MAX_MODEL_REQUESTS = 6 (total API requests, including final turn).
+    - Hard limit of MAX_INSPECTION_CALLS = 5 (distinct novel queries dispatched to ObjectInspector).
+    - Invariant duplicate inspection cache: duplicate queries return local cached payload,
+      incrementing provider_requests and cache_hits without consuming distinct inspection budget.
+    - Strict inspection accounting identity:
+      inspection_attempts = distinct_inspections + cache_hits + malformed_inspection_calls + rejected_inspection_calls
+    - Dynamic finalization-only tool schema stripping: when provider_requests >= 5 or distinct_inspections >= 5,
+      the tools schema exposes ONLY terminal actions (zero inspect_* tools).
+    - Atomic single-tool contract: responses returning len(tool_calls) > 1 are rejected cleanly,
+      executing 0 tools and incrementing invalid_tool_responses.
+    - Symmetrical REJECT and CLARIFY outcomes via finalize_no_action and finalize_clarification.
     """
 
     MAX_MODEL_REQUESTS: int = 6
@@ -229,7 +271,6 @@ class ConditionCAgent(BaseAgent):
                 metadata={"status": "invalid_plan_version", "condition_id": "C"},
             )
 
-        tools = get_condition_c_tools()
         messages: List[LLMMessage] = [
             LLMMessage(role="system", content=context.system_prompt),
             LLMMessage(
@@ -240,28 +281,51 @@ class ConditionCAgent(BaseAgent):
                     "Instructions:\n"
                     "1. Use inspection tools to query specific slots, recipes, or preferences on demand.\n"
                     "2. When you have resolved the task, call propose_replace_meal or propose_change_servings.\n"
-                    "3. If the task cannot be accomplished or violates rules, call finalize_no_action."
+                    "3. If the task cannot be accomplished or violates rules, call finalize_no_action.\n"
+                    "4. If the task is ambiguous or missing required parameters, call finalize_clarification."
                 ),
             ),
         ]
 
-        model_requests_count = 0
-        inspection_calls_count = 0
+        provider_requests = 0
+        distinct_inspections = 0
+        cache_hits = 0
+        malformed_inspection_calls = 0
+        rejected_inspection_calls = 0
+        non_tool_responses = 0
+        invalid_tool_responses = 0
+
+        inspection_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
         inspection_steps: List[Dict[str, Any]] = []
+
         usages: List[Optional[LLMUsage]] = []
         request_ids: List[str] = []
         latencies: List[float] = []
         fingerprints: List[str] = []
         model_ids: List[str] = []
+
         final_proposal: Optional[ActionProposal] = None
         final_rationale: str = ""
         final_clarification: Optional[str] = None
+        rejection_category: Optional[str] = None
+        agent_initiated_rejection: bool = False
         last_raw_output: str = ""
 
         # Multi-turn interaction loop
-        while model_requests_count < self.max_model_requests:
-            model_requests_count += 1
-            completion = self.provider.complete(messages=messages, tools=tools, tool_choice="auto")
+        while provider_requests < self.max_model_requests:
+            provider_requests += 1
+
+            # Dynamic Turn 6 / Limit Stripping:
+            # When provider_requests >= max_model_requests (this is the final turn)
+            # OR when distinct_inspections >= max_inspection_calls,
+            # strip all inspect_* tools from the prompt schema!
+            use_terminal_only = (
+                (provider_requests >= self.max_model_requests)
+                or (distinct_inspections >= self.max_inspection_calls)
+            )
+            current_tools = get_condition_c_tools(terminal_only=use_terminal_only)
+
+            completion = self.provider.complete(messages=messages, tools=current_tools, tool_choice="auto")
             last_raw_output = completion.message.content or ""
             usages.append(completion.usage)
             if completion.provider_request_id:
@@ -275,226 +339,269 @@ class ConditionCAgent(BaseAgent):
 
             tool_calls = completion.message.tool_calls
             if not tool_calls:
-                # Model stopped issuing tool calls and returned plain text
+                non_tool_responses += 1
                 final_rationale = last_raw_output or "Model finished interaction without proposing an action."
                 break
 
-            # 1. Append single assistant message representing this turn's response
-            messages.append(
-                LLMMessage(
-                    role="assistant",
-                    content=completion.message.content,
-                    tool_calls=completion.message.tool_calls,
+            # Atomic Single-Tool Contract: Enforce len(tool_calls) == 1
+            if len(tool_calls) > 1:
+                invalid_tool_responses += 1
+                for tc in tool_calls:
+                    fn_name = tc.get("function", {}).get("name") or tc.get("name", "")
+                    if fn_name.startswith("inspect_"):
+                        rejected_inspection_calls += 1
+                final_rationale = (
+                    f"Multiple tool calls ({len(tool_calls)}) returned in a single turn. "
+                    "Multi-action responses are unsupported under the atomic ActionBroker contract; "
+                    "exactly one tool call is required."
                 )
-            )
+                break
 
-            # 2. Process tool calls in this turn
-            executed_any_inspection = False
-            for tc in tool_calls:
-                cid = tc.get("call_id") or tc.get("id") or ""
-                fn_dict = tc.get("function", {})
-                tool_name = fn_dict.get("name") or tc.get("name", "")
-                raw_args = fn_dict.get("arguments") or tc.get("arguments", "{}")
+            primary_tc = tool_calls[0]
+            cid = primary_tc.get("call_id") or primary_tc.get("id") or ""
+            fn_dict = primary_tc.get("function", {})
+            tool_name = fn_dict.get("name") or primary_tc.get("name", "")
+            raw_args = fn_dict.get("arguments") or primary_tc.get("arguments", "{}")
 
+            try:
+                args_dict = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+            except Exception as json_err:
+                if tool_name.startswith("inspect_"):
+                    malformed_inspection_calls += 1
+                invalid_tool_responses += 1
+                final_rationale = f"Malformed tool arguments JSON: {json_err}"
+                break
+
+            # -----------------------------------------------------------------
+            # Terminal Tools
+            # -----------------------------------------------------------------
+            if tool_name == "propose_replace_meal":
                 try:
-                    args_dict = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-                except json.JSONDecodeError:
-                    args_dict = {}
+                    val_args = ReplaceMealArgs.model_validate(args_dict)
+                except ValidationError as err:
+                    invalid_tool_responses += 1
+                    final_rationale = f"Invalid arguments for propose_replace_meal: {err}"
+                    break
 
-                # -------------------------------------------------------------
-                # A. FINAL ACTION PROPOSALS
-                # -------------------------------------------------------------
-                if tool_name == "propose_replace_meal":
+                final_proposal = ActionProposal(
+                    operation=OperationType.REPLACE_MEAL,
+                    arguments={
+                        "day": val_args.day,
+                        "meal_type": val_args.meal_type,
+                        "recipe_id": val_args.recipe_id,
+                    },
+                    reason=f"Condition C propose_replace_meal({val_args.day}, {val_args.meal_type}, {val_args.recipe_id})",
+                    expected_plan_version=plan_version,
+                )
+                final_rationale = final_proposal.reason
+                break
+
+            elif tool_name == "propose_change_servings":
+                try:
+                    val_serv = ChangeServingsArgs.model_validate(args_dict)
+                except ValidationError as err:
+                    invalid_tool_responses += 1
+                    final_rationale = f"Invalid arguments for propose_change_servings: {err}"
+                    break
+
+                final_proposal = ActionProposal(
+                    operation=OperationType.CHANGE_SERVINGS,
+                    arguments={
+                        "day": val_serv.day,
+                        "meal_type": val_serv.meal_type,
+                        "servings": val_serv.servings,
+                    },
+                    reason=f"Condition C propose_change_servings({val_serv.day}, {val_serv.meal_type}, {val_serv.servings})",
+                    expected_plan_version=plan_version,
+                )
+                final_rationale = final_proposal.reason
+                break
+
+            elif tool_name == "finalize_no_action":
+                reason = str(args_dict.get("reason", "Agent concluded no action should be taken.")).strip() or "Agent concluded no action should be taken."
+                cat_raw = args_dict.get("rejection_category")
+                if cat_raw:
                     try:
-                        val_args = ReplaceMealArgs.model_validate(args_dict)
-                    except ValidationError as err:
-                        final_rationale = f"Invalid arguments for propose_replace_meal: {err}"
-                        final_proposal = None
+                        rejection_category = RejectionCategory(str(cat_raw).strip()).value
+                    except ValueError:
+                        rejection_category = "other"
+                else:
+                    rejection_category = "other"
+                agent_initiated_rejection = True
+                final_rationale = reason
+                break
+
+            elif tool_name in ("finalize_clarification", "request_clarification"):
+                q = (
+                    args_dict.get("question")
+                    or args_dict.get("clarification")
+                    or "Clarification requested."
+                )
+                final_clarification = str(q).strip() or "Clarification requested."
+                final_rationale = f"Clarification requested: {final_clarification}"
+                break
+
+            # -----------------------------------------------------------------
+            # Inspection Tools
+            # -----------------------------------------------------------------
+            elif tool_name in (
+                "inspect_slot",
+                "inspect_recipe",
+                "inspect_recipe_ingredients",
+                "inspect_ingredient",
+                "inspect_plan",
+                "inspect_preferences",
+            ):
+                if use_terminal_only:
+                    rejected_inspection_calls += 1
+                    invalid_tool_responses += 1
+                    messages.append(
+                        LLMMessage(
+                            role="assistant",
+                            content=completion.message.content,
+                            tool_calls=completion.message.tool_calls,
+                        )
+                    )
+                    messages.append(
+                        LLMMessage(
+                            role="tool",
+                            tool_call_id=cid,
+                            content=json.dumps({
+                                "error": (
+                                    "INSPECTION_FORBIDDEN: Inspection limit reached or final turn active. "
+                                    "You must call a terminal tool (propose_replace_meal, propose_change_servings, "
+                                    "finalize_no_action, finalize_clarification)."
+                                )
+                            }),
+                        )
+                    )
+                    continue
+
+                cache_key = (tool_name, json.dumps(args_dict, sort_keys=True))
+                if cache_key in inspection_cache:
+                    cache_hits += 1
+                    insp_result = copy.deepcopy(inspection_cache[cache_key])
+                else:
+                    if distinct_inspections >= self.max_inspection_calls:
+                        rejected_inspection_calls += 1
+                        messages.append(
+                            LLMMessage(
+                                role="assistant",
+                                content=completion.message.content,
+                                tool_calls=completion.message.tool_calls,
+                            )
+                        )
                         messages.append(
                             LLMMessage(
                                 role="tool",
                                 tool_call_id=cid,
-                                content=json.dumps({"error": final_rationale}),
-                            )
-                        )
-                        break
-
-                    final_proposal = ActionProposal(
-                        operation=OperationType.REPLACE_MEAL,
-                        arguments={
-                            "day": val_args.day,
-                            "meal_type": val_args.meal_type,
-                            "recipe_id": val_args.recipe_id,
-                        },
-                        reason=f"Condition C propose_replace_meal({val_args.day}, {val_args.meal_type}, {val_args.recipe_id})",
-                        expected_plan_version=plan_version,
-                    )
-                    final_rationale = final_proposal.reason
-                    messages.append(
-                        LLMMessage(
-                            role="tool",
-                            tool_call_id=cid,
-                            content=json.dumps({"status": "proposal_staged", "operation": "replace_meal"}),
-                        )
-                    )
-                    break
-
-                elif tool_name == "propose_change_servings":
-                    try:
-                        val_serv = ChangeServingsArgs.model_validate(args_dict)
-                    except ValidationError as err:
-                        final_rationale = f"Invalid arguments for propose_change_servings: {err}"
-                        final_proposal = None
-                        messages.append(
-                            LLMMessage(
-                                role="tool",
-                                tool_call_id=cid,
-                                content=json.dumps({"error": final_rationale}),
-                            )
-                        )
-                        break
-
-                    final_proposal = ActionProposal(
-                        operation=OperationType.CHANGE_SERVINGS,
-                        arguments={
-                            "day": val_serv.day,
-                            "meal_type": val_serv.meal_type,
-                            "servings": val_serv.servings,
-                        },
-                        reason=f"Condition C propose_change_servings({val_serv.day}, {val_serv.meal_type}, {val_serv.servings})",
-                        expected_plan_version=plan_version,
-                    )
-                    final_rationale = final_proposal.reason
-                    messages.append(
-                        LLMMessage(
-                            role="tool",
-                            tool_call_id=cid,
-                            content=json.dumps({"status": "proposal_staged", "operation": "change_servings"}),
-                        )
-                    )
-                    break
-
-                elif tool_name == "request_clarification":
-                    final_proposal = None
-                    final_clarification = (
-                        args_dict.get("question")
-                        or args_dict.get("clarification")
-                        or "Clarification requested."
-                    )
-                    final_rationale = f"Clarification requested: {final_clarification}"
-                    messages.append(
-                        LLMMessage(
-                            role="tool",
-                            tool_call_id=cid,
-                            content=json.dumps({"status": "clarification_requested", "question": final_clarification}),
-                        )
-                    )
-                    break
-
-                elif tool_name == "finalize_no_action":
-                    final_proposal = None
-                    reason = args_dict.get("reason", "Agent concluded no action should be taken.")
-                    action_type = args_dict.get("action_type")
-                    if action_type == "clarify" or "clarif" in reason.lower():
-                        final_clarification = reason
-                        final_rationale = f"Clarification requested: {reason}"
-                    else:
-                        final_rationale = reason
-                    messages.append(
-                        LLMMessage(
-                            role="tool",
-                            tool_call_id=cid,
-                            content=json.dumps({"status": "finalized", "reason": final_rationale}),
-                        )
-                    )
-                    break
-
-                # -------------------------------------------------------------
-                # B. ON-DEMAND DOMAIN INSPECTION QUERIES
-                # -------------------------------------------------------------
-                elif tool_name in (
-                    "inspect_slot",
-                    "inspect_recipe",
-                    "inspect_recipe_ingredients",
-                    "inspect_ingredient",
-                    "inspect_plan",
-                    "inspect_preferences",
-                ):
-                    # Check inspection call limit
-                    if inspection_calls_count >= self.max_inspection_calls:
-                        # Reached maximum allowed domain inspections
-                        error_payload = {
-                            "error": (
-                                f"MAX_INSPECTION_CALLS_EXCEEDED: Reached maximum of {self.max_inspection_calls} "
-                                "inspection calls. You must now submit a proposal or call finalize_no_action."
-                            )
-                        }
-                        messages.append(
-                            LLMMessage(
-                                role="tool",
-                                tool_call_id=cid,
-                                content=json.dumps(error_payload),
+                                content=json.dumps({
+                                    "error": (
+                                        f"MAX_DISTINCT_INSPECTIONS_EXCEEDED: Reached maximum of {self.max_inspection_calls} "
+                                        "distinct inspections. You must call a terminal action."
+                                    )
+                                }),
                             )
                         )
                         continue
 
-                    # Execute query via ObjectInspector
-                    executed_any_inspection = True
-                    inspection_calls_count += 1
+                    distinct_inspections += 1
                     insp_result = self._dispatch_inspection(inspector, tool_name, args_dict)
+                    inspection_cache[cache_key] = copy.deepcopy(insp_result)
                     disclosure_chars = len(json.dumps(insp_result))
                     inspection_steps.append({
-                        "step": inspection_calls_count,
+                        "step": distinct_inspections,
                         "tool": tool_name,
                         "arguments": args_dict,
                         "disclosure_chars": disclosure_chars,
                     })
 
-                    messages.append(
-                        LLMMessage(
-                            role="tool",
-                            tool_call_id=cid,
-                            content=json.dumps(insp_result),
-                        )
+                messages.append(
+                    LLMMessage(
+                        role="assistant",
+                        content=completion.message.content,
+                        tool_calls=completion.message.tool_calls,
                     )
-
-                else:
-                    # Unknown tool name
-                    messages.append(
-                        LLMMessage(
-                            role="tool",
-                            tool_call_id=cid,
-                            content=json.dumps({"error": f"Unknown tool name: {tool_name}"}),
-                        )
+                )
+                messages.append(
+                    LLMMessage(
+                        role="tool",
+                        tool_call_id=cid,
+                        content=json.dumps(insp_result),
                     )
+                )
+                continue
 
-            # If a proposal was reached or finalized, exit loop
-            if final_proposal is not None or final_rationale:
-                break
+            else:
+                invalid_tool_responses += 1
+                messages.append(
+                    LLMMessage(
+                        role="assistant",
+                        content=completion.message.content,
+                        tool_calls=completion.message.tool_calls,
+                    )
+                )
+                messages.append(
+                    LLMMessage(
+                        role="tool",
+                        tool_call_id=cid,
+                        content=json.dumps({"error": f"Unknown tool name: {tool_name}"}),
+                    )
+                )
+                continue
 
-            # If no inspection was executed and limit reached, break
-            if not executed_any_inspection and inspection_calls_count >= self.max_inspection_calls:
-                break
-
-        # Check if loop terminated due to model request ceiling
-        if model_requests_count >= self.max_model_requests and final_proposal is None and not final_rationale:
+        if provider_requests >= self.max_model_requests and final_proposal is None and not final_rationale:
             final_rationale = (
                 f"MAX_MODEL_REQUESTS_EXCEEDED: Reached limit of {self.max_model_requests} "
                 "requests without producing a final action proposal."
             )
 
+        inspection_attempts = (
+            distinct_inspections
+            + cache_hits
+            + malformed_inspection_calls
+            + rejected_inspection_calls
+        )
+
+        # Invariant check
+        assert inspection_attempts == (
+            distinct_inspections
+            + cache_hits
+            + malformed_inspection_calls
+            + rejected_inspection_calls
+        )
+
         aggregated_usage = aggregate_usages(usages)
 
+        if final_proposal is not None:
+            status = "ok"
+        elif final_clarification is not None:
+            status = "clarification_requested"
+        elif agent_initiated_rejection:
+            status = "agent_rejected"
+        elif "multiple tool calls" in final_rationale.lower():
+            status = "unsupported_multiple_tool_calls"
+        elif provider_requests >= self.max_model_requests:
+            status = "max_requests_exceeded"
+        else:
+            status = "no_proposal"
+
         metadata: Dict[str, Any] = {
-            "status": (
-                "ok"
-                if final_proposal is not None
-                else ("clarification_requested" if final_clarification is not None else "no_proposal")
-            ),
+            "status": status,
             "condition_id": "C",
-            "total_model_requests": model_requests_count,
-            "inspection_calls_count": inspection_calls_count,
+            "total_model_requests": provider_requests,
+            "provider_requests": provider_requests,
+            "inspection_calls_count": distinct_inspections,
+            "distinct_inspections": distinct_inspections,
+            "cache_hits": cache_hits,
+            "inspection_attempts": inspection_attempts,
+            "malformed_inspection_calls": malformed_inspection_calls,
+            "rejected_inspection_calls": rejected_inspection_calls,
+            "non_tool_responses": non_tool_responses,
+            "invalid_tool_responses": invalid_tool_responses,
             "inspection_steps": tuple(inspection_steps),
+            "rejection_category": rejection_category,
+            "agent_initiated_rejection": agent_initiated_rejection,
             "plan_version": plan_version,
             "usage": usage_to_dict(aggregated_usage),
             "model_identifier": model_ids[-1] if model_ids else None,
@@ -507,7 +614,7 @@ class ConditionCAgent(BaseAgent):
             proposal=final_proposal,
             rationale=final_rationale or "Interaction completed.",
             raw_output=last_raw_output or (final_proposal.model_dump_json() if final_proposal else ""),
-            inspection_calls_made=inspection_calls_count,
+            inspection_calls_made=distinct_inspections,
             clarification_message=final_clarification,
             metadata=metadata,
         )

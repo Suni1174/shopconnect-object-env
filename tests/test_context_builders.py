@@ -252,11 +252,13 @@ def test_condition_b_tool_definitions_match_pydantic_schemas(context_request):
 
     assert result.condition_id == "B"
     assert isinstance(result.signatures, list)
-    assert len(result.signatures) == 2
+    assert len(result.signatures) == 4
 
     tool_names = [t["function"]["name"] for t in result.signatures]
     assert "replace_meal" in tool_names
     assert "change_servings" in tool_names
+    assert "request_clarification" in tool_names
+    assert "decline_request" in tool_names
 
     # Check parameters match Pydantic schemas
     replace_tool = next(t for t in result.signatures if t["function"]["name"] == "replace_meal")

@@ -41,7 +41,12 @@ class FullStateContextBuilder(BaseContextBuilder):
         "Instructions:\n"
         "1. Analyze the user's natural language request.\n"
         "2. Review the full current schedule and constraint profile.\n"
-        "3. You must regenerate and emit the COMPLETE updated meal plan for the entire week.\n"
+        "3. You must emit a single JSON object conforming to one of the following decisions:\n"
+        "   - COMMIT: {\"decision\": \"COMMIT\", \"schedule\": [<21 slots>]}\n"
+        "     Every slot must have: day, meal_type, status ('assigned' or 'unfilled'), recipe_id, servings (1-20 for assigned, 0 for unfilled).\n"
+        "   - REJECT: {\"decision\": \"REJECT\", \"rejection_category\": \"<category>\", \"reason\": \"<explanation>\"}\n"
+        "     Valid categories: 'allergen_conflict', 'dietary_mismatch', 'budget_overflow', 'invalid_recipe', 'no_op', 'other'.\n"
+        "   - CLARIFY: {\"decision\": \"CLARIFY\", \"clarification_question\": \"<question>\"}\n"
         "4. Preserve all meals that do not require modification.\n"
         "5. Ensure the revised plan respects all dietary tags, allergen constraints, and budget limits."
     )

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from decimal import Decimal
+from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -28,6 +29,21 @@ MEAL_TYPES: Tuple[str, ...] = (
     "lunch",
     "dinner",
 )
+
+
+class RejectionCategory(str, Enum):
+    """Standardized taxonomic categories for rejected meal plan operations.
+
+    Used across all experimental conditions (A, B, C) and evaluation metrics to ensure
+    consistent, structured rejection reasoning without fuzzy string matching.
+    """
+
+    ALLERGEN_CONFLICT = "allergen_conflict"
+    DIETARY_MISMATCH = "dietary_mismatch"
+    BUDGET_OVERFLOW = "budget_overflow"
+    INVALID_RECIPE = "invalid_recipe"
+    NO_OP = "no_op"
+    OTHER = "other"
 
 
 def make_slot_key(day: str, meal_type: str) -> str:

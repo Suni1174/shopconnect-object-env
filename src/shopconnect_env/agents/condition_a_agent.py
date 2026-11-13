@@ -20,14 +20,134 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
+from typing import Annotated, Any, Dict, List, Literal, Mapping, Optional, Set, Tuple, Union
+
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator
 
 from shopconnect_env.agents.base import AgentResponse, BaseAgent, ObjectInspector
 from shopconnect_env.agents.providers import LLMMessage, LLMProvider, usage_to_dict
 from shopconnect_env.context.base import ContextResult
-from shopconnect_env.domain.models import DAYS_OF_WEEK, MEAL_TYPES, make_slot_key
+from shopconnect_env.domain.models import DAYS_OF_WEEK, MEAL_TYPES, RejectionCategory, make_slot_key
 from shopconnect_env.validation.broker import ActionBroker, ActionResult, ActionStatus
 from shopconnect_env.validation.schemas import ActionProposal, OperationType
+
+
+# =============================================================================
+# CONDITION A RESPONSE ENVELOPES (PYDANTIC V2 DISCRIMINATED UNION)
+# =============================================================================
+
+class ScheduleSlotModel(BaseModel):
+    """Pydantic model representing a single schedule slot in Condition A."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    day: str
+    meal_type: str
+    status: Literal["assigned", "unfilled"]
+    recipe_id: Optional[str] = None
+    servings: int
+
+    @field_validator("day")
+    @classmethod
+    def validate_day(cls, v: str) -> str:
+        norm = v.strip().capitalize()
+        if norm not in DAYS_OF_WEEK:
+            raise ValueError(f"Invalid day: '{v}'. Must be one of {DAYS_OF_WEEK}.")
+        return norm
+
+    @field_validator("meal_type")
+    @classmethod
+    def validate_meal_type(cls, v: str) -> str:
+        norm = v.strip().lower()
+        if norm not in MEAL_TYPES:
+            raise ValueError(f"Invalid meal_type: '{v}'. Must be one of {MEAL_TYPES}.")
+        return norm
+
+    @field_validator("servings")
+    @classmethod
+    def validate_servings(cls, v: int) -> int:
+        if v < 0 or v > 20:
+            raise ValueError(f"servings must be between 0 and 20, got {v}.")
+        return v
+
+
+class ConditionACommitEnvelope(BaseModel):
+    """Envelope emitted when Condition A commits a 21-slot regenerated meal plan."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decision: Literal["COMMIT"]
+    schedule: List[ScheduleSlotModel]
+
+    @field_validator("schedule")
+    @classmethod
+    def validate_schedule_slots(cls, slots: List[ScheduleSlotModel]) -> List[ScheduleSlotModel]:
+        if len(slots) != 21:
+            raise ValueError(f"Invalid slot count: expected 21 slots, got {len(slots)}.")
+        coords = set()
+        for s in slots:
+            coord = (s.day, s.meal_type)
+            if coord in coords:
+                raise ValueError(f"Duplicate slot coordinate detected: {coord[0]} {coord[1]}.")
+            coords.add(coord)
+            if s.status == "assigned":
+                if not s.recipe_id or not s.recipe_id.strip():
+                    raise ValueError(f"Assigned slot {coord} must specify a valid recipe_id.")
+                if s.servings < 1 or s.servings > 20:
+                    raise ValueError(f"Assigned slot {coord} servings must be 1-20, got {s.servings}.")
+            elif s.status == "unfilled":
+                if s.recipe_id is not None:
+                    raise ValueError(f"Unfilled slot {coord} must have null recipe_id, got {s.recipe_id!r}.")
+                if s.servings != 0:
+                    raise ValueError(f"Unfilled slot {coord} must have servings=0, got {s.servings}.")
+        for d in DAYS_OF_WEEK:
+            for m in MEAL_TYPES:
+                if (d, m) not in coords:
+                    raise ValueError(f"Missing slot coordinate: {d} {m}.")
+        return slots
+
+
+class ConditionARejectEnvelope(BaseModel):
+    """Envelope emitted when Condition A rejects an invalid or unsafe request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decision: Literal["REJECT"]
+    rejection_category: RejectionCategory
+    reason: str = Field(min_length=1)
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, v: str) -> str:
+        s = v.strip()
+        if not s:
+            raise ValueError("reason cannot be empty or whitespace.")
+        return s
+
+
+class ConditionAClarifyEnvelope(BaseModel):
+    """Envelope emitted when Condition A requests user clarification."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decision: Literal["CLARIFY"]
+    clarification_question: str = Field(min_length=1)
+
+    @field_validator("clarification_question")
+    @classmethod
+    def validate_question(cls, v: str) -> str:
+        s = v.strip()
+        if not s:
+            raise ValueError("clarification_question cannot be empty or whitespace.")
+        return s
+
+
+ConditionAEnvelope = Annotated[
+    Union[ConditionACommitEnvelope, ConditionARejectEnvelope, ConditionAClarifyEnvelope],
+    Field(discriminator="decision"),
+]
+
+ConditionAEnvelopeAdapter: TypeAdapter[Any] = TypeAdapter(ConditionAEnvelope)
 
 
 def _extract_plan_version(serialized_context: str) -> Optional[int]:
@@ -227,8 +347,11 @@ class ConditionAAgent(BaseAgent):
                 content=(
                     f"User Request:\n{context.task_prompt}\n\n"
                     f"Current Complete State:\n{context.serialized_context}\n\n"
-                    "Regenerate and return the COMPLETE 21-slot weekly meal plan as JSON.\n"
-                    "Every slot must have: day, meal_type, status ('assigned' or 'unfilled'), "
+                    "Emit a single JSON object conforming to the Condition A response schema:\n"
+                    "- COMMIT: {\"decision\": \"COMMIT\", \"schedule\": [<21 slots>]}\n"
+                    "- REJECT: {\"decision\": \"REJECT\", \"rejection_category\": \"<category>\", \"reason\": \"<explanation>\"}\n"
+                    "- CLARIFY: {\"decision\": \"CLARIFY\", \"clarification_question\": \"<question>\"}\n"
+                    "For COMMIT, every slot must have: day, meal_type, status ('assigned' or 'unfilled'), "
                     "recipe_id, and servings (1-20 for assigned, 0 for unfilled)."
                 ),
             ),
@@ -247,39 +370,98 @@ class ConditionAAgent(BaseAgent):
             "per_request_latencies_ms": (completion.latency_ms,) if completion.latency_ms else (),
         }
 
-        # 3. Parse JSON schedule or explicit clarification
+        # 3. Clean raw output and parse JSON
+        clean_text = raw_text.strip()
+        if clean_text.startswith("```"):
+            clean_lines = clean_text.splitlines()
+            if clean_lines[0].startswith("```"):
+                clean_lines = clean_lines[1:]
+            if clean_lines and clean_lines[-1].startswith("```"):
+                clean_lines = clean_lines[:-1]
+            clean_text = "\n".join(clean_lines).strip()
+
+        parsed_raw = None
         try:
-            clean_text = raw_text.strip()
-            if clean_text.startswith("```"):
-                clean_lines = clean_text.splitlines()
-                if clean_lines[0].startswith("```"):
-                    clean_lines = clean_lines[1:]
-                if clean_lines and clean_lines[-1].startswith("```"):
-                    clean_lines = clean_lines[:-1]
-                clean_text = "\n".join(clean_lines).strip()
             parsed_raw = json.loads(clean_text)
-            if isinstance(parsed_raw, dict):
-                clar_msg = (
-                    parsed_raw.get("clarification")
-                    or parsed_raw.get("clarification_request")
-                    or parsed_raw.get("question")
-                )
-                if clar_msg:
-                    return AgentResponse(
-                        proposal=None,
-                        rationale=f"Clarification requested: {clar_msg}",
-                        raw_output=raw_text,
-                        clarification_message=str(clar_msg),
-                        metadata={
-                            **base_meta,
-                            "status": "clarification_requested",
-                        },
-                    )
         except Exception:
             pass
 
+        # 3a. Condition A Pydantic v2 Discriminated Envelope Handling
+        raw_slots: Optional[List[Dict[str, Any]]] = None
+        if isinstance(parsed_raw, dict) and "decision" in parsed_raw:
+            try:
+                envelope = ConditionAEnvelopeAdapter.validate_python(parsed_raw)
+            except ValidationError as val_err:
+                return AgentResponse(
+                    proposal=None,
+                    rationale=f"Envelope validation error: {val_err}",
+                    raw_output=raw_text,
+                    metadata={
+                        **base_meta,
+                        "status": "envelope_validation_error",
+                        "error": str(val_err),
+                    },
+                )
+
+            if envelope.decision == "REJECT":
+                return AgentResponse(
+                    proposal=None,
+                    rationale=envelope.reason,
+                    raw_output=raw_text,
+                    metadata={
+                        **base_meta,
+                        "status": "agent_rejected",
+                        "rejection_category": envelope.rejection_category.value,
+                        "agent_initiated_rejection": True,
+                    },
+                )
+            elif envelope.decision == "CLARIFY":
+                return AgentResponse(
+                    proposal=None,
+                    rationale=f"Clarification requested: {envelope.clarification_question}",
+                    raw_output=raw_text,
+                    clarification_message=envelope.clarification_question,
+                    metadata={
+                        **base_meta,
+                        "status": "clarification_requested",
+                    },
+                )
+            elif envelope.decision == "COMMIT":
+                raw_slots = [
+                    {
+                        "day": s.day,
+                        "meal_type": s.meal_type,
+                        "status": s.status,
+                        "recipe_id": s.recipe_id,
+                        "servings": s.servings,
+                    }
+                    for s in envelope.schedule
+                ]
+
+        # 3b. Legacy dictionary clarification handling
+        if raw_slots is None and isinstance(parsed_raw, dict):
+            clar_msg = (
+                parsed_raw.get("clarification")
+                or parsed_raw.get("clarification_request")
+                or parsed_raw.get("question")
+            )
+            if clar_msg:
+                return AgentResponse(
+                    proposal=None,
+                    rationale=f"Clarification requested: {clar_msg}",
+                    raw_output=raw_text,
+                    clarification_message=str(clar_msg),
+                    metadata={
+                        **base_meta,
+                        "status": "clarification_requested",
+                    },
+                )
+
+        # 3c. Free-text clarification detection fallback
         if (
-            not raw_text.strip().startswith("[")
+            raw_slots is None
+            and not raw_text.strip().startswith("[")
+            and not raw_text.strip().startswith("{")
             and not raw_text.strip().startswith("```")
             and any(p in raw_text.lower() for p in ["clarif", "could you specify", "please specify", "unclear which meal", "which meal slot"])
         ):
@@ -294,7 +476,9 @@ class ConditionAAgent(BaseAgent):
                 },
             )
 
-        raw_slots = _parse_regenerated_json(raw_text)
+        if raw_slots is None:
+            raw_slots = _parse_regenerated_json(raw_text)
+
         if raw_slots is None:
             return AgentResponse(
                 proposal=None,

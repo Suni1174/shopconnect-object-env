@@ -20,7 +20,7 @@ from shopconnect_env.context.base import (
     serialize_meal,
     serialize_user_preferences,
 )
-from shopconnect_env.domain.models import DAYS_OF_WEEK, MEAL_TYPES
+from shopconnect_env.domain.models import DAYS_OF_WEEK, MEAL_TYPES, RejectionCategory
 from shopconnect_env.validation.schemas import ChangeServingsArgs, ReplaceMealArgs
 
 
@@ -28,7 +28,7 @@ def get_conventional_tool_definitions() -> List[Dict[str, Any]]:
     """Return flat function-calling specifications derived directly from Pydantic schemas.
 
     Uses Stage 3 Pydantic schemas as the single source of truth for argument constraints,
-    descriptions, and required parameters.
+    descriptions, and required parameters, plus explicit clarification and decline tools.
     """
     return [
         {
@@ -53,6 +53,51 @@ def get_conventional_tool_definitions() -> List[Dict[str, Any]]:
                 "parameters": ChangeServingsArgs.model_json_schema(),
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "request_clarification",
+                "description": (
+                    "Ask the user a clarification question when the request is ambiguous, "
+                    "missing required meal slot, day, servings, or recipe parameters."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "question": {
+                            "type": "string",
+                            "description": "Specific question addressing the ambiguous or missing information.",
+                        },
+                    },
+                    "required": ["question"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "decline_request",
+                "description": (
+                    "Explicitly decline the user request when it violates policy constraints "
+                    "(e.g. allergens, dietary restrictions, budget) or cannot be executed."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "rejection_category": {
+                            "type": "string",
+                            "enum": [c.value for c in RejectionCategory],
+                            "description": "Taxonomic category of rejection.",
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Detailed explanation of why the request cannot be performed safely.",
+                        },
+                    },
+                    "required": ["rejection_category", "reason"],
+                },
+            },
+        },
     ]
 
 
@@ -68,11 +113,16 @@ class ToolContextBuilder(BaseContextBuilder):
         "You have access to defined tools to perform operations on the weekly meal plan.\n\n"
         "Available Tools:\n"
         "1. replace_meal(day, meal_type, recipe_id, servings=None)\n"
-        "2. change_servings(day, meal_type, servings)\n\n"
+        "2. change_servings(day, meal_type, servings)\n"
+        "3. request_clarification(question)\n"
+        "4. decline_request(rejection_category, reason)\n\n"
         "Instructions:\n"
         "1. Inspect the provided state snapshot (current schedule, available recipes, user preferences).\n"
-        "2. Select the single appropriate tool to accomplish the user's request.\n"
-        "3. Emit a structured tool call matching the tool schema.\n"
+        "2. Select the single appropriate tool to accomplish the user's request:\n"
+        "   - Use replace_meal or change_servings for valid modifications.\n"
+        "   - Use decline_request if the request violates allergens, diet, budget, or is invalid.\n"
+        "   - Use request_clarification if the request is ambiguous or lacks required information.\n"
+        "3. Emit exactly ONE structured tool call matching the tool schema.\n"
         "4. Do NOT attempt to rewrite the entire meal plan."
     )
 

@@ -10,6 +10,7 @@ from shopconnect_env.domain.models import (
     Meal,
     MealPlan,
     Recipe,
+    RejectionCategory,
     UserPreferences,
     load_catalog_from_json,
     make_slot_key,
@@ -18,6 +19,7 @@ from shopconnect_env.domain.models import (
 __all__ = [
     "DAYS_OF_WEEK",
     "MEAL_TYPES",
+    "RejectionCategory",
     "Ingredient",
     "IngredientRequirement",
     "Recipe",

@@ -262,6 +262,16 @@ class LLMProvider(Protocol):
         """Return SDK version string if applicable."""
         ...
 
+    @property
+    def is_execution_lock_enabled(self) -> bool:
+        """Return True if completion requests are guarded by an execution lock."""
+        ...
+
+    @property
+    def effective_reasoning_effort(self) -> Optional[str]:
+        """Return the effective reasoning effort string for this provider configuration."""
+        ...
+
     def complete(
         self,
         messages: List[LLMMessage],
@@ -326,6 +336,16 @@ class MockLLMProvider:
     def sdk_version(self) -> Optional[str]:
         """Return None for mock provider to avoid fabricating external SDK metadata."""
         return None
+
+    @property
+    def is_execution_lock_enabled(self) -> bool:
+        """Mock provider does not require hardware serialization."""
+        return False
+
+    @property
+    def effective_reasoning_effort(self) -> Optional[str]:
+        """Mock provider default reasoning effort matching simulated execution."""
+        return "low"
 
     def complete(
         self,
@@ -496,6 +516,16 @@ class OpenAIProvider:
             return getattr(openai, "__version__", None)
         except ImportError:
             return None
+
+    @property
+    def is_execution_lock_enabled(self) -> bool:
+        """Remote cloud provider does not require local hardware execution locking."""
+        return False
+
+    @property
+    def effective_reasoning_effort(self) -> Optional[str]:
+        """Return configured reasoning effort for OpenAI Responses API."""
+        return self.reasoning_effort or "low"
 
     def complete(
         self,
@@ -884,6 +914,16 @@ class GeminiProvider:
             return getattr(genai, "__version__", None)
         except ImportError:
             return None
+
+    @property
+    def is_execution_lock_enabled(self) -> bool:
+        """Remote cloud provider does not require local hardware execution locking."""
+        return False
+
+    @property
+    def effective_reasoning_effort(self) -> Optional[str]:
+        """Return thinking level for Gemini provider."""
+        return self.thinking_level or "low"
 
     def complete(
         self,
@@ -1658,6 +1698,16 @@ class OpenRouterProvider:
         except ImportError:
             return None
 
+    @property
+    def is_execution_lock_enabled(self) -> bool:
+        """Remote cloud provider does not require local hardware execution locking."""
+        return False
+
+    @property
+    def effective_reasoning_effort(self) -> Optional[str]:
+        """OpenRouter provider does not configure reasoning effort."""
+        return None
+
     def complete(
         self,
         messages: List[LLMMessage],
@@ -1810,6 +1860,18 @@ class OllamaProvider:
             return getattr(openai, "__version__", None)
         except ImportError:
             return None
+
+    @property
+    def is_execution_lock_enabled(self) -> bool:
+        """Local Ollama provider enforces strict sequential execution via process-wide lock."""
+        return True
+
+    @property
+    def effective_reasoning_effort(self) -> str:
+        """Return 'none' when thinking is disabled, otherwise configured reasoning effort."""
+        if not self.enable_thinking:
+            return "none"
+        return self.reasoning_effort or "low"
 
     def complete(
         self,

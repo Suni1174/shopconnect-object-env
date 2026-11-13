@@ -86,7 +86,7 @@ PILOT_CONDITIONS: Tuple[str, ...] = ("A", "B", "C")
 MAX_PILOT_RUNS: int = 9  # 3 tasks * 3 conditions
 PILOT_TASKS_COUNT: int = len(PILOT_TASK_IDS)  # 3
 
-# Per-condition request budgets for Ollama pilot
+# Per-condition request budgets for Ollama pilot (Protocol v1)
 MAX_REQUESTS_PER_CONDITION_A: int = 1
 MAX_REQUESTS_PER_CONDITION_B: int = 1
 MAX_REQUESTS_PER_CONDITION_C: int = 4
@@ -99,6 +99,14 @@ MAX_THEORETICAL_TOTAL_REQUESTS: int = PILOT_TASKS_COUNT * (
 
 MAX_TOTAL_PROVIDER_REQUESTS: int = 20
 GLOBAL_REQUEST_CEILING: int = MAX_TOTAL_PROVIDER_REQUESTS
+
+# Protocol v2 budgets
+PROTOCOL_V2_MAX_REQUESTS_PER_CONDITION_C: int = 6
+PROTOCOL_V2_MAX_INSPECTIONS_PER_CONDITION_C: int = 5
+PROTOCOL_V2_MAX_THEORETICAL_TOTAL_REQUESTS: int = PILOT_TASKS_COUNT * (
+    MAX_REQUESTS_PER_CONDITION_A + MAX_REQUESTS_PER_CONDITION_B + PROTOCOL_V2_MAX_REQUESTS_PER_CONDITION_C
+)  # 3 * (1 + 1 + 6) = 24 requests
+PROTOCOL_V2_GLOBAL_REQUEST_CEILING: int = 28
 DEFAULT_OUTPUT_TOKEN_CEILING: int = 2048
 PILOT_MODEL: str = "qwen3.5:0.8b"
 DEFAULT_BASE_URL: str = "http://localhost:11434/v1"
@@ -234,6 +242,14 @@ class OllamaPilotRequestGuardrailProvider:
     @property
     def sdk_version(self) -> Optional[str]:
         return getattr(self.provider, "sdk_version", None)
+
+    @property
+    def is_execution_lock_enabled(self) -> bool:
+        return getattr(self.provider, "is_execution_lock_enabled", False)
+
+    @property
+    def effective_reasoning_effort(self) -> Optional[str]:
+        return getattr(self.provider, "effective_reasoning_effort", None)
 
     def complete(
         self,
@@ -497,9 +513,25 @@ def run_ollama_pilot_dry_run(
     tasks_path: Union[str, Path] = "data/tasks.jsonl",
     output_dir: Optional[Union[str, Path]] = None,
     provider: Optional[LLMProvider] = None,
-    max_requests: int = MAX_TOTAL_PROVIDER_REQUESTS,
+    max_requests: Optional[int] = None,
+    protocol_version: str = "v1",
 ) -> Dict[str, Any]:
     """Execute simulated 9-run pilot offline with deterministic mock data."""
+    if protocol_version == "v2":
+        effective_max_requests = max_requests if max_requests is not None else PROTOCOL_V2_GLOBAL_REQUEST_CEILING
+        c_requests = PROTOCOL_V2_MAX_REQUESTS_PER_CONDITION_C
+        c_inspections = PROTOCOL_V2_MAX_INSPECTIONS_PER_CONDITION_C
+        config_version = "protocol-v2-ollama-pilot-dry-run"
+        default_dir_name = "protocol_v2_pilot"
+        theoretical_total = PROTOCOL_V2_MAX_THEORETICAL_TOTAL_REQUESTS
+    else:
+        effective_max_requests = max_requests if max_requests is not None else MAX_TOTAL_PROVIDER_REQUESTS
+        c_requests = MAX_REQUESTS_PER_CONDITION_C
+        c_inspections = MAX_INSPECTIONS_PER_CONDITION_C
+        config_version = "phase6.5-ollama-pilot-dry-run"
+        default_dir_name = "phase6_5_ollama_pilot"
+        theoretical_total = MAX_THEORETICAL_TOTAL_REQUESTS
+
     ingredients, catalog = load_catalog_from_json(catalog_path)
     fixtures = load_plan_fixtures(fixtures_path, catalog, ingredients)
     all_tasks = load_benchmark_tasks(tasks_path, fixtures, catalog)
@@ -512,7 +544,7 @@ def run_ollama_pilot_dry_run(
     underlying_provider = provider or create_ollama_pilot_mock_provider()
     guardrail = OllamaPilotRequestGuardrailProvider(
         provider=underlying_provider,
-        max_requests=max_requests,
+        max_requests=effective_max_requests,
     )
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -526,19 +558,20 @@ def run_ollama_pilot_dry_run(
         pricing=pricing,
         default_provider=guardrail,
         experiment_run_id=run_id,
-        experiment_config_version="phase6.5-ollama-pilot-dry-run",
+        experiment_config_version=config_version,
         provider_mode="simulated",
         model_name="mock-qwen3.5:0.8b",
-        condition_c_max_model_requests=MAX_REQUESTS_PER_CONDITION_C,
-        condition_c_max_inspections=MAX_INSPECTIONS_PER_CONDITION_C,
+        condition_c_max_model_requests=c_requests,
+        condition_c_max_inspections=c_inspections,
+        protocol_version=protocol_version,
     )
 
     records: List[RunRecord] = []
     incomplete_reason: Optional[str] = None
     for task in pilot_tasks:
         for condition in PILOT_CONDITIONS:
-            if guardrail.total_requests >= max_requests:
-                incomplete_reason = f"Request ceiling of {max_requests} reached before starting {task.task_id} condition {condition}."
+            if guardrail.total_requests >= effective_max_requests:
+                incomplete_reason = f"Request ceiling of {effective_max_requests} reached before starting {task.task_id} condition {condition}."
                 break
             try:
                 rec = runner.run_task(task=task, condition_id=condition, provider=guardrail)
@@ -552,7 +585,7 @@ def run_ollama_pilot_dry_run(
             break
 
     if output_dir is None:
-        target_dir = Path("artifacts") / "phase6_5_ollama_pilot" / run_id
+        target_dir = Path("artifacts") / default_dir_name / run_id
     else:
         target_dir = Path(output_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -566,7 +599,7 @@ def run_ollama_pilot_dry_run(
         run_id=run_id,
         is_live=False,
         guardrail=guardrail,
-        max_requests=max_requests,
+        max_requests=effective_max_requests,
         incomplete_reason=incomplete_reason,
     )
 
@@ -577,12 +610,12 @@ def run_ollama_pilot_dry_run(
         "runs_completed": len(records),
         "runs_planned": MAX_PILOT_RUNS,
         "total_provider_requests": guardrail.total_requests,
-        "max_theoretical_requests": MAX_THEORETICAL_TOTAL_REQUESTS,
-        "max_requests_per_condition_c": MAX_REQUESTS_PER_CONDITION_C,
-        "max_inspections_per_condition_c": MAX_INSPECTIONS_PER_CONDITION_C,
-        "max_requests_ceiling": max_requests,
-        "global_request_ceiling": MAX_TOTAL_PROVIDER_REQUESTS,
-        "ceiling_reached": not is_complete and (guardrail.total_requests >= max_requests or "ceiling" in (incomplete_reason or "").lower()),
+        "max_theoretical_requests": theoretical_total,
+        "max_requests_per_condition_c": c_requests,
+        "max_inspections_per_condition_c": c_inspections,
+        "max_requests_ceiling": effective_max_requests,
+        "global_request_ceiling": effective_max_requests,
+        "ceiling_reached": not is_complete and (guardrail.total_requests >= effective_max_requests or "ceiling" in (incomplete_reason or "").lower()),
         "network_calls_made": 0,
         "output_directory": str(target_dir),
         "artifacts": {
@@ -606,9 +639,10 @@ def run_live_ollama_pilot(
     output_dir: Optional[Union[str, Path]] = None,
     live: bool = False,
     confirm_live: bool = False,
-    max_requests: int = MAX_TOTAL_PROVIDER_REQUESTS,
+    max_requests: Optional[int] = None,
     client: Optional[Any] = None,
     probe_fn: Optional[Callable[[str], Dict[str, Any]]] = None,
+    protocol_version: str = "v1",
 ) -> Dict[str, Any]:
     """Execute live Ollama pilot with strict dual-flag confirmation and request ceilings."""
     if not (live and confirm_live):
@@ -617,6 +651,21 @@ def run_live_ollama_pilot(
             "both --live and --confirm-live flags must be supplied. "
             "Cleanly aborting to prevent unintended model execution."
         )
+
+    if protocol_version == "v2":
+        effective_max_requests = max_requests if max_requests is not None else PROTOCOL_V2_GLOBAL_REQUEST_CEILING
+        c_requests = PROTOCOL_V2_MAX_REQUESTS_PER_CONDITION_C
+        c_inspections = PROTOCOL_V2_MAX_INSPECTIONS_PER_CONDITION_C
+        config_version = "protocol-v2-ollama-live-pilot"
+        default_dir_name = "protocol_v2_pilot"
+        theoretical_total = PROTOCOL_V2_MAX_THEORETICAL_TOTAL_REQUESTS
+    else:
+        effective_max_requests = max_requests if max_requests is not None else MAX_TOTAL_PROVIDER_REQUESTS
+        c_requests = MAX_REQUESTS_PER_CONDITION_C
+        c_inspections = MAX_INSPECTIONS_PER_CONDITION_C
+        config_version = "phase6.5-ollama-live-pilot"
+        default_dir_name = "phase6_5_ollama_pilot"
+        theoretical_total = MAX_THEORETICAL_TOTAL_REQUESTS
 
     # 1. Preflight validation
     preflight = run_ollama_pilot_preflight(
@@ -650,7 +699,7 @@ def run_live_ollama_pilot(
 
     guardrail = OllamaPilotRequestGuardrailProvider(
         provider=base_provider,
-        max_requests=max_requests,
+        max_requests=effective_max_requests,
     )
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -664,19 +713,20 @@ def run_live_ollama_pilot(
         pricing=pricing,
         default_provider=guardrail,
         experiment_run_id=run_id,
-        experiment_config_version="phase6.5-ollama-live-pilot",
+        experiment_config_version=config_version,
         provider_mode="live",
         model_name=PILOT_MODEL,
-        condition_c_max_model_requests=MAX_REQUESTS_PER_CONDITION_C,
-        condition_c_max_inspections=MAX_INSPECTIONS_PER_CONDITION_C,
+        condition_c_max_model_requests=c_requests,
+        condition_c_max_inspections=c_inspections,
+        protocol_version=protocol_version,
     )
 
     records: List[RunRecord] = []
     incomplete_reason: Optional[str] = None
     for task in pilot_tasks:
         for condition in PILOT_CONDITIONS:
-            if guardrail.total_requests >= max_requests:
-                incomplete_reason = f"Request ceiling of {max_requests} reached before starting {task.task_id} condition {condition}."
+            if guardrail.total_requests >= effective_max_requests:
+                incomplete_reason = f"Request ceiling of {effective_max_requests} reached before starting {task.task_id} condition {condition}."
                 break
             try:
                 rec = runner.run_task(task=task, condition_id=condition, provider=guardrail)
@@ -690,7 +740,7 @@ def run_live_ollama_pilot(
             break
 
     if output_dir is None:
-        target_dir = Path("artifacts") / "phase6_5_ollama_pilot" / run_id
+        target_dir = Path("artifacts") / default_dir_name / run_id
     else:
         target_dir = Path(output_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -704,7 +754,7 @@ def run_live_ollama_pilot(
         run_id=run_id,
         is_live=True,
         guardrail=guardrail,
-        max_requests=max_requests,
+        max_requests=effective_max_requests,
         incomplete_reason=incomplete_reason,
     )
 
@@ -715,12 +765,12 @@ def run_live_ollama_pilot(
         "runs_completed": len(records),
         "runs_planned": MAX_PILOT_RUNS,
         "total_provider_requests": guardrail.total_requests,
-        "max_theoretical_requests": MAX_THEORETICAL_TOTAL_REQUESTS,
-        "max_requests_per_condition_c": MAX_REQUESTS_PER_CONDITION_C,
-        "max_inspections_per_condition_c": MAX_INSPECTIONS_PER_CONDITION_C,
-        "max_requests_ceiling": max_requests,
-        "global_request_ceiling": MAX_TOTAL_PROVIDER_REQUESTS,
-        "ceiling_reached": not is_complete and (guardrail.total_requests >= max_requests or "ceiling" in (incomplete_reason or "").lower()),
+        "max_theoretical_requests": theoretical_total,
+        "max_requests_per_condition_c": c_requests,
+        "max_inspections_per_condition_c": c_inspections,
+        "max_requests_ceiling": effective_max_requests,
+        "global_request_ceiling": effective_max_requests,
+        "ceiling_reached": not is_complete and (guardrail.total_requests >= effective_max_requests or "ceiling" in (incomplete_reason or "").lower()),
         "cumulative_tokens": {
             "input": guardrail.cumulative_input_tokens,
             "output": guardrail.cumulative_output_tokens,
