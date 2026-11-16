@@ -164,6 +164,7 @@ class MockAgent(BaseAgent):
                     "day": "Wednesday",
                     "meal_type": "dinner",
                     "recipe_id": "rec_nonexistent",
+                    "servings": 2,
                 },
                 reason="Test rejection of nonexistent recipe ID.",
                 expected_plan_version=plan_version,
@@ -183,6 +184,7 @@ class MockAgent(BaseAgent):
                     "day": "Wednesday",
                     "meal_type": "breakfast",
                     "recipe_id": "rec_peanut_butter_banana_toast",
+                    "servings": 2,
                 },
                 reason="Test rejection of allergen-conflicting recipe.",
                 expected_plan_version=plan_version,
@@ -202,6 +204,7 @@ class MockAgent(BaseAgent):
                     "day": "Wednesday",
                     "meal_type": "dinner",
                     "recipe_id": "rec_pan_seared_salmon",
+                    "servings": 2,
                 },
                 reason="Test rejection of budget-overflow recipe.",
                 expected_plan_version=plan_version,
@@ -221,6 +224,7 @@ class MockAgent(BaseAgent):
                     "day": "Wednesday",
                     "meal_type": "dinner",
                     "recipe_id": "rec_red_lentil_dahl",
+                    "servings": 4,
                 },
                 reason="Test rejection of stale plan version.",
                 expected_plan_version=plan_version + 999,
@@ -297,6 +301,13 @@ class MockAgent(BaseAgent):
             }
             if servings_val is not None:
                 arguments["servings"] = servings_val
+            else:
+                current_meal = getattr(context, "plan", None)
+                if current_meal and hasattr(current_meal, "get_meal"):
+                    cm = current_meal.get_meal(day_str, slot_str)
+                    arguments["servings"] = cm.servings if cm else 2
+                else:
+                    arguments["servings"] = 2
 
             prop = ActionProposal(
                 operation=OperationType.REPLACE_MEAL,
@@ -373,12 +384,20 @@ class MockAgent(BaseAgent):
             chosen_recipe = matching[0]
             chosen_id = chosen_recipe["recipe_id"]
 
+            current_meal = getattr(context, "plan", None)
+            if current_meal and hasattr(current_meal, "get_meal"):
+                cm = current_meal.get_meal(day_str, slot_str)
+                servings_resolved = cm.servings if cm else chosen_recipe.get("default_servings", 2)
+            else:
+                servings_resolved = chosen_recipe.get("default_servings", 2)
+
             prop = ActionProposal(
                 operation=OperationType.REPLACE_MEAL,
                 arguments={
                     "day": day_str,
                     "meal_type": slot_str,
                     "recipe_id": chosen_id,
+                    "servings": servings_resolved,
                 },
                 reason=f"Replace {day_str} {slot_str} with {tag_str} recipe {chosen_id}.",
                 expected_plan_version=plan_version,

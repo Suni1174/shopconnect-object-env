@@ -106,6 +106,7 @@ def test_other_slots_remain_unchanged(sample_plan, catalog_data):
         meal_type="dinner",
         recipe_id="rec_pan_seared_salmon",
         catalog=recipes,
+        servings=2,
     )
 
     # Check that Monday breakfast, Monday dinner, Tuesday lunch, and Friday dinner are untouched
@@ -239,6 +240,17 @@ def test_invalid_serving_counts(sample_plan, catalog_data):
     # Boolean or float servings
     with pytest.raises(ValueError, match="positive integer"):
         apply_change_servings(sample_plan, "Wednesday", "dinner", servings=True)  # type: ignore
+
+    # Missing / None servings
+    with pytest.raises(ValueError, match="Explicit servings must be provided"):
+        apply_replace_meal(
+            plan=sample_plan,
+            day="Wednesday",
+            meal_type="dinner",
+            recipe_id="rec_pan_seared_salmon",
+            catalog=recipes,
+            servings=None,
+        )
 
 
 # 9. Confirming original plan is unchanged when an operation fails

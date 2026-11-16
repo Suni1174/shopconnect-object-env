@@ -95,6 +95,31 @@ def test_successful_meal_replacement(broker):
     assert "ing_whole_wheat_pasta" in committed_basket.items
 
 
+def test_replace_meal_missing_servings_rejected_by_broker(broker):
+    """Verify that a replace_meal proposal with omitted servings is rejected and never commits."""
+    initial_version = broker.get_plan_version()
+    initial_plan = copy.deepcopy(broker.get_plan())
+    initial_basket = copy.deepcopy(broker.get_basket())
+
+    proposal = {
+        "operation": "replace_meal",
+        "arguments": {
+            "day": "Wednesday",
+            "meal_type": "dinner",
+            "recipe_id": "rec_tomato_spinach_pasta",
+            # "servings" deliberately omitted
+        },
+        "reason": "Swap soup for pasta without servings",
+        "expected_plan_version": initial_version,
+    }
+
+    result = broker.execute(proposal)
+    assert result.status == ActionStatus.REJECTED
+    assert broker.get_plan_version() == initial_version
+    assert broker.get_plan().meals == initial_plan.meals
+    assert broker.get_basket().items == initial_basket.items
+
+
 def test_successful_serving_update(broker):
     """Verify that changing servings commits, updates version, and recalculates basket."""
     proposal = {

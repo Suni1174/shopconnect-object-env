@@ -56,16 +56,19 @@ def apply_replace_meal(
     target_recipe = catalog[recipe_id]
 
     # 3. Resolve and validate servings
-    resolved_servings = (
-        target_recipe.default_servings if servings is None else servings
-    )
+    if servings is None:
+        raise ValueError(
+            "Explicit servings must be provided for replace_meal. Omitted servings cannot default."
+        )
+    resolved_servings = servings
     if (
         not isinstance(resolved_servings, int)
         or isinstance(resolved_servings, bool)
         or resolved_servings <= 0
+        or resolved_servings > 20
     ):
         raise ValueError(
-            f"Servings must be a positive integer, got: {resolved_servings!r}."
+            f"Servings must be a positive integer between 1 and 20, got: {resolved_servings!r}."
         )
 
     # 4. Clone state to prevent accidental mutation of the original plan

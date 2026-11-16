@@ -17,6 +17,7 @@ Enforces:
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -55,6 +56,15 @@ def _extract_plan_version(serialized_context: str) -> Optional[int]:
     return v
 
 
+def _provider_supports_parallel_tool_calls(provider: Any) -> bool:
+    """Check if provider complete method explicitly accepts parallel_tool_calls."""
+    try:
+        sig = inspect.signature(provider.complete)
+        return "parallel_tool_calls" in sig.parameters
+    except Exception:
+        return False
+
+
 def get_condition_c_tools(terminal_only: bool = False) -> List[Dict[str, Any]]:
     """Return tool specifications for Condition C: selective inspection and action proposals.
 
@@ -81,11 +91,14 @@ def get_condition_c_tools(terminal_only: bool = False) -> List[Dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "inspect_recipe",
-                "description": "Inspect recipe metadata, tags, default servings, and estimated cost.",
+                "description": "Inspect recipe metadata, tags, default servings, and estimated cost. Requires 'recipe_id'.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "recipe_id": {"type": "string", "description": "Canonical recipe ID (e.g. 'rec_berry_oatmeal')"},
+                        "recipe_id": {
+                            "type": "string",
+                            "description": "Canonical recipe ID from catalog (e.g. 'rec_berry_oatmeal', 'rec_tomato_spinach_pasta'). REQUIRED. Must not be empty.",
+                        },
                     },
                     "required": ["recipe_id"],
                 },
@@ -95,11 +108,14 @@ def get_condition_c_tools(terminal_only: bool = False) -> List[Dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "inspect_recipe_ingredients",
-                "description": "Inspect ingredient requirements and scaled quantities for a recipe.",
+                "description": "Inspect ingredient requirements and scaled quantities for a recipe. Requires 'recipe_id'.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "recipe_id": {"type": "string", "description": "Canonical recipe ID"},
+                        "recipe_id": {
+                            "type": "string",
+                            "description": "Canonical recipe ID from catalog (e.g. 'rec_peanut_butter_banana_toast'). REQUIRED. Must not be empty.",
+                        },
                     },
                     "required": ["recipe_id"],
                 },
@@ -148,16 +164,16 @@ def get_condition_c_tools(terminal_only: bool = False) -> List[Dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "propose_replace_meal",
-                "description": "Submit a final proposal to replace a meal slot with a specific recipe.",
+                "description": "Submit a final proposal to replace a meal slot with a specific recipe and explicit serving count.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "day": {"type": "string", "description": "Day of the week (e.g. 'Wednesday')"},
                         "meal_type": {"type": "string", "enum": ["breakfast", "lunch", "dinner"]},
-                        "recipe_id": {"type": "string", "description": "Replacement recipe ID"},
-                        "servings": {"type": "integer", "description": "Optional servings count (1-20)"},
+                        "recipe_id": {"type": "string", "description": "Replacement recipe ID (e.g. 'rec_tomato_spinach_pasta')"},
+                        "servings": {"type": "integer", "description": "Explicit target serving count (positive integer between 1 and 20, e.g. 2 or 4). REQUIRED."},
                     },
-                    "required": ["day", "meal_type", "recipe_id"],
+                    "required": ["day", "meal_type", "recipe_id", "servings"],
                 },
             },
         },
@@ -181,16 +197,20 @@ def get_condition_c_tools(terminal_only: bool = False) -> List[Dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "finalize_no_action",
-                "description": "Finalize the task with no state mutation (e.g. when constraints prevent action).",
+                "description": "Finalize the task with no state mutation when constraints, dietary restrictions, or allergen conflicts prevent action. BOTH 'rejection_category' and 'reason' are strictly REQUIRED.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "rejection_category": {
                             "type": "string",
                             "enum": [c.value for c in RejectionCategory],
-                            "description": "Taxonomic category of rejection.",
+                            "description": (
+                                "Taxonomic category of rejection. REQUIRED. Must be one of: "
+                                + ", ".join(f"'{c.value}'" for c in RejectionCategory)
+                                + ". (e.g. 'allergen_conflict' for allergy violations, 'dietary_restriction_conflict' for diet conflicts, 'budget_exceeded' for budget limits)."
+                            ),
                         },
-                        "reason": {"type": "string", "description": "Reason why no action was proposed or why request is rejected"},
+                        "reason": {"type": "string", "description": "Specific explanatory reason why no action was proposed or why request is rejected. REQUIRED."},
                     },
                     "required": ["rejection_category", "reason"],
                 },
@@ -279,10 +299,11 @@ class ConditionCAgent(BaseAgent):
                     f"User Request:\n{context.task_prompt}\n\n"
                     f"Context Signatures & Initial Summary:\n{context.serialized_context}\n\n"
                     "Instructions:\n"
-                    "1. Use inspection tools to query specific slots, recipes, or preferences on demand.\n"
-                    "2. When you have resolved the task, call propose_replace_meal or propose_change_servings.\n"
-                    "3. If the task cannot be accomplished or violates rules, call finalize_no_action.\n"
-                    "4. If the task is ambiguous or missing required parameters, call finalize_clarification."
+                    "1. Use inspection tools to query specific slots, recipes, or preferences on demand (e.g. inspect_recipe requires 'recipe_id').\n"
+                    "2. When proposing a meal replacement, call propose_replace_meal with 'day', 'meal_type', 'recipe_id', and explicit 'servings'.\n"
+                    "3. When changing servings, call propose_change_servings with 'day', 'meal_type', and 'servings'.\n"
+                    "4. If the task cannot be accomplished or violates rules/allergies, call finalize_no_action with BOTH 'rejection_category' (e.g. 'allergen_conflict') and 'reason'.\n"
+                    "5. If the task is ambiguous or missing required parameters, call finalize_clarification with 'question'."
                 ),
             ),
         ]
@@ -325,7 +346,38 @@ class ConditionCAgent(BaseAgent):
             )
             current_tools = get_condition_c_tools(terminal_only=use_terminal_only)
 
-            completion = self.provider.complete(messages=messages, tools=current_tools, tool_choice="auto")
+            complete_kwargs: Dict[str, Any] = {
+                "messages": messages,
+                "tools": current_tools,
+                "tool_choice": "auto",
+            }
+            if _provider_supports_parallel_tool_calls(self.provider):
+                complete_kwargs["parallel_tool_calls"] = False
+
+            try:
+                completion = self.provider.complete(**complete_kwargs)
+            except Exception as exc:
+                aggregated_usage = aggregate_usages(usages) if usages else None
+                return AgentResponse(
+                    proposal=None,
+                    rationale=f"Agent exception during interaction: {exc}",
+                    raw_output=last_raw_output,
+                    metadata={
+                        "condition_id": "C",
+                        "plan_version": plan_version,
+                        "status": "error",
+                        "error": str(exc),
+                        "total_model_requests": provider_requests,
+                        "usage": usage_to_dict(aggregated_usage) if aggregated_usage else None,
+                        "model_identifier": model_ids[-1] if model_ids else None,
+                        "system_fingerprint": fingerprints[-1] if fingerprints else None,
+                        "provider_request_ids": tuple(request_ids),
+                        "per_request_latencies_ms": tuple(latencies),
+                        "distinct_inspections": distinct_inspections,
+                        "cache_hits": cache_hits,
+                        "inspection_steps": inspection_steps,
+                    },
+                )
             last_raw_output = completion.message.content or ""
             usages.append(completion.usage)
             if completion.provider_request_id:
@@ -389,8 +441,9 @@ class ConditionCAgent(BaseAgent):
                         "day": val_args.day,
                         "meal_type": val_args.meal_type,
                         "recipe_id": val_args.recipe_id,
+                        "servings": val_args.servings,
                     },
-                    reason=f"Condition C propose_replace_meal({val_args.day}, {val_args.meal_type}, {val_args.recipe_id})",
+                    reason=f"Condition C propose_replace_meal({val_args.day}, {val_args.meal_type}, {val_args.recipe_id}, servings={val_args.servings})",
                     expected_plan_version=plan_version,
                 )
                 final_rationale = final_proposal.reason
@@ -418,15 +471,22 @@ class ConditionCAgent(BaseAgent):
                 break
 
             elif tool_name == "finalize_no_action":
-                reason = str(args_dict.get("reason", "Agent concluded no action should be taken.")).strip() or "Agent concluded no action should be taken."
+                reason = str(args_dict.get("reason", "")).strip()
                 cat_raw = args_dict.get("rejection_category")
-                if cat_raw:
-                    try:
-                        rejection_category = RejectionCategory(str(cat_raw).strip()).value
-                    except ValueError:
-                        rejection_category = "other"
-                else:
-                    rejection_category = "other"
+                if not reason or not cat_raw:
+                    invalid_tool_responses += 1
+                    final_rationale = (
+                        "Invalid finalize_no_action invocation: 'rejection_category' and 'reason' are required."
+                    )
+                    break
+                try:
+                    rejection_category = RejectionCategory(str(cat_raw).strip()).value
+                except ValueError:
+                    invalid_tool_responses += 1
+                    final_rationale = (
+                        f"Invalid rejection_category: '{cat_raw}'. Must be one of {[c.value for c in RejectionCategory]}."
+                    )
+                    break
                 agent_initiated_rejection = True
                 final_rationale = reason
                 break

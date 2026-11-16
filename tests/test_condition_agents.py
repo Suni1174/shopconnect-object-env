@@ -19,7 +19,7 @@ import pytest
 from shopconnect_env.agents.condition_a_agent import ConditionAAgent
 from shopconnect_env.agents.condition_b_agent import ConditionBAgent
 from shopconnect_env.agents.condition_c_agent import ConditionCAgent
-from shopconnect_env.agents.providers import LLMCompletionResult, LLMMessage, LLMUsage, MockLLMProvider
+from shopconnect_env.agents.providers import LLMCompletionResult, LLMMessage, LLMProvider, LLMUsage, MockLLMProvider
 from shopconnect_env.context.base import ContextRequest
 from shopconnect_env.context.full_state import FullStateContextBuilder
 from shopconnect_env.context.object_context import ObjectContextBuilder
@@ -395,6 +395,7 @@ def test_condition_b_valid_function_call(catalog_data, broker):
                 "day": "Wednesday",
                 "meal_type": "dinner",
                 "recipe_id": "rec_hearty_veggie_soup",
+                "servings": 4,
             }),
         },
     }
@@ -476,7 +477,7 @@ def test_condition_b_multiple_function_calls(catalog_data, broker):
         "id": "call_01",
         "call_id": "call_01",
         "name": "replace_meal",
-        "function": {"name": "replace_meal", "arguments": json.dumps({"day": "Wednesday", "meal_type": "dinner", "recipe_id": "rec_hearty_veggie_soup"})},
+        "function": {"name": "replace_meal", "arguments": json.dumps({"day": "Wednesday", "meal_type": "dinner", "recipe_id": "rec_hearty_veggie_soup", "servings": 4})},
     }
     call_2 = {
         "id": "call_02",
@@ -616,6 +617,7 @@ def test_condition_b_broker_policy_rejection(catalog_data, broker):
                 "day": "Monday",
                 "meal_type": "breakfast",
                 "recipe_id": "rec_peanut_butter_banana_toast",
+                "servings": 2,
             }),
         },
     }
@@ -686,6 +688,7 @@ def test_condition_c_successful_one_inspection_interaction(catalog_data, broker)
                             "day": "Wednesday",
                             "meal_type": "dinner",
                             "recipe_id": "rec_hearty_veggie_soup",
+                            "servings": 4,
                         }),
                     },
                 },
@@ -903,7 +906,7 @@ def test_condition_c_unknown_object_inspection(catalog_data, broker):
                 "id": "c_fin",
                 "call_id": "c_fin",
                 "name": "finalize_no_action",
-                "function": {"name": "finalize_no_action", "arguments": json.dumps({"reason": "Recipe not found"})},
+                "function": {"name": "finalize_no_action", "arguments": json.dumps({"rejection_category": "other", "reason": "Recipe not found"})},
             },),
         ),
         usage=None,
@@ -948,6 +951,7 @@ def test_condition_c_rejected_proposal_leaves_plan_and_basket_unchanged(catalog_
                         "day": "Monday",
                         "meal_type": "breakfast",
                         "recipe_id": "rec_peanut_butter_banana_toast",
+                        "servings": 2,
                     }),
                 },
             },),
@@ -1018,6 +1022,7 @@ def test_condition_c_multiple_inspections_in_single_response(catalog_data, broke
                         "day": "Wednesday",
                         "meal_type": "dinner",
                         "recipe_id": "rec_hearty_veggie_soup",
+                        "servings": 4,
                     }),
                 },
             },),
@@ -1193,7 +1198,7 @@ def test_stale_plan_version_rejection_across_conditions(catalog_data, broker):
         "id": "c_b_stale",
         "call_id": "c_b_stale",
         "name": "replace_meal",
-        "function": {"name": "replace_meal", "arguments": json.dumps({"day": "Wednesday", "meal_type": "dinner", "recipe_id": "rec_hearty_veggie_soup"})},
+        "function": {"name": "replace_meal", "arguments": json.dumps({"day": "Wednesday", "meal_type": "dinner", "recipe_id": "rec_hearty_veggie_soup", "servings": 4})},
     }
     agent_b = ConditionBAgent(
         provider=MockLLMProvider(
@@ -1216,7 +1221,7 @@ def test_stale_plan_version_rejection_across_conditions(catalog_data, broker):
         "id": "c_c_stale",
         "call_id": "c_c_stale",
         "name": "propose_replace_meal",
-        "function": {"name": "propose_replace_meal", "arguments": json.dumps({"day": "Wednesday", "meal_type": "dinner", "recipe_id": "rec_hearty_veggie_soup"})},
+        "function": {"name": "propose_replace_meal", "arguments": json.dumps({"day": "Wednesday", "meal_type": "dinner", "recipe_id": "rec_hearty_veggie_soup", "servings": 4})},
     }
     agent_c = ConditionCAgent(
         provider=MockLLMProvider(
@@ -1235,3 +1240,104 @@ def test_stale_plan_version_rejection_across_conditions(catalog_data, broker):
     assert broker.get_plan_version() == 2
     assert broker.get_plan().meals == plan_v2.meals
     assert broker.get_basket().items == basket_v2.items
+
+
+def test_condition_c_preserves_partial_usage_on_turn_failure(catalog_data, broker):
+    """Verify that when a Condition C interaction fails on turn N, partial usage from turns 1..N-1 is preserved."""
+    ingredients, recipes = catalog_data
+    builder = ObjectContextBuilder()
+    req = ContextRequest(
+        user_request="Replace Monday breakfast with peanut toast for 2 servings.",
+        plan=broker.get_plan(),
+        catalog=recipes,
+        ingredients=ingredients,
+    )
+    context = builder.build(req)
+
+    # Turn 1 succeeds with usage
+    turn_1 = LLMCompletionResult(
+        message=LLMMessage(
+            role="assistant",
+            tool_calls=({
+                "id": "c_insp",
+                "call_id": "c_insp",
+                "name": "inspect_recipe",
+                "function": {
+                    "name": "inspect_recipe",
+                    "arguments": json.dumps({"recipe_id": "rec_peanut_butter_banana_toast"}),
+                },
+            },),
+        ),
+        usage=LLMUsage(input_tokens=500, output_tokens=25, total_tokens=525, is_provider_reported=True),
+        provider_request_id="req_turn1",
+        model_identifier="mock-c",
+        latency_ms=120.0,
+    )
+
+    class FailingOnSecondTurnProvider(LLMProvider):
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return turn_1
+            raise RuntimeError("Groq API 400 Bad Request: missing property rejection_category")
+
+    agent = ConditionCAgent(provider=FailingOnSecondTurnProvider())
+    response = agent.propose_action(context, inspector=builder)
+
+    assert response.metadata["status"] == "error"
+    assert "missing property rejection_category" in response.metadata["error"]
+    assert response.metadata["total_model_requests"] == 2
+    assert response.metadata["provider_request_ids"] == ("req_turn1",)
+    assert response.metadata["per_request_latencies_ms"] == (120.0,)
+    # Crucial regression invariant: partial usage from turn 1 must be preserved
+    assert response.metadata["usage"] is not None
+    assert response.metadata["usage"]["input_tokens"] == 500
+    assert response.metadata["usage"]["output_tokens"] == 25
+    assert response.metadata["usage"]["total_tokens"] == 525
+    assert response.metadata["usage"]["is_provider_reported"] is True
+    assert isinstance(response.metadata_dict["usage"], dict)
+
+
+def test_condition_c_finalize_no_action_requires_category_and_reason(catalog_data, broker):
+    """Verify that finalize_no_action requires non-empty rejection_category and reason and does not default to 'other'."""
+    ingredients, recipes = catalog_data
+    builder = ObjectContextBuilder()
+    req = ContextRequest(
+        user_request="Replace Monday breakfast with peanut toast.",
+        plan=broker.get_plan(),
+        catalog=recipes,
+        ingredients=ingredients,
+    )
+    context = builder.build(req)
+
+    # Missing rejection_category
+    bad_call = {
+        "id": "c_fail",
+        "call_id": "c_fail",
+        "name": "finalize_no_action",
+        "function": {
+            "name": "finalize_no_action",
+            "arguments": json.dumps({"reason": "Peanut allergy conflict"}),  # missing rejection_category
+        },
+    }
+
+    mock_provider = MockLLMProvider(
+        responses=[
+            LLMCompletionResult(
+                message=LLMMessage(role="assistant", tool_calls=(bad_call,)),
+                usage=None,
+                model_identifier="mock-c",
+            )
+        ]
+    )
+
+    agent = ConditionCAgent(provider=mock_provider)
+    response = agent.propose_action(context, inspector=builder)
+
+    # Must be recorded as invalid_tool_responses and not accepted as valid agent_rejected with 'other'
+    assert response.metadata["invalid_tool_responses"] == 1
+    assert response.metadata["agent_initiated_rejection"] is False
+    assert "rejection_category" in response.rationale.lower()

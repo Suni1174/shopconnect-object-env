@@ -130,11 +130,18 @@ def test_invalid_day_and_meal_type():
     """Verify that invalid days and meal slots are rejected."""
     # Invalid day
     with pytest.raises(ValidationError):
-        ReplaceMealArgs(day="Funday", meal_type="dinner", recipe_id="rec_01")
+        ReplaceMealArgs(day="Funday", meal_type="dinner", recipe_id="rec_01", servings=2)
 
     # Invalid meal slot
     with pytest.raises(ValidationError):
-        ReplaceMealArgs(day="Monday", meal_type="midnight_snack", recipe_id="rec_01")
+        ReplaceMealArgs(day="Monday", meal_type="midnight_snack", recipe_id="rec_01", servings=2)
+
+
+def test_replace_meal_missing_servings_rejected():
+    """Verify that omitted servings in ReplaceMealArgs raises ValidationError."""
+    with pytest.raises(ValidationError) as exc_info:
+        ReplaceMealArgs(day="Wednesday", meal_type="dinner", recipe_id="rec_01")  # type: ignore
+    assert "servings" in str(exc_info.value)
 
 
 def test_zero_and_negative_servings_rejected():

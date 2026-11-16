@@ -276,10 +276,11 @@ class LLMProvider(Protocol):
         self,
         messages: List[LLMMessage],
         tools: Optional[List[Dict[str, Any]]] = None,
-        tool_choice: Optional[str] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         response_format: Optional[Dict[str, Any]] = None,
         reasoning_effort: str = "low",
         max_output_tokens: Optional[int] = None,
+        parallel_tool_calls: Optional[bool] = None,
         **kwargs: Any,
     ) -> LLMCompletionResult:
         """Execute a completion request against the underlying model.
@@ -351,10 +352,11 @@ class MockLLMProvider:
         self,
         messages: List[LLMMessage],
         tools: Optional[List[Dict[str, Any]]] = None,
-        tool_choice: Optional[str] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         response_format: Optional[Dict[str, Any]] = None,
         reasoning_effort: str = "low",
         max_output_tokens: Optional[int] = None,
+        parallel_tool_calls: Optional[bool] = None,
         **kwargs: Any,
     ) -> LLMCompletionResult:
         """Return a deterministic completion without network access."""
@@ -1712,10 +1714,11 @@ class OpenRouterProvider:
         self,
         messages: List[LLMMessage],
         tools: Optional[List[Dict[str, Any]]] = None,
-        tool_choice: Optional[str] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         response_format: Optional[Dict[str, Any]] = None,
         reasoning_effort: str = "low",
         max_output_tokens: Optional[int] = None,
+        parallel_tool_calls: Optional[bool] = None,
         **kwargs: Any,
     ) -> LLMCompletionResult:
         """Execute completion request against OpenRouter Chat Completions API."""
@@ -1972,3 +1975,243 @@ class OllamaProvider:
             raise TimeoutError(f"Local Ollama inference request timed out after {self.timeout_seconds}s.") from exc
 
         raise ProviderError(f"Ollama local provider error ({exc_type}): {exc}") from exc
+
+
+# =============================================================================
+# 10. GROQ CLOUD INFERENCE PROVIDER ADAPTER
+# =============================================================================
+
+class GroqProvider:
+    """Provider adapter connecting to Groq Cloud OpenAI-compatible Chat Completions API.
+
+    Enforces research integrity:
+    - Target model: 'qwen/qwen3.8-27b'.
+    - Base URL: 'https://api.groq.com/openai/v1'.
+    - Credentials loaded strictly from GROQ_API_KEY environment variable.
+    - Zero automatic SDK retries (max_retries=0).
+    - Secrets never logged, echoed, or exposed in exceptions.
+    - Uses OpenAI-compatible Chat Completions interface.
+    - Full support for Condition A (JSON output), Condition B (tools), Condition C (multi-turn tools).
+    - Supports dependency injection of client for 100% offline unit testing.
+    """
+
+    DEFAULT_MODEL: str = "qwen/qwen3.8-27b"
+    DEFAULT_BASE_URL: str = "https://api.groq.com/openai/v1"
+    DEFAULT_OUTPUT_TOKEN_CEILING: int = 2048
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: str = DEFAULT_MODEL,
+        base_url: str = DEFAULT_BASE_URL,
+        timeout_seconds: float = 60.0,
+        client: Optional[Any] = None,
+        max_output_tokens: Optional[int] = DEFAULT_OUTPUT_TOKEN_CEILING,
+        max_retries: int = 0,
+    ) -> None:
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.timeout_seconds = timeout_seconds
+        self._explicit_api_key = api_key
+        self._injected_client = client
+        self._client: Optional[Any] = client
+        self.max_output_tokens = max_output_tokens
+        self.max_retries = max_retries
+        self._last_response_headers: Dict[str, str] = {}
+
+    def __repr__(self) -> str:
+        """Return safe string representation without exposing API credentials."""
+        return f"GroqProvider(model={self.model!r}, base_url={self.base_url!r})"
+
+    def _get_client(self) -> Any:
+        """Obtain or lazily instantiate OpenAI client targeting Groq base URL."""
+        if self._client is not None:
+            return self._client
+
+        api_key = self._explicit_api_key or os.environ.get("GROQ_API_KEY")
+        if not api_key or not api_key.strip():
+            raise ConfigurationError(
+                "GROQ_API_KEY environment variable is not set. "
+                "Provide an API key or inject a client for testing."
+            )
+
+        import openai
+        self._client = openai.OpenAI(
+            base_url=self.base_url,
+            api_key=api_key.strip(),
+            timeout=self.timeout_seconds,
+            max_retries=self.max_retries,
+        )
+        return self._client
+
+    @property
+    def sdk_version(self) -> Optional[str]:
+        """Return the installed version of the underlying OpenAI SDK."""
+        try:
+            import openai
+            return getattr(openai, "__version__", None)
+        except ImportError:
+            return None
+
+    @property
+    def is_execution_lock_enabled(self) -> bool:
+        """Remote cloud provider does not require local hardware execution locking."""
+        return False
+
+    @property
+    def effective_reasoning_effort(self) -> Optional[str]:
+        """Groq provider does not configure reasoning effort."""
+        return None
+
+    @property
+    def last_response_headers(self) -> Dict[str, str]:
+        """Return lowercased HTTP response headers from the most recent request."""
+        return dict(self._last_response_headers)
+
+    @property
+    def retry_after_seconds(self) -> Optional[float]:
+        """Extract Retry-After duration in seconds from the most recent response headers."""
+        raw = self._last_response_headers.get("retry-after")
+        if not raw:
+            return None
+        try:
+            return float(raw.strip())
+        except (ValueError, TypeError):
+            return None
+
+    @property
+    def rate_limit_remaining_tokens(self) -> Optional[int]:
+        """Extract x-ratelimit-remaining-tokens from the most recent response headers."""
+        val = self._last_response_headers.get("x-ratelimit-remaining-tokens")
+        try:
+            return int(val) if val is not None else None
+        except (ValueError, TypeError):
+            return None
+
+    @property
+    def rate_limit_reset_tokens(self) -> Optional[float]:
+        """Extract x-ratelimit-reset-tokens duration in seconds from the most recent response headers."""
+        val = self._last_response_headers.get("x-ratelimit-reset-tokens")
+        if not val:
+            return None
+        v_str = str(val).strip().lower()
+        try:
+            if v_str.endswith("ms"):
+                return float(v_str[:-2]) / 1000.0
+            if v_str.endswith("s"):
+                return float(v_str[:-1])
+            if v_str.endswith("m"):
+                return float(v_str[:-1]) * 60.0
+            return float(v_str)
+        except (ValueError, TypeError):
+            return None
+
+    @property
+    def rate_limit_remaining_requests(self) -> Optional[int]:
+        """Extract x-ratelimit-remaining-requests from the most recent response headers."""
+        val = self._last_response_headers.get("x-ratelimit-remaining-requests")
+        try:
+            return int(val) if val is not None else None
+        except (ValueError, TypeError):
+            return None
+
+    @property
+    def rate_limit_reset_requests(self) -> Optional[float]:
+        """Extract x-ratelimit-reset-requests duration in seconds from the most recent response headers."""
+        val = self._last_response_headers.get("x-ratelimit-reset-requests")
+        if not val:
+            return None
+        v_str = str(val).strip().lower()
+        try:
+            if v_str.endswith("ms"):
+                return float(v_str[:-2]) / 1000.0
+            if v_str.endswith("s"):
+                return float(v_str[:-1])
+            if v_str.endswith("m"):
+                return float(v_str[:-1]) * 60.0
+            return float(v_str)
+        except (ValueError, TypeError):
+            return None
+
+    def complete(
+        self,
+        messages: List[LLMMessage],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        reasoning_effort: str = "low",
+        max_output_tokens: Optional[int] = None,
+        parallel_tool_calls: Optional[bool] = None,
+        **kwargs: Any,
+    ) -> LLMCompletionResult:
+        """Execute completion request against Groq Chat Completions API."""
+        client = self._get_client()
+        effective_max_tokens = max_output_tokens if max_output_tokens is not None else self.max_output_tokens
+
+        chat_messages = convert_to_chat_completions_messages(messages)
+        formatted_tools = convert_to_chat_completions_tools(tools)
+
+        request_kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "messages": chat_messages,
+        }
+        if effective_max_tokens is not None:
+            request_kwargs["max_tokens"] = effective_max_tokens
+
+        if formatted_tools:
+            request_kwargs["tools"] = formatted_tools
+            if parallel_tool_calls is not None:
+                request_kwargs["parallel_tool_calls"] = parallel_tool_calls
+        if tool_choice:
+            request_kwargs["tool_choice"] = tool_choice
+        if response_format:
+            request_kwargs["response_format"] = response_format
+
+        t0 = time.perf_counter()
+        try:
+            raw_response = client.chat.completions.create(**request_kwargs)
+            raw_headers = getattr(raw_response, "_headers", getattr(raw_response, "headers", {}))
+            if isinstance(raw_headers, Mapping):
+                self._last_response_headers = {str(k).lower(): str(v) for k, v in raw_headers.items()}
+            else:
+                self._last_response_headers = {}
+        except Exception as exc:
+            resp = getattr(exc, "response", None)
+            raw_headers = getattr(resp, "headers", {}) if resp else {}
+            if isinstance(raw_headers, Mapping):
+                self._last_response_headers = {str(k).lower(): str(v) for k, v in raw_headers.items()}
+            else:
+                self._last_response_headers = {}
+            self._handle_api_exception(exc)
+
+        latency_ms = (time.perf_counter() - t0) * 1000.0
+        return parse_chat_completions_response(
+            raw_response,
+            latency_ms=latency_ms,
+            default_model=self.model,
+            is_provider_reported=True,
+            deployment_mode="hosted_api",
+        )
+
+    def _handle_api_exception(self, exc: Exception) -> None:
+        """Map underlying SDK exceptions to typed ProviderError classes with secret redaction."""
+        exc_type = type(exc).__name__
+        exc_msg = str(exc)
+
+        if "Authentication" in exc_type or "Unauthorized" in exc_msg or getattr(exc, "status_code", None) == 401:
+            raise AuthenticationError("Authentication failed: invalid or unauthorized Groq API key.") from None
+
+        if "RateLimit" in exc_type or "429" in exc_msg or getattr(exc, "status_code", None) == 429:
+            raise RateLimitError("Groq API rate limit or quota exceeded.") from None
+
+        if "Timeout" in exc_type or "timed out" in exc_msg.lower():
+            raise TimeoutError("Groq API request timed out.") from None
+
+        if "Connection" in exc_type or "connection" in exc_msg.lower() or "connect" in exc_msg.lower():
+            raise ConnectionError("Failed to connect to Groq API endpoint.") from None
+
+        clean_detail = exc_msg.split("\n")[0] if exc_msg else exc_type
+        for secret in filter(None, [self._explicit_api_key, os.environ.get("GROQ_API_KEY")]):
+            clean_detail = clean_detail.replace(secret, "[REDACTED_API_KEY]")
+
+        raise ProviderError(f"Groq API provider error ({exc_type}): {clean_detail}") from None

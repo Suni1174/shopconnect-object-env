@@ -14,6 +14,7 @@ Enforces:
 
 from __future__ import annotations
 
+import inspect
 import json
 from typing import Any, Dict, List, Optional
 
@@ -45,6 +46,15 @@ def _extract_plan_version(serialized_context: str) -> Optional[int]:
     if isinstance(v, bool) or not isinstance(v, int) or v < 1:
         return None
     return v
+
+
+def _provider_supports_parallel_tool_calls(provider: Any) -> bool:
+    """Check if provider complete method explicitly accepts parallel_tool_calls."""
+    try:
+        sig = inspect.signature(provider.complete)
+        return "parallel_tool_calls" in sig.parameters
+    except Exception:
+        return False
 
 
 class ConditionBAgent(BaseAgent):
@@ -83,7 +93,29 @@ class ConditionBAgent(BaseAgent):
             ),
         ]
 
-        completion = self.provider.complete(messages=messages, tools=tools, tool_choice="auto")
+        complete_kwargs: Dict[str, Any] = {
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": "auto",
+        }
+        if _provider_supports_parallel_tool_calls(self.provider):
+            complete_kwargs["parallel_tool_calls"] = False
+
+        try:
+            completion = self.provider.complete(**complete_kwargs)
+        except Exception as exc:
+            return AgentResponse(
+                proposal=None,
+                rationale=f"Agent exception during completion: {exc}",
+                raw_output="",
+                metadata={
+                    "condition_id": "B",
+                    "plan_version": plan_version,
+                    "status": "error",
+                    "error": str(exc),
+                    "total_model_requests": 1,
+                },
+            )
         raw_output = completion.message.content or ""
 
         base_meta: Dict[str, Any] = {
@@ -202,14 +234,13 @@ class ConditionBAgent(BaseAgent):
                 "day": validated_args.day,
                 "meal_type": validated_args.meal_type,
                 "recipe_id": validated_args.recipe_id,
+                "servings": validated_args.servings,
             }
-            if validated_args.servings is not None:
-                args_payload["servings"] = validated_args.servings
 
             proposal = ActionProposal(
                 operation=OperationType.REPLACE_MEAL,
                 arguments=args_payload,
-                reason=f"Tool call replace_meal({validated_args.day}, {validated_args.meal_type}, {validated_args.recipe_id})",
+                reason=f"Tool call replace_meal({validated_args.day}, {validated_args.meal_type}, {validated_args.recipe_id}, servings={validated_args.servings})",
                 expected_plan_version=plan_version,
             )
 

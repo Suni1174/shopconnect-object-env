@@ -1,0 +1,1717 @@
+"""Controlled Groq Cloud API pilot execution harness and guardrails for Protocol v2.
+
+Stage 6 Protocol v2:
+- Safe, bounded execution of exactly 3 frozen benchmark tasks across 3 conditions (9 runs).
+- Selected tasks:
+  * 1 COMMIT: task_01_commit_replace_wed_dinner (meal_replacement)
+  * 1 REJECT: task_14_reject_allergen_peanut_toast (allergen_conflict)
+  * 1 CLARIFY: task_22_clarify_missing_meal_slot (ambiguous_request)
+- Strict maximum 28 total provider requests across the full pilot.
+- Sequential execution only (zero parallelism).
+- SDK retries disabled / single-attempt execution (max_retries=0).
+- Output token ceiling enforced (max_output_tokens=2048).
+- Model: qwen/qwen3.8-27b (Groq hosted).
+- Dual confirmation flags (--live AND --confirm-live) strictly required for live API calls.
+- Offline preflight validation and simulated dry-run modes with zero network access.
+- Dedicated artifacts under artifacts/protocol_v2_pilot/groq_<run_id>/.
+- Distinctly tagged: REAL_API_PILOT (GROQ) — LIMITED_SAMPLE — NOT_FULL_EXPERIMENT.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+from datetime import datetime, timezone
+from decimal import Decimal
+import json
+import os
+from pathlib import Path
+import sys
+import time
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
+
+# Ensure src/ is in sys.path for direct CLI script execution
+_src_root = str(Path(__file__).resolve().parent.parent.parent)
+if _src_root not in sys.path:
+    sys.path.insert(0, _src_root)
+
+from pydantic import ValidationError
+
+from shopconnect_env.agents.condition_a_agent import ConditionAEnvelopeAdapter
+from shopconnect_env.agents.providers import (
+    GroqProvider,
+    LLMCompletionResult,
+    LLMMessage,
+    LLMProvider,
+    LLMUsage,
+    MockLLMProvider,
+    usage_to_dict,
+)
+from shopconnect_env.context.base import ContextRequest
+from shopconnect_env.context.full_state import FullStateContextBuilder
+from shopconnect_env.context.object_context import ObjectContextBuilder
+from shopconnect_env.context.tool_context import ToolContextBuilder
+from shopconnect_env.domain.models import MealPlan, RejectionCategory, load_catalog_from_json
+from shopconnect_env.evaluation.metrics import (
+    PricingConfig,
+    RunMetrics,
+    compute_aggregate_metrics,
+    create_groq_free_pricing,
+)
+from shopconnect_env.evaluation.runner import (
+    ExperimentRunner,
+    PlanFixture,
+    RunRecord,
+    compute_sha256,
+    load_plan_fixtures,
+)
+from shopconnect_env.evaluation.tasks import (
+    BenchmarkTask,
+    ExpectedOutcome,
+    load_benchmark_tasks,
+)
+
+
+# =============================================================================
+# 1. PILOT CONSTANTS & SPECIFICATIONS
+# =============================================================================
+
+PILOT_TASK_IDS: Tuple[str, ...] = (
+    "task_01_commit_replace_wed_dinner",
+    "task_14_reject_allergen_peanut_toast",
+    "task_22_clarify_missing_meal_slot",
+)
+
+PILOT_CONDITIONS: Tuple[str, ...] = ("A", "B", "C")
+
+MAX_PILOT_RUNS: int = 9  # 3 tasks * 3 conditions
+PILOT_TASKS_COUNT: int = len(PILOT_TASK_IDS)  # 3
+
+# Per-condition request budgets for Groq Protocol v2 pilot
+MAX_REQUESTS_PER_CONDITION_A: int = 1
+MAX_REQUESTS_PER_CONDITION_B: int = 1
+PROTOCOL_V2_MAX_REQUESTS_PER_CONDITION_C: int = 6
+PROTOCOL_V2_MAX_INSPECTIONS_PER_CONDITION_C: int = 5
+
+# Maximum possible total requests: 3 tasks × (1 A + 1 B + 6 C) = 24 requests
+PROTOCOL_V2_MAX_THEORETICAL_TOTAL_REQUESTS: int = PILOT_TASKS_COUNT * (
+    MAX_REQUESTS_PER_CONDITION_A + MAX_REQUESTS_PER_CONDITION_B + PROTOCOL_V2_MAX_REQUESTS_PER_CONDITION_C
+)
+
+# Global hard ceiling adapted to Groq free plan quotas (ceiling 28)
+PROTOCOL_V2_GLOBAL_REQUEST_CEILING: int = 28
+GLOBAL_REQUEST_CEILING: int = PROTOCOL_V2_GLOBAL_REQUEST_CEILING
+DEFAULT_OUTPUT_TOKEN_CEILING: int = 2048
+PILOT_MODEL: str = "qwen/qwen3.8-27b"
+DEFAULT_BASE_URL: str = "https://api.groq.com/openai/v1"
+PILOT_TAG: str = "REAL_API_PILOT (GROQ) — LIMITED_SAMPLE — NOT_FULL_EXPERIMENT"
+
+# Standalone One-Request Connection Test Specifications
+CONNECTION_TEST_PROMPT: str = "Reply with exactly: SHOPCONNECT_GROQ_CONNECTION_OK"
+EXPECTED_CONNECTION_TEST_TOKEN: str = "SHOPCONNECT_GROQ_CONNECTION_OK"
+CONNECTION_TEST_OUTPUT_TOKEN_CEILING: int = 64
+DEFAULT_CONNECTION_TEST_ARTIFACT_DIR: str = "artifacts/protocol_v2_pilot"
+
+# Standalone One-Request Tool-Calling Smoke Test Specifications
+INSPECT_PLAN_TOOL_DEFINITION: Dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "inspect_plan",
+        "description": "Inspect active plan metadata, plan_version, and total assigned meals.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+}
+INSPECT_PLAN_TOOL_CHOICE: Dict[str, Any] = {
+    "type": "function",
+    "function": {"name": "inspect_plan"},
+}
+TOOL_SMOKE_TEST_PROMPT: str = "Inspect the current active meal plan metadata and plan version."
+TOOL_SMOKE_TEST_OUTPUT_TOKEN_CEILING: int = 128
+DEFAULT_TOOL_SMOKE_TEST_ARTIFACT_DIR: str = "artifacts/protocol_v2_pilot"
+
+# Standalone One-Request Condition A JSON Smoke Test Specifications
+JSON_SMOKE_TEST_SYSTEM_PROMPT: str = (
+    "You are a meal planning assistant. Respond strictly with a JSON object conforming to the schema. "
+    "Do not include any explanation or commentary outside the JSON."
+)
+JSON_SMOKE_TEST_USER_PROMPT: str = (
+    "User Request:\n"
+    "Please replace Thursday dinner with Thai Peanut Noodles.\n\n"
+    "Current Household Constraints:\n"
+    "- Severe peanut allergy registered for child.\n\n"
+    "Because of the allergen conflict, reject this request.\n"
+    "Emit a single JSON object conforming to the Condition A response schema:\n"
+    '{"decision": "REJECT", "rejection_category": "allergen_conflict", "reason": "<non-empty explanation of the peanut allergen conflict>"}\n'
+    "Valid rejection_category values include: allergen_conflict, dietary_mismatch, budget_overflow, invalid_recipe, no_op, other."
+)
+JSON_SMOKE_TEST_OUTPUT_TOKEN_CEILING: int = 256
+DEFAULT_JSON_SMOKE_TEST_ARTIFACT_DIR: str = "artifacts/protocol_v2_pilot"
+
+# Safe Rate Limiting Target and Free Tier Quotas for Groq
+GROQ_FREE_TIER_ITPM_LIMIT: int = 7000
+GROQ_FREE_TIER_RPM_LIMIT: int = 30
+CONFIGURED_SAFE_TARGET_RPM: int = 12
+MIN_REQUEST_INTERVAL_SECONDS: float = 12.0  # 12.0s minimum interval between request starts (safe for 5 RPM / 7k ITPM)
+
+
+# =============================================================================
+# 2. SEQUENTIAL RATE LIMITER
+# =============================================================================
+
+class SequentialRateLimiter:
+    """Enforces a safe sequential interval and quota-aware pacing between provider requests."""
+
+    def __init__(
+        self,
+        min_interval_seconds: float = MIN_REQUEST_INTERVAL_SECONDS,
+        clock: Optional[Callable[[], float]] = None,
+        sleeper: Optional[Callable[[float], None]] = None,
+    ) -> None:
+        self.min_interval_seconds = min_interval_seconds
+        self.clock = clock or time.monotonic
+        self.sleeper = sleeper or time.sleep
+        self.last_request_start: Optional[float] = None
+        self.total_sleep_seconds: float = 0.0
+        self.sleep_events: List[float] = []
+        self.pending_quota_delay_seconds: float = 0.0
+        self.last_remaining_tokens: Optional[int] = None
+        self.last_reset_tokens_seconds: Optional[float] = None
+
+    def update_from_headers(
+        self,
+        headers: Mapping[str, Any],
+        estimated_next_tokens: Optional[int] = None,
+    ) -> None:
+        """Capture rate-limit headers and enforce quota-aware backoff before next request."""
+        if not headers:
+            return
+        headers_lower = {str(k).lower(): str(v) for k, v in headers.items()}
+
+        # 1. Retry-After header
+        retry_after_raw = headers_lower.get("retry-after")
+        if retry_after_raw:
+            try:
+                delay = float(str(retry_after_raw).strip())
+                self.pending_quota_delay_seconds = max(self.pending_quota_delay_seconds, delay)
+            except (ValueError, TypeError):
+                pass
+
+        # 2. Token quota reset duration tracking and adaptive request comparison
+        rem_tokens_raw = headers_lower.get("x-ratelimit-remaining-tokens")
+        reset_tokens_raw = headers_lower.get("x-ratelimit-reset-tokens")
+        if rem_tokens_raw and reset_tokens_raw:
+            try:
+                rem = int(str(rem_tokens_raw).strip())
+                self.last_remaining_tokens = rem
+
+                r_str = str(reset_tokens_raw).strip().lower()
+                if r_str.endswith("ms"):
+                    reset_s = float(r_str[:-2]) / 1000.0
+                elif r_str.endswith("s"):
+                    reset_s = float(r_str[:-1])
+                elif r_str.endswith("m"):
+                    reset_s = float(r_str[:-1]) * 60.0
+                else:
+                    reset_s = float(r_str)
+                self.last_reset_tokens_seconds = reset_s
+
+                # Dynamic comparison: required tokens = estimated request size + 200 token buffer
+                # Default threshold is 3000 tokens (sufficient for Condition B ~2800 tokens)
+                required_tokens = (estimated_next_tokens + 200) if estimated_next_tokens is not None else 3000
+                if rem < required_tokens:
+                    self.pending_quota_delay_seconds = max(self.pending_quota_delay_seconds, reset_s)
+            except (ValueError, TypeError):
+                pass
+
+    def wait_for_slot(
+        self,
+        provider: Optional[Any] = None,
+        estimated_tokens: Optional[int] = None,
+    ) -> float:
+        """Wait until min_interval_seconds and quota reset duration have elapsed."""
+        if provider is not None and hasattr(provider, "last_response_headers"):
+            self.update_from_headers(provider.last_response_headers, estimated_next_tokens=estimated_tokens)
+        elif estimated_tokens is not None and self.last_remaining_tokens is not None and self.last_reset_tokens_seconds is not None:
+            required_tokens = estimated_tokens + 200
+            if self.last_remaining_tokens < required_tokens:
+                self.pending_quota_delay_seconds = max(self.pending_quota_delay_seconds, self.last_reset_tokens_seconds)
+
+        effective_interval = max(self.min_interval_seconds, self.pending_quota_delay_seconds)
+        self.pending_quota_delay_seconds = 0.0
+
+        if effective_interval <= 0.0:
+            self.last_request_start = self.clock()
+            return 0.0
+
+        now = self.clock()
+        slept = 0.0
+        if self.last_request_start is not None:
+            elapsed = now - self.last_request_start
+            wait_time = effective_interval - elapsed
+            if wait_time > 0:
+                self.sleeper(wait_time)
+                slept = wait_time
+                now = self.clock()
+
+        self.last_request_start = now
+        self.total_sleep_seconds += slept
+        if slept > 0.0:
+            self.sleep_events.append(slept)
+            if self.last_reset_tokens_seconds is not None and slept >= self.last_reset_tokens_seconds:
+                self.last_remaining_tokens = None
+        return slept
+
+
+# =============================================================================
+# 3. PILOT REQUEST GUARDRAIL PROVIDER
+# =============================================================================
+
+class GroqPilotRequestGuardrailProvider:
+    """Decorates an LLMProvider to enforce strict invocation, token, and rate limits."""
+
+    def __init__(
+        self,
+        provider: LLMProvider,
+        max_requests: int = PROTOCOL_V2_GLOBAL_REQUEST_CEILING,
+        rate_limiter: Optional[SequentialRateLimiter] = None,
+        min_interval_seconds: float = 0.0,
+        clock: Optional[Callable[[], float]] = None,
+        sleeper: Optional[Callable[[float], None]] = None,
+    ) -> None:
+        self.provider = provider
+        self.max_requests = max_requests
+        if rate_limiter is not None:
+            self.rate_limiter: Optional[SequentialRateLimiter] = rate_limiter
+        elif min_interval_seconds > 0.0:
+            self.rate_limiter = SequentialRateLimiter(
+                min_interval_seconds=min_interval_seconds,
+                clock=clock,
+                sleeper=sleeper,
+            )
+        else:
+            self.rate_limiter = None
+
+        self.total_requests: int = 0
+        self.request_history: List[Dict[str, Any]] = []
+        self.provider_request_ids: List[str] = []
+
+        # Cumulative token counters
+        self.cumulative_input_tokens: int = 0
+        self.cumulative_output_tokens: int = 0
+        self.cumulative_cached_input_tokens: int = 0
+        self.cumulative_reasoning_tokens: int = 0
+        self.cumulative_total_tokens: Optional[int] = None
+        self.cumulative_derived_total_tokens: int = 0
+        self.cumulative_sleep_seconds: float = 0.0
+
+    @property
+    def sdk_version(self) -> Optional[str]:
+        return getattr(self.provider, "sdk_version", None)
+
+    @property
+    def is_execution_lock_enabled(self) -> bool:
+        return getattr(self.provider, "is_execution_lock_enabled", False)
+
+    @property
+    def effective_reasoning_effort(self) -> Optional[str]:
+        return getattr(self.provider, "effective_reasoning_effort", None)
+
+    @property
+    def last_response_headers(self) -> Dict[str, str]:
+        return getattr(self.provider, "last_response_headers", {})
+
+    def complete(
+        self,
+        messages: List[LLMMessage],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        reasoning_effort: str = "low",
+        max_output_tokens: Optional[int] = None,
+        parallel_tool_calls: Optional[bool] = None,
+        **kwargs: Any,
+    ) -> LLMCompletionResult:
+        """Enforces rate limiting and ceiling checks before forwarding completion calls."""
+        if self.total_requests >= self.max_requests:
+            raise RuntimeError(
+                f"Groq pilot execution safety ceiling reached: {self.total_requests}/{self.max_requests} requests. "
+                "Halting further API invocations to protect quota limits."
+            )
+
+        slept = 0.0
+        if self.rate_limiter is not None:
+            prompt_chars = sum(len(m.content or "") for m in messages)
+            if tools:
+                try:
+                    prompt_chars += len(json.dumps(tools))
+                except Exception:
+                    pass
+            est_tokens = max(1, int(prompt_chars / 3.0))
+            slept = self.rate_limiter.wait_for_slot(provider=self.provider, estimated_tokens=est_tokens)
+            self.cumulative_sleep_seconds += slept
+
+        self.total_requests += 1
+
+        t0 = time.perf_counter()
+        try:
+            result = self.provider.complete(
+                messages=messages,
+                tools=tools,
+                tool_choice=tool_choice,
+                response_format=response_format,
+                reasoning_effort=reasoning_effort,
+                max_output_tokens=max_output_tokens,
+                parallel_tool_calls=parallel_tool_calls,
+                **kwargs,
+            )
+        except Exception as exc:
+            duration_ms = (time.perf_counter() - t0) * 1000.0
+            headers = getattr(self.provider, "last_response_headers", {})
+            if headers and self.rate_limiter is not None:
+                self.rate_limiter.update_from_headers(headers)
+            self.request_history.append({
+                "request_index": self.total_requests,
+                "status": "error",
+                "error": type(exc).__name__,
+                "duration_ms": duration_ms,
+                "sleep_seconds": slept,
+            })
+            raise
+
+        duration_ms = (time.perf_counter() - t0) * 1000.0
+        headers = getattr(self.provider, "last_response_headers", {})
+        if headers and self.rate_limiter is not None:
+            self.rate_limiter.update_from_headers(headers)
+
+        if result.usage:
+            self.cumulative_input_tokens += result.usage.input_tokens
+            self.cumulative_output_tokens += result.usage.output_tokens
+            if result.usage.cached_input_tokens is not None:
+                self.cumulative_cached_input_tokens += result.usage.cached_input_tokens
+            if result.usage.reasoning_tokens is not None:
+                self.cumulative_reasoning_tokens += result.usage.reasoning_tokens
+            if result.usage.total_tokens is not None:
+                if self.cumulative_total_tokens is None:
+                    self.cumulative_total_tokens = result.usage.total_tokens
+                else:
+                    self.cumulative_total_tokens += result.usage.total_tokens
+            if result.usage.derived_total_tokens is not None:
+                self.cumulative_derived_total_tokens += result.usage.derived_total_tokens
+            else:
+                self.cumulative_derived_total_tokens += (result.usage.input_tokens + result.usage.output_tokens)
+
+        if result.provider_request_id:
+            self.provider_request_ids.append(result.provider_request_id)
+
+        self.request_history.append({
+            "request_index": self.total_requests,
+            "status": "success",
+            "provider_request_id": result.provider_request_id,
+            "duration_ms": duration_ms,
+            "sleep_seconds": slept,
+            "usage": usage_to_dict(result.usage),
+        })
+
+        return result
+
+
+# =============================================================================
+# 4. PREFLIGHT VALIDATION & PROMPT ESTIMATION (ZERO NETWORK ACTIVITY)
+# =============================================================================
+
+def estimate_prompt_tokens(text: str) -> int:
+    """Conservatively estimate LLM token count from raw text without external tokenizer.
+
+    For Qwen / OpenAI-compatible tokenizers on structured text/JSON, the ratio is
+    approximately ~3.0 characters per token.
+    """
+    if not text:
+        return 0
+    return max(1, int(len(text) / 3.0))
+
+
+def estimate_condition_prompt_tokens(
+    condition_id: str,
+    task: BenchmarkTask,
+    plan: MealPlan,
+    catalog: Dict[str, Any],
+    ingredients: Dict[str, Any],
+) -> int:
+    """Estimate prompt tokens for a specific condition and task before dispatch."""
+    ctx_req = ContextRequest(
+        user_request=task.user_request,
+        plan=plan,
+        catalog=catalog,
+        ingredients=ingredients,
+    )
+    if condition_id == "A":
+        builder = FullStateContextBuilder()
+    elif condition_id == "B":
+        builder = ToolContextBuilder()
+    elif condition_id == "C":
+        builder = ObjectContextBuilder()
+    else:
+        raise ValueError(f"Unknown condition_id: {condition_id}")
+
+    ctx_res = builder.build(ctx_req)
+    full_prompt_text = (
+        ctx_res.system_prompt
+        + "\nUser Request:\n"
+        + task.user_request
+        + "\nCurrent State:\n"
+        + ctx_res.serialized_context
+    )
+    return estimate_prompt_tokens(full_prompt_text)
+
+
+def run_groq_pilot_preflight(
+    catalog_path: Union[str, Path] = "data/catalog_seed.json",
+    fixtures_path: Union[str, Path] = "data/plan_fixtures.json",
+    tasks_path: Union[str, Path] = "data/tasks.jsonl",
+    api_key: Optional[str] = None,
+    protocol_version: str = "v2",
+    conditions: Sequence[str] = PILOT_CONDITIONS,
+    enforce_itpm_limits: bool = False,
+) -> Dict[str, Any]:
+    """Execute preflight configuration and data integrity validation for Groq."""
+    catalog_p = Path(catalog_path)
+    fixtures_p = Path(fixtures_path)
+    tasks_p = Path(tasks_path)
+
+    errors: List[str] = []
+    warnings: List[str] = []
+
+    # API key check (never log secrets)
+    configured_key = api_key or os.environ.get("GROQ_API_KEY", "")
+    key_present = bool(configured_key and configured_key.strip())
+
+    catalog = {}
+    ingredients = {}
+    if not catalog_p.exists():
+        errors.append(f"Catalog file not found: {catalog_p}")
+    else:
+        try:
+            ingredients, catalog = load_catalog_from_json(catalog_p)
+            if len(catalog) < 15:
+                errors.append(f"Catalog contains only {len(catalog)} recipes; expected at least 15.")
+        except Exception as e:
+            errors.append(f"Failed to load catalog: {e}")
+
+    fixtures = {}
+    if not fixtures_p.exists():
+        errors.append(f"Plan fixtures file not found: {fixtures_p}")
+    elif catalog:
+        try:
+            fixtures = load_plan_fixtures(fixtures_p, catalog, ingredients)
+            if "fixture_standard" not in fixtures:
+                errors.append("Standard fixture 'fixture_standard' missing from fixtures.")
+        except Exception as e:
+            errors.append(f"Failed to load plan fixtures: {e}")
+
+    pilot_tasks: List[BenchmarkTask] = []
+    if not tasks_p.exists():
+        errors.append(f"Tasks file not found: {tasks_p}")
+    elif fixtures and catalog:
+        try:
+            all_tasks = load_benchmark_tasks(tasks_p, fixtures, catalog)
+            task_map = {t.task_id: t for t in all_tasks}
+            missing = [tid for tid in PILOT_TASK_IDS if tid not in task_map]
+            if missing:
+                errors.append(f"Required pilot task(s) missing from {tasks_p}: {missing}")
+            else:
+                pilot_tasks = [task_map[tid] for tid in PILOT_TASK_IDS]
+                expected_matrix = {
+                    "task_01_commit_replace_wed_dinner": ExpectedOutcome.COMMIT,
+                    "task_14_reject_allergen_peanut_toast": ExpectedOutcome.REJECT,
+                    "task_22_clarify_missing_meal_slot": ExpectedOutcome.CLARIFY,
+                }
+                for t in pilot_tasks:
+                    exp = expected_matrix[t.task_id]
+                    if t.expected_outcome != exp:
+                        errors.append(
+                            f"Task {t.task_id} has outcome {t.expected_outcome.value}; "
+                            f"expected {exp.value} for pilot."
+                        )
+        except Exception as e:
+            errors.append(f"Failed to load benchmark tasks: {e}")
+
+    # Prompt size estimation and ITPM limit check
+    estimated_prompt_tokens: Dict[str, int] = {}
+    if fixtures and catalog and pilot_tasks:
+        sample_task = pilot_tasks[0]
+        sample_plan = fixtures[sample_task.fixture_id].plan
+        for cond in conditions:
+            try:
+                est = estimate_condition_prompt_tokens(
+                    condition_id=cond,
+                    task=sample_task,
+                    plan=sample_plan,
+                    catalog=catalog,
+                    ingredients=ingredients,
+                )
+                estimated_prompt_tokens[cond] = est
+                if est > GROQ_FREE_TIER_ITPM_LIMIT:
+                    msg = (
+                        f"Condition {cond} estimated prompt size ({est} tokens) exceeds "
+                        f"Groq Free Tier ITPM limit of {GROQ_FREE_TIER_ITPM_LIMIT} tokens. "
+                        f"Dispatching will trigger HTTP 413 rate_limit_exceeded."
+                    )
+                    if enforce_itpm_limits:
+                        errors.append(msg)
+                    else:
+                        warnings.append(msg)
+            except Exception as e:
+                warnings.append(f"Could not estimate prompt tokens for Condition {cond}: {e}")
+
+    try:
+        pricing = create_groq_free_pricing()
+    except Exception as e:
+        pricing = None
+        errors.append(f"Invalid pricing configuration: {e}")
+
+    c_reqs = PROTOCOL_V2_MAX_REQUESTS_PER_CONDITION_C
+    c_insps = PROTOCOL_V2_MAX_INSPECTIONS_PER_CONDITION_C
+    ceil_reqs = PROTOCOL_V2_GLOBAL_REQUEST_CEILING
+
+    tasks_count = len(pilot_tasks) if pilot_tasks else len(PILOT_TASK_IDS)
+    planned_runs = tasks_count * len(conditions)
+
+    theor_reqs = tasks_count * sum(
+        MAX_REQUESTS_PER_CONDITION_A if c == "A" else (MAX_REQUESTS_PER_CONDITION_B if c == "B" else c_reqs)
+        for c in conditions
+    )
+
+    budget_breakdown = " + ".join(
+        f"{MAX_REQUESTS_PER_CONDITION_A if c == 'A' else (MAX_REQUESTS_PER_CONDITION_B if c == 'B' else c_reqs)} {c}"
+        for c in conditions
+    )
+    request_budget_formula = f"{tasks_count} tasks × ({budget_breakdown}) = {theor_reqs} requests"
+
+    return {
+        "status": "passed" if not errors else "failed",
+        "api_key_configured": key_present,
+        "pilot_model": PILOT_MODEL,
+        "base_url": DEFAULT_BASE_URL,
+        "planned_runs_count": planned_runs,
+        "conditions": list(conditions),
+        "estimated_prompt_tokens": estimated_prompt_tokens,
+        "itpm_limit": GROQ_FREE_TIER_ITPM_LIMIT,
+        "enforce_itpm_limits": enforce_itpm_limits,
+        "max_requests_per_condition_a": MAX_REQUESTS_PER_CONDITION_A,
+        "max_requests_per_condition_b": MAX_REQUESTS_PER_CONDITION_B,
+        "max_requests_per_condition_c": c_reqs,
+        "max_inspections_per_condition_c": c_insps,
+        "max_theoretical_requests": theor_reqs,
+        "max_possible_total_requests": theor_reqs,
+        "request_budget_formula": request_budget_formula,
+        "global_request_ceiling": ceil_reqs,
+        "max_provider_requests_ceiling": ceil_reqs,
+        "safety_margin_requests": ceil_reqs - theor_reqs,
+        "pricing_complete": pricing.is_complete() if pricing else False,
+        "billing_tier": "free",
+        "tasks_loaded": len(pilot_tasks),
+        "protocol_version": protocol_version,
+        "errors": errors,
+        "warnings": warnings,
+    }
+
+
+# =============================================================================
+# 5. DETERMINISTIC MOCK FOR DRY-RUN TESTING
+# =============================================================================
+
+def create_groq_pilot_mock_provider() -> MockLLMProvider:
+    """Create offline mock provider configured specifically for Groq pilot dry run."""
+    canned: Dict[str, LLMCompletionResult] = {
+        "pasta": LLMCompletionResult(
+            message=LLMMessage(
+                role="assistant",
+                content='{"action": "replace_meal", "day": "Wednesday", "slot": "Dinner", "recipe": "Vegetable Pasta Primavera"}',
+            ),
+            usage=LLMUsage(
+                input_tokens=150,
+                output_tokens=48,
+                total_tokens=198,
+                cached_input_tokens=0,
+                reasoning_tokens=0,
+                is_provider_reported=False,
+            ),
+            model_identifier="mock-qwen-3.8-27b",
+            system_fingerprint="groq_mock_fp",
+            provider_request_id="groq_mock_req_01",
+            latency_ms=45.0,
+            finish_reason="stop",
+        ),
+        "peanut": LLMCompletionResult(
+            message=LLMMessage(
+                role="assistant",
+                content="I cannot schedule peanut butter toast because the profile has a severe peanut allergy constraint.",
+            ),
+            usage=LLMUsage(
+                input_tokens=140,
+                output_tokens=30,
+                total_tokens=170,
+                is_provider_reported=False,
+            ),
+            model_identifier="mock-qwen-3.8-27b",
+            system_fingerprint="groq_mock_fp",
+            provider_request_id="groq_mock_req_02",
+            latency_ms=40.0,
+            finish_reason="stop",
+        ),
+        "unclear": LLMCompletionResult(
+            message=LLMMessage(
+                role="assistant",
+                content='{"clarification_request": "Which meal slot would you like to assign this recipe to?"}',
+            ),
+            usage=LLMUsage(
+                input_tokens=120,
+                output_tokens=25,
+                total_tokens=145,
+                is_provider_reported=False,
+            ),
+            model_identifier="mock-qwen-3.8-27b",
+            system_fingerprint="groq_mock_fp",
+            provider_request_id="groq_mock_req_03",
+            latency_ms=35.0,
+            finish_reason="stop",
+        ),
+    }
+
+    default_resp = LLMCompletionResult(
+        message=LLMMessage(
+            role="assistant",
+            content='{"status": "groq_dry_run_simulated_completion"}',
+        ),
+        usage=LLMUsage(
+            input_tokens=105,
+            output_tokens=20,
+            total_tokens=125,
+            is_provider_reported=False,
+        ),
+        model_identifier="mock-qwen-3.8-27b",
+        system_fingerprint="groq_mock_fp",
+        provider_request_id="groq_mock_req_default",
+        latency_ms=30.0,
+        finish_reason="stop",
+    )
+
+    return MockLLMProvider(canned_responses=canned, default_response=default_resp)
+
+
+# =============================================================================
+# 6. DRY RUN RUNNER (ZERO NETWORK CALLS)
+# =============================================================================
+
+def run_groq_pilot_dry_run(
+    catalog_path: Union[str, Path] = "data/catalog_seed.json",
+    fixtures_path: Union[str, Path] = "data/plan_fixtures.json",
+    tasks_path: Union[str, Path] = "data/tasks.jsonl",
+    output_dir: Optional[Union[str, Path]] = None,
+    provider: Optional[LLMProvider] = None,
+    rate_limiter: Optional[SequentialRateLimiter] = None,
+    max_requests: Optional[int] = None,
+    protocol_version: str = "v2",
+    conditions: Sequence[str] = PILOT_CONDITIONS,
+) -> Dict[str, Any]:
+    """Execute simulated pilot offline with deterministic mock data."""
+    effective_max_requests = max_requests if max_requests is not None else PROTOCOL_V2_GLOBAL_REQUEST_CEILING
+    c_requests = PROTOCOL_V2_MAX_REQUESTS_PER_CONDITION_C
+    c_inspections = PROTOCOL_V2_MAX_INSPECTIONS_PER_CONDITION_C
+    config_version = "protocol-v2-groq-pilot-dry-run"
+
+    ingredients, catalog = load_catalog_from_json(catalog_path)
+    fixtures = load_plan_fixtures(fixtures_path, catalog, ingredients)
+    all_tasks = load_benchmark_tasks(tasks_path, fixtures, catalog)
+
+    task_map = {t.task_id: t for t in all_tasks}
+    pilot_tasks = [task_map[tid] for tid in PILOT_TASK_IDS]
+
+    planned_runs = len(pilot_tasks) * len(conditions)
+    theoretical_total = len(pilot_tasks) * sum(
+        MAX_REQUESTS_PER_CONDITION_A if c == "A" else (MAX_REQUESTS_PER_CONDITION_B if c == "B" else c_requests)
+        for c in conditions
+    )
+
+    pricing = create_groq_free_pricing()
+
+    underlying_provider = provider or create_groq_pilot_mock_provider()
+    guardrail = GroqPilotRequestGuardrailProvider(
+        provider=underlying_provider,
+        max_requests=effective_max_requests,
+        rate_limiter=rate_limiter,
+    )
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    run_id = f"groq_dry_run_{timestamp}"
+
+    runner = ExperimentRunner(
+        fixtures=fixtures,
+        tasks=pilot_tasks,
+        catalog=catalog,
+        ingredients=ingredients,
+        pricing=pricing,
+        default_provider=guardrail,
+        experiment_run_id=run_id,
+        experiment_config_version=config_version,
+        provider_mode="simulated",
+        model_name="mock-qwen-3.8-27b",
+        condition_c_max_model_requests=c_requests,
+        condition_c_max_inspections=c_inspections,
+        protocol_version=protocol_version,
+    )
+
+    records: List[RunRecord] = []
+    incomplete_reason: Optional[str] = None
+    for task in pilot_tasks:
+        for condition in conditions:
+            if guardrail.total_requests >= effective_max_requests:
+                incomplete_reason = f"Request ceiling of {effective_max_requests} reached before starting {task.task_id} condition {condition}."
+                break
+            try:
+                rec = runner.run_task(task=task, condition_id=condition, provider=guardrail)
+                records.append(rec)
+            except RuntimeError as exc:
+                if "safety ceiling reached" in str(exc).lower():
+                    incomplete_reason = str(exc)
+                    break
+                raise
+        if incomplete_reason is not None:
+            break
+
+    if output_dir is None:
+        target_dir = Path("artifacts") / "protocol_v2_pilot" / run_id
+    else:
+        target_dir = Path(output_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    is_complete = len(records) == planned_runs and incomplete_reason is None
+
+    # Export artifacts
+    runner.export_artifacts(records, target_dir)
+    _patch_pilot_analysis_markdown(
+        target_dir / "analysis.md",
+        run_id=run_id,
+        is_live=False,
+        guardrail=guardrail,
+        max_requests=effective_max_requests,
+        incomplete_reason=incomplete_reason,
+    )
+
+    return {
+        "status": "completed" if is_complete else "incomplete",
+        "incomplete_reason": incomplete_reason,
+        "run_id": run_id,
+        "runs_completed": len(records),
+        "runs_planned": planned_runs,
+        "conditions": list(conditions),
+        "total_provider_requests": guardrail.total_requests,
+        "max_theoretical_requests": theoretical_total,
+        "max_requests_per_condition_c": c_requests,
+        "max_inspections_per_condition_c": c_inspections,
+        "max_requests_ceiling": effective_max_requests,
+        "global_request_ceiling": effective_max_requests,
+        "ceiling_reached": not is_complete and (guardrail.total_requests >= effective_max_requests or "ceiling" in (incomplete_reason or "").lower()),
+        "network_calls_made": 0,
+        "output_directory": str(target_dir),
+        "protocol_version": protocol_version,
+        "artifacts": {
+            "raw_runs": str(target_dir / "raw_runs.jsonl"),
+            "comparison_csv": str(target_dir / "comparison.csv"),
+            "analysis_markdown": str(target_dir / "analysis.md"),
+        },
+    }
+
+
+# =============================================================================
+# 7. LIVE PILOT RUNNER (REQUIRES DUAL CONFIRMATION)
+# =============================================================================
+
+def run_live_groq_pilot(
+    api_key: Optional[str] = None,
+    catalog_path: Union[str, Path] = "data/catalog_seed.json",
+    fixtures_path: Union[str, Path] = "data/plan_fixtures.json",
+    tasks_path: Union[str, Path] = "data/tasks.jsonl",
+    output_dir: Optional[Union[str, Path]] = None,
+    live: bool = False,
+    confirm_live: bool = False,
+    max_requests: Optional[int] = None,
+    min_interval_seconds: float = MIN_REQUEST_INTERVAL_SECONDS,
+    client: Optional[Any] = None,
+    clock: Optional[Callable[[], float]] = None,
+    sleeper: Optional[Callable[[float], None]] = None,
+    protocol_version: str = "v2",
+    conditions: Sequence[str] = PILOT_CONDITIONS,
+    enforce_itpm_limits: bool = True,
+) -> Dict[str, Any]:
+    """Execute live Groq pilot with strict dual-flag confirmation and request ceilings."""
+    if not (live and confirm_live):
+        raise RuntimeError(
+            "Live Groq pilot execution requires explicit dual confirmation: "
+            "both --live and --confirm-live flags must be supplied. "
+            "Cleanly aborting to prevent unintended API execution."
+        )
+
+    effective_max_requests = max_requests if max_requests is not None else PROTOCOL_V2_GLOBAL_REQUEST_CEILING
+    c_requests = PROTOCOL_V2_MAX_REQUESTS_PER_CONDITION_C
+    c_inspections = PROTOCOL_V2_MAX_INSPECTIONS_PER_CONDITION_C
+    config_version = "protocol-v2-groq-live-pilot"
+
+    # 1. Preflight validation
+    preflight = run_groq_pilot_preflight(
+        catalog_path=catalog_path,
+        fixtures_path=fixtures_path,
+        tasks_path=tasks_path,
+        api_key=api_key,
+        protocol_version=protocol_version,
+        conditions=conditions,
+        enforce_itpm_limits=enforce_itpm_limits,
+    )
+    if preflight["status"] != "passed":
+        raise RuntimeError(f"Preflight validation failed: {preflight['errors']}")
+    if not preflight["api_key_configured"]:
+        raise RuntimeError("GROQ_API_KEY environment variable is not configured.")
+
+    ingredients, catalog = load_catalog_from_json(catalog_path)
+    fixtures = load_plan_fixtures(fixtures_path, catalog, ingredients)
+    all_tasks = load_benchmark_tasks(tasks_path, fixtures, catalog)
+
+    task_map = {t.task_id: t for t in all_tasks}
+    pilot_tasks = [task_map[tid] for tid in PILOT_TASK_IDS]
+
+    planned_runs = len(pilot_tasks) * len(conditions)
+    theoretical_total = len(pilot_tasks) * sum(
+        MAX_REQUESTS_PER_CONDITION_A if c == "A" else (MAX_REQUESTS_PER_CONDITION_B if c == "B" else c_requests)
+        for c in conditions
+    )
+
+    pricing = create_groq_free_pricing()
+
+    base_provider = GroqProvider(
+        api_key=api_key,
+        model=PILOT_MODEL,
+        base_url=DEFAULT_BASE_URL,
+        timeout_seconds=60.0,
+        client=client,
+        max_output_tokens=DEFAULT_OUTPUT_TOKEN_CEILING,
+        max_retries=0,
+    )
+
+    rate_limiter = SequentialRateLimiter(
+        min_interval_seconds=min_interval_seconds,
+        clock=clock,
+        sleeper=sleeper,
+    )
+
+    guardrail = GroqPilotRequestGuardrailProvider(
+        provider=base_provider,
+        max_requests=effective_max_requests,
+        rate_limiter=rate_limiter,
+    )
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    run_id = f"groq_live_pilot_{timestamp}"
+
+    runner = ExperimentRunner(
+        fixtures=fixtures,
+        tasks=pilot_tasks,
+        catalog=catalog,
+        ingredients=ingredients,
+        pricing=pricing,
+        default_provider=guardrail,
+        experiment_run_id=run_id,
+        experiment_config_version=config_version,
+        provider_mode="live",
+        model_name=PILOT_MODEL,
+        condition_c_max_model_requests=c_requests,
+        condition_c_max_inspections=c_inspections,
+        protocol_version=protocol_version,
+    )
+
+    records: List[RunRecord] = []
+    incomplete_reason: Optional[str] = None
+    for task in pilot_tasks:
+        for condition in conditions:
+            if guardrail.total_requests >= effective_max_requests:
+                incomplete_reason = f"Request ceiling of {effective_max_requests} reached before starting {task.task_id} condition {condition}."
+                break
+            try:
+                rec = runner.run_task(task=task, condition_id=condition, provider=guardrail)
+                records.append(rec)
+            except RuntimeError as exc:
+                if "safety ceiling reached" in str(exc).lower():
+                    incomplete_reason = str(exc)
+                    break
+                raise
+        if incomplete_reason is not None:
+            break
+
+    if output_dir is None:
+        target_dir = Path("artifacts") / "protocol_v2_pilot" / run_id
+    else:
+        target_dir = Path(output_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    is_complete = len(records) == planned_runs and incomplete_reason is None
+
+    # Export artifacts
+    runner.export_artifacts(records, target_dir)
+    _patch_pilot_analysis_markdown(
+        target_dir / "analysis.md",
+        run_id=run_id,
+        is_live=True,
+        guardrail=guardrail,
+        max_requests=effective_max_requests,
+        incomplete_reason=incomplete_reason,
+    )
+
+    return {
+        "status": "completed" if is_complete else "incomplete",
+        "incomplete_reason": incomplete_reason,
+        "run_id": run_id,
+        "runs_completed": len(records),
+        "runs_planned": planned_runs,
+        "conditions": list(conditions),
+        "total_provider_requests": guardrail.total_requests,
+        "max_theoretical_requests": theoretical_total,
+        "max_requests_per_condition_c": c_requests,
+        "max_inspections_per_condition_c": c_inspections,
+        "max_requests_ceiling": effective_max_requests,
+        "global_request_ceiling": effective_max_requests,
+        "ceiling_reached": not is_complete and (guardrail.total_requests >= effective_max_requests or "ceiling" in (incomplete_reason or "").lower()),
+        "protocol_version": protocol_version,
+        "cumulative_tokens": {
+            "input": guardrail.cumulative_input_tokens,
+            "output": guardrail.cumulative_output_tokens,
+            "cached": guardrail.cumulative_cached_input_tokens,
+            "reasoning": guardrail.cumulative_reasoning_tokens,
+            "total": guardrail.cumulative_total_tokens,
+            "derived_total": guardrail.cumulative_derived_total_tokens,
+        },
+        "output_directory": str(target_dir),
+        "artifacts": {
+            "raw_runs": str(target_dir / "raw_runs.jsonl"),
+            "comparison_csv": str(target_dir / "comparison.csv"),
+            "analysis_markdown": str(target_dir / "analysis.md"),
+        },
+    }
+
+
+# =============================================================================
+# 8. STANDALONE ONE-REQUEST CONNECTION TEST
+# =============================================================================
+
+def run_groq_connection_test(
+    api_key: Optional[str] = None,
+    output_dir: Optional[Union[str, Path]] = None,
+    connection_test: bool = False,
+    confirm_connection_test: bool = False,
+    client: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Execute a single-request live connectivity test against Groq Cloud API."""
+    if not (connection_test and confirm_connection_test):
+        raise RuntimeError(
+            "Standalone Groq connection test requires explicit dual confirmation: "
+            "both --connection-test and --confirm-connection-test flags must be supplied. "
+            "Neither flag alone may make a network request."
+        )
+
+    configured_key = api_key or os.environ.get("GROQ_API_KEY", "")
+    key_configured = bool(configured_key and configured_key.strip())
+
+    ts_utc = datetime.now(timezone.utc).isoformat()
+    test_run_id = f"groq_connection_test_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+
+    artifact_dir = Path(output_dir) if output_dir else Path(DEFAULT_CONNECTION_TEST_ARTIFACT_DIR) / test_run_id
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    result_path = artifact_dir / "connection_test_result.json"
+
+    if not key_configured:
+        payload = {
+            "status": "failed",
+            "success": False,
+            "error": "GROQ_API_KEY environment variable is not configured.",
+            "error_type": "MissingAPIKeyError",
+            "model_requested": PILOT_MODEL,
+            "actual_model_identifier": None,
+            "provider_request_id": None,
+            "system_fingerprint": None,
+            "latency_ms": 0.0,
+            "timestamp_utc": ts_utc,
+            "prompt_sent": CONNECTION_TEST_PROMPT,
+            "response_text": None,
+            "token_usage": None,
+            "usage_provenance": None,
+            "billing_tier": "free",
+            "artifact_file": str(result_path),
+            "requests_made": 0,
+            "max_requests_allowed": 1,
+        }
+        result_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return payload
+
+    provider = GroqProvider(
+        api_key=configured_key,
+        model=PILOT_MODEL,
+        base_url=DEFAULT_BASE_URL,
+        timeout_seconds=30.0,
+        client=client,
+        max_output_tokens=CONNECTION_TEST_OUTPUT_TOKEN_CEILING,
+        max_retries=0,
+    )
+    guardrail = GroqPilotRequestGuardrailProvider(provider=provider, max_requests=1)
+
+    t_start = time.perf_counter()
+    try:
+        completion = guardrail.complete([
+            LLMMessage(role="user", content=CONNECTION_TEST_PROMPT),
+        ])
+        latency_ms = round((time.perf_counter() - t_start) * 1000.0, 2)
+        resp_text = (completion.message.content or "").strip()
+        success = EXPECTED_CONNECTION_TEST_TOKEN in resp_text
+
+        error = None
+        error_type = None
+        if not success:
+            error = f"Expected token {EXPECTED_CONNECTION_TEST_TOKEN!r} not found in model response: {resp_text!r}"
+            error_type = "UnexpectedResponseError"
+
+        usage_dict = usage_to_dict(completion.usage)
+        usage_prov = "provider_reported" if (completion.usage and completion.usage.is_provider_reported) else "unknown"
+
+        payload = {
+            "status": "passed" if success else "failed",
+            "success": success,
+            "model_requested": PILOT_MODEL,
+            "actual_model_identifier": completion.model_identifier,
+            "provider_request_id": completion.provider_request_id,
+            "system_fingerprint": completion.system_fingerprint,
+            "latency_ms": latency_ms,
+            "timestamp_utc": ts_utc,
+            "prompt_sent": CONNECTION_TEST_PROMPT,
+            "response_text": resp_text,
+            "token_usage": usage_dict,
+            "usage_provenance": usage_prov,
+            "billing_tier": "free",
+            "artifact_file": str(result_path),
+            "requests_made": guardrail.total_requests,
+            "max_requests_allowed": 1,
+            "error": error,
+            "error_type": error_type,
+        }
+
+    except Exception as exc:
+        latency_ms = round((time.perf_counter() - t_start) * 1000.0, 2)
+        exc_type_name = type(exc).__name__
+        exc_msg = str(exc)
+        for secret in filter(None, [api_key, os.environ.get("GROQ_API_KEY")]):
+            exc_msg = exc_msg.replace(secret, "[REDACTED_API_KEY]")
+
+        payload = {
+            "status": "failed",
+            "success": False,
+            "error": exc_msg,
+            "error_type": exc_type_name,
+            "model_requested": PILOT_MODEL,
+            "actual_model_identifier": None,
+            "provider_request_id": None,
+            "system_fingerprint": None,
+            "latency_ms": latency_ms,
+            "timestamp_utc": ts_utc,
+            "prompt_sent": CONNECTION_TEST_PROMPT,
+            "response_text": None,
+            "token_usage": None,
+            "usage_provenance": None,
+            "billing_tier": "free",
+            "artifact_file": str(result_path),
+            "requests_made": guardrail.total_requests,
+            "max_requests_allowed": 1,
+        }
+
+    result_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return payload
+
+
+# =============================================================================
+# 8b. STANDALONE ONE-REQUEST TOOL-CALLING SMOKE TEST
+# =============================================================================
+
+def run_groq_tool_calling_smoke_test(
+    api_key: Optional[str] = None,
+    output_dir: Optional[Union[str, Path]] = None,
+    smoke_test_tool_call: bool = False,
+    confirm_smoke_test_tool_call: bool = False,
+    client: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Execute a single-request live tool calling smoke test against Groq Cloud API.
+
+    Verifies:
+    1. Tool definition serialization for inspect_plan.
+    2. Forced tool invocation via named tool_choice.
+    3. Return of exactly one tool call matching 'inspect_plan'.
+    4. Valid JSON arguments.
+    5. No inspection function is executed and no application state is mutated.
+    6. Usage reporting and latency extraction.
+    7. Hard limit of 1 HTTP request maximum (zero SDK retries).
+    """
+    if not (smoke_test_tool_call and confirm_smoke_test_tool_call):
+        raise RuntimeError(
+            "Standalone Groq tool-calling smoke test requires explicit dual confirmation: "
+            "both --smoke-test-tool-call and --confirm-smoke-test-tool-call flags must be supplied. "
+            "Neither flag alone may make a network request."
+        )
+
+    configured_key = api_key or os.environ.get("GROQ_API_KEY", "")
+    key_configured = bool(configured_key and configured_key.strip())
+
+    ts_utc = datetime.now(timezone.utc).isoformat()
+    test_run_id = f"groq_smoke_tool_call_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+
+    artifact_dir = Path(output_dir) if output_dir else Path(DEFAULT_TOOL_SMOKE_TEST_ARTIFACT_DIR) / test_run_id
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    result_path = artifact_dir / "tool_calling_smoke_test_result.json"
+
+    if not key_configured:
+        payload = {
+            "status": "failed",
+            "success": False,
+            "test_name": "tool_calling_smoke_test",
+            "error": "GROQ_API_KEY environment variable is not configured.",
+            "error_type": "MissingAPIKeyError",
+            "model_requested": PILOT_MODEL,
+            "actual_model_identifier": None,
+            "provider_request_id": None,
+            "system_fingerprint": None,
+            "latency_ms": 0.0,
+            "timestamp_utc": ts_utc,
+            "prompt_sent": TOOL_SMOKE_TEST_PROMPT,
+            "tool_definitions_sent": [INSPECT_PLAN_TOOL_DEFINITION],
+            "tool_choice_sent": INSPECT_PLAN_TOOL_CHOICE,
+            "tool_calls_received": None,
+            "tool_calls_count": 0,
+            "tool_call_name_matches": False,
+            "tool_call_arguments_valid_json": False,
+            "tool_call_arguments_parsed": None,
+            "function_executed": False,
+            "state_mutated": False,
+            "token_usage": None,
+            "usage_provenance": None,
+            "billing_tier": "free",
+            "artifact_file": str(result_path),
+            "requests_made": 0,
+            "max_requests_allowed": 1,
+        }
+        result_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return payload
+
+    provider = GroqProvider(
+        api_key=configured_key,
+        model=PILOT_MODEL,
+        base_url=DEFAULT_BASE_URL,
+        timeout_seconds=30.0,
+        client=client,
+        max_output_tokens=TOOL_SMOKE_TEST_OUTPUT_TOKEN_CEILING,
+        max_retries=0,
+    )
+    guardrail = GroqPilotRequestGuardrailProvider(provider=provider, max_requests=1)
+
+    t_start = time.perf_counter()
+    try:
+        completion = guardrail.complete(
+            messages=[LLMMessage(role="user", content=TOOL_SMOKE_TEST_PROMPT)],
+            tools=[INSPECT_PLAN_TOOL_DEFINITION],
+            tool_choice=INSPECT_PLAN_TOOL_CHOICE,
+            response_format=None,
+        )
+        latency_ms = round((time.perf_counter() - t_start) * 1000.0, 2)
+
+        tool_calls = completion.message.tool_calls or []
+        tool_calls_count = len(tool_calls)
+
+        name_matches = False
+        args_valid_json = False
+        parsed_args = None
+        error = None
+        error_type = None
+
+        if tool_calls_count != 1:
+            error = f"Expected exactly 1 tool call, got {tool_calls_count}"
+            error_type = "ToolCallCountError"
+        else:
+            primary_tc = tool_calls[0]
+            fn_dict = primary_tc.get("function", {})
+            call_name = fn_dict.get("name") or primary_tc.get("name", "")
+            name_matches = (call_name == "inspect_plan")
+            if not name_matches:
+                error = f"Expected tool name 'inspect_plan', got {call_name!r}"
+                error_type = "ToolNameMismatchError"
+            else:
+                raw_args = fn_dict.get("arguments") or primary_tc.get("arguments", "{}")
+                try:
+                    parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+                    if not isinstance(parsed_args, dict):
+                        raise ValueError(f"Arguments must be a dict object, got {type(parsed_args).__name__}")
+                    args_valid_json = True
+                except Exception as exc:
+                    args_valid_json = False
+                    error = f"Malformed tool arguments JSON: {exc}"
+                    error_type = "MalformedArgumentsError"
+
+        success = (tool_calls_count == 1) and name_matches and args_valid_json and (error is None)
+
+        usage_dict = usage_to_dict(completion.usage)
+        usage_prov = "provider_reported" if (completion.usage and completion.usage.is_provider_reported) else "unknown"
+
+        payload = {
+            "status": "passed" if success else "failed",
+            "success": success,
+            "test_name": "tool_calling_smoke_test",
+            "model_requested": PILOT_MODEL,
+            "actual_model_identifier": completion.model_identifier,
+            "provider_request_id": completion.provider_request_id,
+            "system_fingerprint": completion.system_fingerprint,
+            "latency_ms": latency_ms,
+            "timestamp_utc": ts_utc,
+            "prompt_sent": TOOL_SMOKE_TEST_PROMPT,
+            "tool_definitions_sent": [INSPECT_PLAN_TOOL_DEFINITION],
+            "tool_choice_sent": INSPECT_PLAN_TOOL_CHOICE,
+            "tool_calls_received": tool_calls,
+            "tool_calls_count": tool_calls_count,
+            "tool_call_name_matches": name_matches,
+            "tool_call_arguments_valid_json": args_valid_json,
+            "tool_call_arguments_parsed": parsed_args,
+            "function_executed": False,
+            "state_mutated": False,
+            "token_usage": usage_dict,
+            "usage_provenance": usage_prov,
+            "billing_tier": "free",
+            "artifact_file": str(result_path),
+            "requests_made": guardrail.total_requests,
+            "max_requests_allowed": 1,
+            "error": error,
+            "error_type": error_type,
+        }
+
+    except Exception as exc:
+        latency_ms = round((time.perf_counter() - t_start) * 1000.0, 2)
+        exc_type_name = type(exc).__name__
+        exc_msg = str(exc)
+        for secret in filter(None, [api_key, os.environ.get("GROQ_API_KEY")]):
+            exc_msg = exc_msg.replace(secret, "[REDACTED_API_KEY]")
+
+        payload = {
+            "status": "failed",
+            "success": False,
+            "test_name": "tool_calling_smoke_test",
+            "error": exc_msg,
+            "error_type": exc_type_name,
+            "model_requested": PILOT_MODEL,
+            "actual_model_identifier": None,
+            "provider_request_id": None,
+            "system_fingerprint": None,
+            "latency_ms": latency_ms,
+            "timestamp_utc": ts_utc,
+            "prompt_sent": TOOL_SMOKE_TEST_PROMPT,
+            "tool_definitions_sent": [INSPECT_PLAN_TOOL_DEFINITION],
+            "tool_choice_sent": INSPECT_PLAN_TOOL_CHOICE,
+            "tool_calls_received": None,
+            "tool_calls_count": 0,
+            "tool_call_name_matches": False,
+            "tool_call_arguments_valid_json": False,
+            "tool_call_arguments_parsed": None,
+            "function_executed": False,
+            "state_mutated": False,
+            "token_usage": None,
+            "usage_provenance": None,
+            "billing_tier": "free",
+            "artifact_file": str(result_path),
+            "requests_made": guardrail.total_requests,
+            "max_requests_allowed": 1,
+        }
+
+    result_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return payload
+
+
+# =============================================================================
+# 8c. STANDALONE ONE-REQUEST CONDITION A JSON SMOKE TEST
+# =============================================================================
+
+def run_groq_json_smoke_test(
+    api_key: Optional[str] = None,
+    output_dir: Optional[Union[str, Path]] = None,
+    smoke_test_json: bool = False,
+    confirm_smoke_test_json: bool = False,
+    client: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Execute a single-request live Condition A JSON smoke test against Groq Cloud API.
+
+    Verifies:
+    1. Prompt-directed JSON generation without response_format (mirroring ConditionAAgent).
+    2. Parsing of response via json.loads() (with markdown fence stripping).
+    3. Strict validation via ConditionAEnvelopeAdapter.
+    4. Decision equals 'REJECT'.
+    5. Rejection category equals 'allergen_conflict'.
+    6. Non-empty explanation reason.
+    7. Usage reporting and latency extraction.
+    8. Hard limit of 1 HTTP request maximum (zero SDK retries).
+    """
+    if not (smoke_test_json and confirm_smoke_test_json):
+        raise RuntimeError(
+            "Standalone Groq JSON smoke test requires explicit dual confirmation: "
+            "both --smoke-test-json and --confirm-smoke-test-json flags must be supplied. "
+            "Neither flag alone may make a network request."
+        )
+
+    configured_key = api_key or os.environ.get("GROQ_API_KEY", "")
+    key_configured = bool(configured_key and configured_key.strip())
+
+    ts_utc = datetime.now(timezone.utc).isoformat()
+    test_run_id = f"groq_smoke_json_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+
+    artifact_dir = Path(output_dir) if output_dir else Path(DEFAULT_JSON_SMOKE_TEST_ARTIFACT_DIR) / test_run_id
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    result_path = artifact_dir / "json_smoke_test_result.json"
+
+    if not key_configured:
+        payload = {
+            "status": "failed",
+            "success": False,
+            "test_name": "json_envelope_smoke_test",
+            "error": "GROQ_API_KEY environment variable is not configured.",
+            "error_type": "MissingAPIKeyError",
+            "model_requested": PILOT_MODEL,
+            "actual_model_identifier": None,
+            "provider_request_id": None,
+            "system_fingerprint": None,
+            "latency_ms": 0.0,
+            "timestamp_utc": ts_utc,
+            "prompt_sent": JSON_SMOKE_TEST_USER_PROMPT,
+            "response_format_sent": None,
+            "raw_response_text": None,
+            "json_parsed_successfully": False,
+            "pydantic_envelope_validated": False,
+            "envelope_decision": None,
+            "envelope_rejection_category": None,
+            "envelope_reason": None,
+            "token_usage": None,
+            "usage_provenance": None,
+            "billing_tier": "free",
+            "artifact_file": str(result_path),
+            "requests_made": 0,
+            "max_requests_allowed": 1,
+        }
+        result_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return payload
+
+    provider = GroqProvider(
+        api_key=configured_key,
+        model=PILOT_MODEL,
+        base_url=DEFAULT_BASE_URL,
+        timeout_seconds=30.0,
+        client=client,
+        max_output_tokens=JSON_SMOKE_TEST_OUTPUT_TOKEN_CEILING,
+        max_retries=0,
+    )
+    guardrail = GroqPilotRequestGuardrailProvider(provider=provider, max_requests=1)
+
+    t_start = time.perf_counter()
+    try:
+        completion = guardrail.complete(
+            messages=[
+                LLMMessage(role="system", content=JSON_SMOKE_TEST_SYSTEM_PROMPT),
+                LLMMessage(role="user", content=JSON_SMOKE_TEST_USER_PROMPT),
+            ],
+            tools=None,
+            tool_choice=None,
+            response_format=None,
+        )
+        latency_ms = round((time.perf_counter() - t_start) * 1000.0, 2)
+        raw_text = completion.message.content or ""
+
+        # Strip markdown fences if present (identical to ConditionAAgent)
+        clean_text = raw_text.strip()
+        if clean_text.startswith("```"):
+            clean_lines = clean_text.splitlines()
+            if clean_lines[0].startswith("```"):
+                clean_lines = clean_lines[1:]
+            if clean_lines and clean_lines[-1].startswith("```"):
+                clean_lines = clean_lines[:-1]
+            clean_text = "\n".join(clean_lines).strip()
+
+        json_parsed = False
+        pydantic_validated = False
+        decision = None
+        rejection_cat = None
+        reason = None
+        error = None
+        error_type = None
+
+        try:
+            parsed_raw = json.loads(clean_text)
+            json_parsed = True
+        except Exception as j_exc:
+            error = f"Failed to parse JSON from model output: {j_exc}"
+            error_type = "JSONDecodeError"
+
+        if json_parsed:
+            try:
+                envelope = ConditionAEnvelopeAdapter.validate_python(parsed_raw)
+                pydantic_validated = True
+                decision = getattr(envelope, "decision", None)
+                rejection_cat_val = getattr(envelope, "rejection_category", None)
+                if isinstance(rejection_cat_val, RejectionCategory):
+                    rejection_cat = rejection_cat_val.value
+                elif rejection_cat_val is not None:
+                    rejection_cat = str(rejection_cat_val)
+                reason = getattr(envelope, "reason", None)
+
+                if decision != "REJECT":
+                    error = f"Expected decision 'REJECT', got {decision!r}"
+                    error_type = "UnexpectedDecisionError"
+                elif rejection_cat != RejectionCategory.ALLERGEN_CONFLICT.value:
+                    error = f"Expected rejection_category 'allergen_conflict', got {rejection_cat!r}"
+                    error_type = "UnexpectedRejectionCategoryError"
+                elif not (reason and str(reason).strip()):
+                    error = "Expected non-empty rejection reason string."
+                    error_type = "EmptyReasonError"
+
+            except ValidationError as v_exc:
+                error = f"Condition A envelope validation failed: {v_exc}"
+                error_type = "ValidationError"
+
+        success = (
+            json_parsed
+            and pydantic_validated
+            and (decision == "REJECT")
+            and (rejection_cat == "allergen_conflict")
+            and bool(reason and str(reason).strip())
+            and (error is None)
+        )
+
+        usage_dict = usage_to_dict(completion.usage)
+        usage_prov = "provider_reported" if (completion.usage and completion.usage.is_provider_reported) else "unknown"
+
+        payload = {
+            "status": "passed" if success else "failed",
+            "success": success,
+            "test_name": "json_envelope_smoke_test",
+            "model_requested": PILOT_MODEL,
+            "actual_model_identifier": completion.model_identifier,
+            "provider_request_id": completion.provider_request_id,
+            "system_fingerprint": completion.system_fingerprint,
+            "latency_ms": latency_ms,
+            "timestamp_utc": ts_utc,
+            "prompt_sent": JSON_SMOKE_TEST_USER_PROMPT,
+            "response_format_sent": None,
+            "raw_response_text": raw_text,
+            "json_parsed_successfully": json_parsed,
+            "pydantic_envelope_validated": pydantic_validated,
+            "envelope_decision": decision,
+            "envelope_rejection_category": rejection_cat,
+            "envelope_reason": reason,
+            "token_usage": usage_dict,
+            "usage_provenance": usage_prov,
+            "billing_tier": "free",
+            "artifact_file": str(result_path),
+            "requests_made": guardrail.total_requests,
+            "max_requests_allowed": 1,
+            "error": error,
+            "error_type": error_type,
+        }
+
+    except Exception as exc:
+        latency_ms = round((time.perf_counter() - t_start) * 1000.0, 2)
+        exc_type_name = type(exc).__name__
+        exc_msg = str(exc)
+        for secret in filter(None, [api_key, os.environ.get("GROQ_API_KEY")]):
+            exc_msg = exc_msg.replace(secret, "[REDACTED_API_KEY]")
+
+        payload = {
+            "status": "failed",
+            "success": False,
+            "test_name": "json_envelope_smoke_test",
+            "error": exc_msg,
+            "error_type": exc_type_name,
+            "model_requested": PILOT_MODEL,
+            "actual_model_identifier": None,
+            "provider_request_id": None,
+            "system_fingerprint": None,
+            "latency_ms": latency_ms,
+            "timestamp_utc": ts_utc,
+            "prompt_sent": JSON_SMOKE_TEST_USER_PROMPT,
+            "response_format_sent": None,
+            "raw_response_text": None,
+            "json_parsed_successfully": False,
+            "pydantic_envelope_validated": False,
+            "envelope_decision": None,
+            "envelope_rejection_category": None,
+            "envelope_reason": None,
+            "token_usage": None,
+            "usage_provenance": None,
+            "billing_tier": "free",
+            "artifact_file": str(result_path),
+            "requests_made": guardrail.total_requests,
+            "max_requests_allowed": 1,
+        }
+
+    result_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return payload
+
+
+# =============================================================================
+# 9. ARTIFACT WRITERS
+# =============================================================================
+
+def _patch_pilot_analysis_markdown(
+    analysis_path: Path,
+    run_id: str,
+    is_live: bool,
+    guardrail: GroqPilotRequestGuardrailProvider,
+    max_requests: int = PROTOCOL_V2_GLOBAL_REQUEST_CEILING,
+    incomplete_reason: Optional[str] = None,
+) -> None:
+    existing = analysis_path.read_text(encoding="utf-8") if analysis_path.exists() else ""
+    banner = f"""# {PILOT_TAG}
+> [!IMPORTANT]
+> **LIMITED SAMPLE SIZE NOTICE**: This report represents a controlled preliminary pilot
+> consisting of 3 tasks across Conditions A, B, and C (9 runs).
+> It is **NOT** the full 25-task benchmark.
+
+- **Pilot Run ID:** `{run_id}`
+- **Execution Mode:** `{'LIVE GROQ CLOUD API' if is_live else 'OFFLINE SIMULATED TEST DOUBLE'}`
+- **Model Identifier:** `{PILOT_MODEL}`
+- **Total Provider Requests Used:** `{guardrail.total_requests}`
+- **Request Ceiling:** `{max_requests}`
+"""
+    if incomplete_reason:
+        banner += f"\n> [!WARNING]\n> **INCOMPLETE PILOT**: {incomplete_reason}\n\n"
+    banner += "\n---\n\n"
+    analysis_path.write_text(banner + existing, encoding="utf-8")
+
+
+# =============================================================================
+# 10. CLI ENTRYPOINT
+# =============================================================================
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="ShopConnect Groq Pilot Execution Harness")
+    parser.add_argument("--preflight", action="store_true", help="Run offline preflight validation")
+    parser.add_argument("--dry-run", action="store_true", help="Run offline simulated dry-run (9 runs)")
+    parser.add_argument("--live", action="store_true", help="Enable live Groq API pilot")
+    parser.add_argument("--confirm-live", action="store_true", help="Confirm live Groq API pilot")
+    parser.add_argument("--connection-test", action="store_true", help="Enable one-request connection test")
+    parser.add_argument("--confirm-connection-test", action="store_true", help="Confirm one-request connection test")
+    parser.add_argument("--smoke-test-tool-call", action="store_true", help="Enable one-request tool calling smoke test")
+    parser.add_argument("--confirm-smoke-test-tool-call", action="store_true", help="Confirm one-request tool calling smoke test")
+    parser.add_argument("--smoke-test-json", action="store_true", help="Enable one-request Condition A JSON envelope smoke test")
+    parser.add_argument("--confirm-smoke-test-json", action="store_true", help="Confirm one-request Condition A JSON envelope smoke test")
+    parser.add_argument("--catalog", default="data/catalog_seed.json")
+    parser.add_argument("--fixtures", default="data/plan_fixtures.json")
+    parser.add_argument("--tasks", default="data/tasks.jsonl")
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument(
+        "--protocol-version",
+        default="v2",
+        choices=["v1", "v2"],
+        help="Protocol version (default: v2)",
+    )
+    parser.add_argument(
+        "--conditions",
+        nargs="+",
+        default=list(PILOT_CONDITIONS),
+        choices=["A", "B", "C"],
+        help="Conditions to run (default: A B C)",
+    )
+    parser.add_argument(
+        "--enforce-itpm",
+        action="store_true",
+        default=False,
+        help="Enforce strict ITPM prompt size limits in preflight (Condition A rejected if > 7000 tokens)",
+    )
+
+    args = parser.parse_args(argv)
+
+    if args.connection_test or args.confirm_connection_test:
+        if not (args.connection_test and args.confirm_connection_test):
+            print("ERROR: Connection test requires both --connection-test AND --confirm-connection-test.")
+            return 1
+        res = run_groq_connection_test(output_dir=args.output_dir, connection_test=True, confirm_connection_test=True)
+        print(json.dumps(res, indent=2))
+        return 0 if res.get("success") else 1
+
+    if args.smoke_test_tool_call or args.confirm_smoke_test_tool_call:
+        if not (args.smoke_test_tool_call and args.confirm_smoke_test_tool_call):
+            print("ERROR: Tool calling smoke test requires both --smoke-test-tool-call AND --confirm-smoke-test-tool-call.")
+            return 1
+        res = run_groq_tool_calling_smoke_test(
+            output_dir=args.output_dir,
+            smoke_test_tool_call=True,
+            confirm_smoke_test_tool_call=True,
+        )
+        print(json.dumps(res, indent=2))
+        return 0 if res.get("success") else 1
+
+    if args.smoke_test_json or args.confirm_smoke_test_json:
+        if not (args.smoke_test_json and args.confirm_smoke_test_json):
+            print("ERROR: JSON smoke test requires both --smoke-test-json AND --confirm-smoke-test-json.")
+            return 1
+        res = run_groq_json_smoke_test(
+            output_dir=args.output_dir,
+            smoke_test_json=True,
+            confirm_smoke_test_json=True,
+        )
+        print(json.dumps(res, indent=2))
+        return 0 if res.get("success") else 1
+
+    if args.preflight:
+        pf = run_groq_pilot_preflight(
+            args.catalog,
+            args.fixtures,
+            args.tasks,
+            protocol_version=args.protocol_version,
+            conditions=tuple(args.conditions),
+            enforce_itpm_limits=args.enforce_itpm,
+        )
+        print(json.dumps(pf, indent=2))
+        return 0 if pf["status"] == "passed" else 1
+
+    if args.dry_run:
+        res = run_groq_pilot_dry_run(
+            args.catalog,
+            args.fixtures,
+            args.tasks,
+            args.output_dir,
+            protocol_version=args.protocol_version,
+            conditions=tuple(args.conditions),
+        )
+        print(json.dumps(res, indent=2))
+        return 0 if res["status"] == "completed" else 1
+
+    if args.live or args.confirm_live:
+        if not (args.live and args.confirm_live):
+            print("ERROR: Live pilot requires both --live AND --confirm-live.")
+            return 1
+        res = run_live_groq_pilot(
+            catalog_path=args.catalog,
+            fixtures_path=args.fixtures,
+            tasks_path=args.tasks,
+            output_dir=args.output_dir,
+            live=True,
+            confirm_live=True,
+            protocol_version=args.protocol_version,
+            conditions=tuple(args.conditions),
+            enforce_itpm_limits=True,
+        )
+        print(json.dumps(res, indent=2))
+        return 0 if res["status"] == "completed" else 1
+
+    parser.print_help()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

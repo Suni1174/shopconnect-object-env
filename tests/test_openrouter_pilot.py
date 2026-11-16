@@ -24,6 +24,7 @@ import pytest
 
 from shopconnect_env.agents.providers import (
     AuthenticationError,
+    ConfigurationError,
     LLMCompletionResult,
     LLMMessage,
     LLMUsage,
@@ -39,6 +40,10 @@ from shopconnect_env.evaluation.openrouter_pilot import (
     MAX_THEORETICAL_TOTAL_REQUESTS,
     MAX_TOTAL_PROVIDER_REQUESTS,
     PILOT_MODEL,
+    PROTOCOL_V2_GLOBAL_REQUEST_CEILING,
+    PROTOCOL_V2_MAX_INSPECTIONS_PER_CONDITION_C,
+    PROTOCOL_V2_MAX_REQUESTS_PER_CONDITION_C,
+    PROTOCOL_V2_MAX_THEORETICAL_TOTAL_REQUESTS,
     OpenRouterPilotRequestGuardrailProvider,
     SequentialRateLimiter,
     create_openrouter_pilot_mock_provider,
@@ -293,3 +298,120 @@ def test_openrouter_live_runner_dual_confirmation():
 
     with pytest.raises(RuntimeError, match="requires explicit dual confirmation"):
         run_live_openrouter_pilot(live=False, confirm_live=True)
+
+
+# =============================================================================
+# 6. PROTOCOL V2 INTEGRATION TESTS (OFFLINE)
+# =============================================================================
+
+def test_openrouter_v1_backward_compatibility(tmp_path):
+    """v1 must remain the default: 4 Condition C requests, ceiling 20, v1 artifacts."""
+    pf = run_openrouter_pilot_preflight()
+    assert pf["protocol_version"] == "v1"
+    assert pf["max_requests_per_condition_c"] == 4
+    assert pf["max_theoretical_requests"] == 18
+    assert pf["global_request_ceiling"] == 20
+
+    dry = run_openrouter_pilot_dry_run(output_dir=tmp_path)
+    assert dry["protocol_version"] == "v1"
+    assert dry["max_requests_per_condition_c"] == 4
+    assert dry["max_requests_ceiling"] == 20
+    assert dry["runs_completed"] == 9
+
+    raw_runs = (tmp_path / "raw_runs.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(raw_runs) == 9
+    for line in raw_runs:
+        rec = json.loads(line)
+        assert rec["protocol_version"] == "v1"
+
+
+def test_openrouter_v2_request_limits():
+    """v2 preflight must configure Condition C=6, inspections=5, ceiling=28, theoretical=24."""
+    pf = run_openrouter_pilot_preflight(protocol_version="v2")
+    assert pf["protocol_version"] == "v2"
+    assert pf["max_requests_per_condition_a"] == 1
+    assert pf["max_requests_per_condition_b"] == 1
+    assert pf["max_requests_per_condition_c"] == 6
+    assert pf["max_inspections_per_condition_c"] == 5
+    assert pf["max_theoretical_requests"] == 24
+    assert pf["global_request_ceiling"] == 28
+
+
+def test_openrouter_v2_output_directory_routing():
+    """v2 default output directory must route to artifacts/protocol_v2_pilot/<run_id>."""
+    res = run_openrouter_pilot_dry_run(protocol_version="v2")
+    out_dir = Path(res["output_directory"])
+    try:
+        assert "artifacts" in out_dir.parts
+        assert "protocol_v2_pilot" in out_dir.parts
+        assert out_dir.name.startswith("openrouter_dry_run_")
+        assert (out_dir / "raw_runs.jsonl").exists()
+    finally:
+        import shutil
+        if out_dir.exists() and "protocol_v2_pilot" in out_dir.parts:
+            shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_openrouter_v2_protocol_version_propagation(tmp_path):
+    """Protocol version 'v2' must be propagated into all RunRecords in raw_runs.jsonl."""
+    res = run_openrouter_pilot_dry_run(output_dir=tmp_path, protocol_version="v2")
+    assert res["status"] == "completed"
+    assert res["protocol_version"] == "v2"
+
+    raw_runs = (tmp_path / "raw_runs.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(raw_runs) == 9
+    for line in raw_runs:
+        rec = json.loads(line)
+        assert rec["protocol_version"] == "v2"
+        assert "legacy_v1_task_success" in rec
+        assert "system_safety_success" in rec
+        assert "model_decision_correct" in rec
+        assert "target_operation_correct" in rec
+
+
+def test_openrouter_free_model_enforcement():
+    """Provider must strictly enforce the :free suffix and prohibit dynamic routing."""
+    with pytest.raises(ConfigurationError, match="must have ':free' suffix"):
+        OpenRouterProvider(api_key="mock-key", model="qwen/qwen3.8-27b")
+
+    with pytest.raises(ConfigurationError, match="must have ':free' suffix"):
+        OpenRouterProvider(api_key="mock-key", model="qwen/qwen-2.5-72b-instruct")
+
+    with pytest.raises(ConfigurationError, match="Dynamic routing model 'openrouter/free' is prohibited"):
+        OpenRouterProvider(api_key="mock-key", model="openrouter/free")
+
+    prov = OpenRouterProvider(api_key="mock-key", model="qwen/qwen3.8-27b:free")
+    assert prov.model == "qwen/qwen3.8-27b:free"
+
+
+def test_openrouter_v2_zero_network_dry_run(tmp_path):
+    """v2 dry-run must execute 9 tasks with zero network calls and produce all artifacts."""
+    res = run_openrouter_pilot_dry_run(output_dir=tmp_path, protocol_version="v2")
+    assert res["status"] == "completed"
+    assert res["network_calls_made"] == 0
+    assert res["runs_completed"] == 9
+    assert res["runs_planned"] == 9
+    assert res["total_provider_requests"] <= 24
+    assert res["max_requests_per_condition_c"] == 6
+    assert res["max_inspections_per_condition_c"] == 5
+    assert res["max_requests_ceiling"] == 28
+
+    assert (tmp_path / "raw_runs.jsonl").exists()
+    assert (tmp_path / "comparison.csv").exists()
+    assert (tmp_path / "analysis.md").exists()
+    assert (tmp_path / "raw_runs.jsonl").stat().st_size > 0
+    assert (tmp_path / "comparison.csv").stat().st_size > 0
+    assert (tmp_path / "analysis.md").stat().st_size > 0
+
+
+def test_openrouter_v2_request_ceiling_enforcement(tmp_path):
+    """v2 dry-run must halt cleanly when request ceiling is reached."""
+    res = run_openrouter_pilot_dry_run(
+        output_dir=tmp_path,
+        protocol_version="v2",
+        max_requests=5,
+    )
+    assert res["status"] == "incomplete"
+    assert res["ceiling_reached"] is True
+    assert res["total_provider_requests"] == 5
+    assert "ceiling" in res["incomplete_reason"].lower()

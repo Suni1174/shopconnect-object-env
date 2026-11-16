@@ -95,6 +95,14 @@ MAX_THEORETICAL_TOTAL_REQUESTS: int = PILOT_TASKS_COUNT * (
 # Global hard ceiling adapted to free variant quotas (20 RPM, 50 RPD documented; ceiling 20)
 MAX_TOTAL_PROVIDER_REQUESTS: int = 20
 GLOBAL_REQUEST_CEILING: int = MAX_TOTAL_PROVIDER_REQUESTS
+
+# Protocol v2 budgets
+PROTOCOL_V2_MAX_REQUESTS_PER_CONDITION_C: int = 6
+PROTOCOL_V2_MAX_INSPECTIONS_PER_CONDITION_C: int = 5
+PROTOCOL_V2_MAX_THEORETICAL_TOTAL_REQUESTS: int = PILOT_TASKS_COUNT * (
+    MAX_REQUESTS_PER_CONDITION_A + MAX_REQUESTS_PER_CONDITION_B + PROTOCOL_V2_MAX_REQUESTS_PER_CONDITION_C
+)  # 3 * (1 + 1 + 6) = 24 requests
+PROTOCOL_V2_GLOBAL_REQUEST_CEILING: int = 28
 DEFAULT_OUTPUT_TOKEN_CEILING: int = 2048
 PILOT_MODEL: str = "qwen/qwen3.8-27b:free"
 PILOT_TAG: str = "REAL_API_PILOT (OPENROUTER) — LIMITED_SAMPLE — NOT_FULL_EXPERIMENT"
@@ -279,6 +287,7 @@ def run_openrouter_pilot_preflight(
     fixtures_path: Union[str, Path] = "data/plan_fixtures.json",
     tasks_path: Union[str, Path] = "data/tasks.jsonl",
     api_key: Optional[str] = None,
+    protocol_version: str = "v1",
 ) -> Dict[str, Any]:
     """Execute preflight configuration and data integrity validation for OpenRouter."""
     catalog_p = Path(catalog_path)
@@ -347,6 +356,11 @@ def run_openrouter_pilot_preflight(
         pricing = None
         errors.append(f"Invalid pricing configuration: {e}")
 
+    c_reqs = PROTOCOL_V2_MAX_REQUESTS_PER_CONDITION_C if protocol_version == "v2" else MAX_REQUESTS_PER_CONDITION_C
+    c_insps = PROTOCOL_V2_MAX_INSPECTIONS_PER_CONDITION_C if protocol_version == "v2" else MAX_INSPECTIONS_PER_CONDITION_C
+    theor_reqs = PROTOCOL_V2_MAX_THEORETICAL_TOTAL_REQUESTS if protocol_version == "v2" else MAX_THEORETICAL_TOTAL_REQUESTS
+    ceil_reqs = PROTOCOL_V2_GLOBAL_REQUEST_CEILING if protocol_version == "v2" else MAX_TOTAL_PROVIDER_REQUESTS
+
     return {
         "status": "passed" if not errors else "failed",
         "api_key_configured": key_present,
@@ -354,21 +368,22 @@ def run_openrouter_pilot_preflight(
         "planned_runs_count": MAX_PILOT_RUNS,
         "max_requests_per_condition_a": MAX_REQUESTS_PER_CONDITION_A,
         "max_requests_per_condition_b": MAX_REQUESTS_PER_CONDITION_B,
-        "max_requests_per_condition_c": MAX_REQUESTS_PER_CONDITION_C,
-        "max_inspections_per_condition_c": MAX_INSPECTIONS_PER_CONDITION_C,
-        "max_theoretical_requests": MAX_THEORETICAL_TOTAL_REQUESTS,
-        "max_possible_total_requests": MAX_THEORETICAL_TOTAL_REQUESTS,
+        "max_requests_per_condition_c": c_reqs,
+        "max_inspections_per_condition_c": c_insps,
+        "max_theoretical_requests": theor_reqs,
+        "max_possible_total_requests": theor_reqs,
         "request_budget_formula": (
             f"{len(PILOT_TASK_IDS)} tasks × ({MAX_REQUESTS_PER_CONDITION_A} A + "
-            f"{MAX_REQUESTS_PER_CONDITION_B} B + {MAX_REQUESTS_PER_CONDITION_C} C) = "
-            f"{MAX_THEORETICAL_TOTAL_REQUESTS} requests"
+            f"{MAX_REQUESTS_PER_CONDITION_B} B + {c_reqs} C) = "
+            f"{theor_reqs} requests"
         ),
-        "global_request_ceiling": MAX_TOTAL_PROVIDER_REQUESTS,
-        "max_provider_requests_ceiling": MAX_TOTAL_PROVIDER_REQUESTS,
-        "safety_margin_requests": MAX_TOTAL_PROVIDER_REQUESTS - MAX_THEORETICAL_TOTAL_REQUESTS,
+        "global_request_ceiling": ceil_reqs,
+        "max_provider_requests_ceiling": ceil_reqs,
+        "safety_margin_requests": ceil_reqs - theor_reqs,
         "pricing_complete": pricing.is_complete() if pricing else False,
         "billing_tier": "free",
         "tasks_loaded": len(pilot_tasks),
+        "protocol_version": protocol_version,
         "errors": errors,
     }
 
@@ -467,9 +482,25 @@ def run_openrouter_pilot_dry_run(
     output_dir: Optional[Union[str, Path]] = None,
     provider: Optional[LLMProvider] = None,
     rate_limiter: Optional[SequentialRateLimiter] = None,
-    max_requests: int = MAX_TOTAL_PROVIDER_REQUESTS,
+    max_requests: Optional[int] = None,
+    protocol_version: str = "v1",
 ) -> Dict[str, Any]:
     """Execute simulated 9-run pilot offline with deterministic mock data."""
+    if protocol_version == "v2":
+        effective_max_requests = max_requests if max_requests is not None else PROTOCOL_V2_GLOBAL_REQUEST_CEILING
+        c_requests = PROTOCOL_V2_MAX_REQUESTS_PER_CONDITION_C
+        c_inspections = PROTOCOL_V2_MAX_INSPECTIONS_PER_CONDITION_C
+        config_version = "protocol-v2-openrouter-pilot-dry-run"
+        default_dir_name = "protocol_v2_pilot"
+        theoretical_total = PROTOCOL_V2_MAX_THEORETICAL_TOTAL_REQUESTS
+    else:
+        effective_max_requests = max_requests if max_requests is not None else MAX_TOTAL_PROVIDER_REQUESTS
+        c_requests = MAX_REQUESTS_PER_CONDITION_C
+        c_inspections = MAX_INSPECTIONS_PER_CONDITION_C
+        config_version = "phase6.5-openrouter-pilot-dry-run"
+        default_dir_name = "phase6_5_openrouter_pilot"
+        theoretical_total = MAX_THEORETICAL_TOTAL_REQUESTS
+
     ingredients, catalog = load_catalog_from_json(catalog_path)
     fixtures = load_plan_fixtures(fixtures_path, catalog, ingredients)
     all_tasks = load_benchmark_tasks(tasks_path, fixtures, catalog)
@@ -482,7 +513,7 @@ def run_openrouter_pilot_dry_run(
     underlying_provider = provider or create_openrouter_pilot_mock_provider()
     guardrail = OpenRouterPilotRequestGuardrailProvider(
         provider=underlying_provider,
-        max_requests=max_requests,
+        max_requests=effective_max_requests,
         rate_limiter=rate_limiter,
     )
 
@@ -497,19 +528,20 @@ def run_openrouter_pilot_dry_run(
         pricing=pricing,
         default_provider=guardrail,
         experiment_run_id=run_id,
-        experiment_config_version="phase6.5-openrouter-pilot-dry-run",
+        experiment_config_version=config_version,
         provider_mode="simulated",
         model_name="mock-qwen-3.8-27b:free",
-        condition_c_max_model_requests=MAX_REQUESTS_PER_CONDITION_C,
-        condition_c_max_inspections=MAX_INSPECTIONS_PER_CONDITION_C,
+        condition_c_max_model_requests=c_requests,
+        condition_c_max_inspections=c_inspections,
+        protocol_version=protocol_version,
     )
 
     records: List[RunRecord] = []
     incomplete_reason: Optional[str] = None
     for task in pilot_tasks:
         for condition in PILOT_CONDITIONS:
-            if guardrail.total_requests >= max_requests:
-                incomplete_reason = f"Request ceiling of {max_requests} reached before starting {task.task_id} condition {condition}."
+            if guardrail.total_requests >= effective_max_requests:
+                incomplete_reason = f"Request ceiling of {effective_max_requests} reached before starting {task.task_id} condition {condition}."
                 break
             try:
                 rec = runner.run_task(task=task, condition_id=condition, provider=guardrail)
@@ -523,7 +555,7 @@ def run_openrouter_pilot_dry_run(
             break
 
     if output_dir is None:
-        target_dir = Path("artifacts") / "phase6_5_openrouter_pilot" / run_id
+        target_dir = Path("artifacts") / default_dir_name / run_id
     else:
         target_dir = Path(output_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -537,7 +569,7 @@ def run_openrouter_pilot_dry_run(
         run_id=run_id,
         is_live=False,
         guardrail=guardrail,
-        max_requests=max_requests,
+        max_requests=effective_max_requests,
         incomplete_reason=incomplete_reason,
     )
 
@@ -548,14 +580,15 @@ def run_openrouter_pilot_dry_run(
         "runs_completed": len(records),
         "runs_planned": MAX_PILOT_RUNS,
         "total_provider_requests": guardrail.total_requests,
-        "max_theoretical_requests": MAX_THEORETICAL_TOTAL_REQUESTS,
-        "max_requests_per_condition_c": MAX_REQUESTS_PER_CONDITION_C,
-        "max_inspections_per_condition_c": MAX_INSPECTIONS_PER_CONDITION_C,
-        "max_requests_ceiling": max_requests,
-        "global_request_ceiling": MAX_TOTAL_PROVIDER_REQUESTS,
-        "ceiling_reached": not is_complete and (guardrail.total_requests >= max_requests or "ceiling" in (incomplete_reason or "").lower()),
+        "max_theoretical_requests": theoretical_total,
+        "max_requests_per_condition_c": c_requests,
+        "max_inspections_per_condition_c": c_inspections,
+        "max_requests_ceiling": effective_max_requests,
+        "global_request_ceiling": effective_max_requests,
+        "ceiling_reached": not is_complete and (guardrail.total_requests >= effective_max_requests or "ceiling" in (incomplete_reason or "").lower()),
         "network_calls_made": 0,
         "output_directory": str(target_dir),
+        "protocol_version": protocol_version,
         "artifacts": {
             "raw_runs": str(target_dir / "raw_runs.jsonl"),
             "comparison_csv": str(target_dir / "comparison.csv"),
@@ -576,11 +609,12 @@ def run_live_openrouter_pilot(
     output_dir: Optional[Union[str, Path]] = None,
     live: bool = False,
     confirm_live: bool = False,
-    max_requests: int = MAX_TOTAL_PROVIDER_REQUESTS,
+    max_requests: Optional[int] = None,
     min_interval_seconds: float = MIN_REQUEST_INTERVAL_SECONDS,
     client: Optional[Any] = None,
     clock: Optional[Callable[[], float]] = None,
     sleeper: Optional[Callable[[float], None]] = None,
+    protocol_version: str = "v1",
 ) -> Dict[str, Any]:
     """Execute live OpenRouter pilot with strict dual-flag confirmation and request ceilings."""
     if not (live and confirm_live):
@@ -590,12 +624,28 @@ def run_live_openrouter_pilot(
             "Cleanly aborting to prevent unintended API execution."
         )
 
+    if protocol_version == "v2":
+        effective_max_requests = max_requests if max_requests is not None else PROTOCOL_V2_GLOBAL_REQUEST_CEILING
+        c_requests = PROTOCOL_V2_MAX_REQUESTS_PER_CONDITION_C
+        c_inspections = PROTOCOL_V2_MAX_INSPECTIONS_PER_CONDITION_C
+        config_version = "protocol-v2-openrouter-live-pilot"
+        default_dir_name = "protocol_v2_pilot"
+        theoretical_total = PROTOCOL_V2_MAX_THEORETICAL_TOTAL_REQUESTS
+    else:
+        effective_max_requests = max_requests if max_requests is not None else MAX_TOTAL_PROVIDER_REQUESTS
+        c_requests = MAX_REQUESTS_PER_CONDITION_C
+        c_inspections = MAX_INSPECTIONS_PER_CONDITION_C
+        config_version = "phase6.5-openrouter-live-pilot"
+        default_dir_name = "phase6_5_openrouter_pilot"
+        theoretical_total = MAX_THEORETICAL_TOTAL_REQUESTS
+
     # 1. Preflight validation
     preflight = run_openrouter_pilot_preflight(
         catalog_path=catalog_path,
         fixtures_path=fixtures_path,
         tasks_path=tasks_path,
         api_key=api_key,
+        protocol_version=protocol_version,
     )
     if preflight["status"] != "passed":
         raise RuntimeError(f"Preflight validation failed: {preflight['errors']}")
@@ -628,7 +678,7 @@ def run_live_openrouter_pilot(
 
     guardrail = OpenRouterPilotRequestGuardrailProvider(
         provider=base_provider,
-        max_requests=max_requests,
+        max_requests=effective_max_requests,
         rate_limiter=rate_limiter,
     )
 
@@ -643,19 +693,20 @@ def run_live_openrouter_pilot(
         pricing=pricing,
         default_provider=guardrail,
         experiment_run_id=run_id,
-        experiment_config_version="phase6.5-openrouter-live-pilot",
+        experiment_config_version=config_version,
         provider_mode="live",
         model_name=PILOT_MODEL,
-        condition_c_max_model_requests=MAX_REQUESTS_PER_CONDITION_C,
-        condition_c_max_inspections=MAX_INSPECTIONS_PER_CONDITION_C,
+        condition_c_max_model_requests=c_requests,
+        condition_c_max_inspections=c_inspections,
+        protocol_version=protocol_version,
     )
 
     records: List[RunRecord] = []
     incomplete_reason: Optional[str] = None
     for task in pilot_tasks:
         for condition in PILOT_CONDITIONS:
-            if guardrail.total_requests >= max_requests:
-                incomplete_reason = f"Request ceiling of {max_requests} reached before starting {task.task_id} condition {condition}."
+            if guardrail.total_requests >= effective_max_requests:
+                incomplete_reason = f"Request ceiling of {effective_max_requests} reached before starting {task.task_id} condition {condition}."
                 break
             try:
                 rec = runner.run_task(task=task, condition_id=condition, provider=guardrail)
@@ -669,7 +720,7 @@ def run_live_openrouter_pilot(
             break
 
     if output_dir is None:
-        target_dir = Path("artifacts") / "phase6_5_openrouter_pilot" / run_id
+        target_dir = Path("artifacts") / default_dir_name / run_id
     else:
         target_dir = Path(output_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -683,7 +734,7 @@ def run_live_openrouter_pilot(
         run_id=run_id,
         is_live=True,
         guardrail=guardrail,
-        max_requests=max_requests,
+        max_requests=effective_max_requests,
         incomplete_reason=incomplete_reason,
     )
 
@@ -694,12 +745,13 @@ def run_live_openrouter_pilot(
         "runs_completed": len(records),
         "runs_planned": MAX_PILOT_RUNS,
         "total_provider_requests": guardrail.total_requests,
-        "max_theoretical_requests": MAX_THEORETICAL_TOTAL_REQUESTS,
-        "max_requests_per_condition_c": MAX_REQUESTS_PER_CONDITION_C,
-        "max_inspections_per_condition_c": MAX_INSPECTIONS_PER_CONDITION_C,
-        "max_requests_ceiling": max_requests,
-        "global_request_ceiling": MAX_TOTAL_PROVIDER_REQUESTS,
-        "ceiling_reached": not is_complete and (guardrail.total_requests >= max_requests or "ceiling" in (incomplete_reason or "").lower()),
+        "max_theoretical_requests": theoretical_total,
+        "max_requests_per_condition_c": c_requests,
+        "max_inspections_per_condition_c": c_inspections,
+        "max_requests_ceiling": effective_max_requests,
+        "global_request_ceiling": effective_max_requests,
+        "ceiling_reached": not is_complete and (guardrail.total_requests >= effective_max_requests or "ceiling" in (incomplete_reason or "").lower()),
+        "protocol_version": protocol_version,
         "cumulative_tokens": {
             "input": guardrail.cumulative_input_tokens,
             "output": guardrail.cumulative_output_tokens,
@@ -921,6 +973,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--fixtures", default="data/plan_fixtures.json")
     parser.add_argument("--tasks", default="data/tasks.jsonl")
     parser.add_argument("--output-dir", default=None)
+    parser.add_argument(
+        "--protocol-version",
+        default="v1",
+        choices=["v1", "v2"],
+        help="Protocol version (default: v1 for backward compatibility)",
+    )
 
     args = parser.parse_args(argv)
 
@@ -933,12 +991,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0 if res.get("success") else 1
 
     if args.preflight:
-        pf = run_openrouter_pilot_preflight(args.catalog, args.fixtures, args.tasks)
+        pf = run_openrouter_pilot_preflight(args.catalog, args.fixtures, args.tasks, protocol_version=args.protocol_version)
         print(json.dumps(pf, indent=2))
         return 0 if pf["status"] == "passed" else 1
 
     if args.dry_run:
-        res = run_openrouter_pilot_dry_run(args.catalog, args.fixtures, args.tasks, args.output_dir)
+        res = run_openrouter_pilot_dry_run(
+            args.catalog,
+            args.fixtures,
+            args.tasks,
+            args.output_dir,
+            protocol_version=args.protocol_version,
+        )
         print(json.dumps(res, indent=2))
         return 0 if res["status"] == "completed" else 1
 
@@ -953,6 +1017,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             output_dir=args.output_dir,
             live=True,
             confirm_live=True,
+            protocol_version=args.protocol_version,
         )
         print(json.dumps(res, indent=2))
         return 0 if res["status"] == "completed" else 1

@@ -390,6 +390,48 @@ def create_ollama_local_pricing(
     )
 
 
+def create_groq_free_pricing(
+    version: str = "2026-04-groq-free-v1",
+    source: str = "Groq Cloud Documentation (Free Tier)",
+    source_url: str = "https://groq.com/pricing",
+    effective_date: str = "2026-04-15",
+    verification_date: Optional[str] = "2026-04-15",
+    model_name: str = "qwen/qwen3.8-27b",
+    pricing_mode: str = "Free Tier",
+    currency: str = "USD",
+    api_type: str = "chat_completions",
+    privacy_notice: str = (
+        "Groq Cloud Free plan endpoint. Subject to free tier rate limits and upstream availability. "
+        "Benchmark uses synthetic task data only. Rates are unconfigured to avoid inventing zero-cost pricing."
+    ),
+    input_cost_per_million: Optional[Decimal] = None,
+    cached_input_cost_per_million: Optional[Decimal] = None,
+    output_cost_per_million: Optional[Decimal] = None,
+) -> PricingConfig:
+    """Create pricing configuration for Groq Cloud hosted free tier (qwen/qwen3.8-27b).
+
+    Rates are None because the free tier is zero-billed dollar-wise and developer price card
+    rates are not falsely declared as zero cost.
+    """
+    return PricingConfig(
+        version=version,
+        source=source,
+        effective_date=effective_date,
+        currency=currency,
+        input_cost_per_million=input_cost_per_million,
+        cached_input_cost_per_million=cached_input_cost_per_million,
+        output_cost_per_million=output_cost_per_million,
+        verification_date=verification_date,
+        model_name=model_name,
+        pricing_mode=pricing_mode,
+        source_url=source_url,
+        provider_name="Groq",
+        billing_tier="free",
+        api_type=api_type,
+        privacy_notice=privacy_notice,
+    )
+
+
 def calculate_percentile(values: List[Any], percentile: float) -> Optional[float]:
     """Calculate percentile from a list of values using standard linear interpolation.
 
@@ -451,7 +493,7 @@ class RunMetrics:
     protocol_version: str = "v2"
     legacy_v1_task_success: bool = False
     system_safety_success: bool = False
-    model_decision_correct: bool = False
+    model_decision_correct: Optional[bool] = None
     target_operation_correct: Optional[bool] = None
     clarification_correct: Optional[bool] = None
     broker_intercepted_rejection: bool = False

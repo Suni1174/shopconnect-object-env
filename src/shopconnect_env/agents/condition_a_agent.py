@@ -357,7 +357,21 @@ class ConditionAAgent(BaseAgent):
             ),
         ]
 
-        completion = self.provider.complete(messages=messages)
+        try:
+            completion = self.provider.complete(messages=messages)
+        except Exception as exc:
+            return AgentResponse(
+                proposal=None,
+                rationale=f"Agent exception during completion: {exc}",
+                raw_output="",
+                metadata={
+                    "condition_id": "A",
+                    "plan_version": plan_version,
+                    "status": "error",
+                    "error": str(exc),
+                    "total_model_requests": 1,
+                },
+            )
         raw_text = completion.message.content or ""
 
         base_meta: Dict[str, Any] = {

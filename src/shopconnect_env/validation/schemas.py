@@ -38,7 +38,7 @@ class ReplaceMealArgs(BaseModel):
     day: str = Field(..., description="Day of the week (e.g. 'Wednesday')")
     meal_type: str = Field(..., description="Meal slot ('breakfast', 'lunch', or 'dinner')")
     recipe_id: str = Field(..., min_length=1, description="Unique recipe identifier from catalog")
-    servings: Optional[int] = Field(default=None, description="Optional positive integer serving count")
+    servings: int = Field(..., ge=1, le=20, description="Target positive integer serving count between 1 and 20 (e.g. 2 or 4). REQUIRED.")
 
     @field_validator("day")
     @classmethod
@@ -69,9 +69,9 @@ class ReplaceMealArgs(BaseModel):
 
     @field_validator("servings", mode="before")
     @classmethod
-    def validate_servings(cls, v: Any) -> Optional[int]:
+    def validate_servings(cls, v: Any) -> int:
         if v is None:
-            return None
+            raise ValueError("Servings must be explicitly specified and cannot be None.")
         if isinstance(v, bool):
             raise ValueError("servings cannot be a boolean value.")
         if isinstance(v, float):
@@ -80,6 +80,8 @@ class ReplaceMealArgs(BaseModel):
             raise ValueError(f"servings must be an integer, got {type(v).__name__}.")
         if v <= 0:
             raise ValueError(f"servings must be a positive integer (> 0), got {v}.")
+        if v > 20:
+            raise ValueError(f"servings cannot exceed 20, got {v}.")
         return v
 
 

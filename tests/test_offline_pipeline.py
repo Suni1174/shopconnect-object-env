@@ -513,6 +513,7 @@ def test_pipeline_custom_canned_fixtures(base_plan, catalog_data, broker):
                 "day": "Friday",
                 "meal_type": "dinner",
                 "recipe_id": "rec_red_lentil_dahl",
+                "servings": 4,
             },
             reason="Custom research scenario replacement.",
         )
@@ -688,7 +689,7 @@ def test_mock_agent_metadata_strictly_scalar_across_all_paths(base_plan, catalog
     agent_with_canned = MockAgent(canned_tasks={
         "TEST_CANNED": ActionProposal(
             operation=OperationType.REPLACE_MEAL,
-            arguments={"day": "Monday", "meal_type": "breakfast", "recipe_id": "rec_berry_oatmeal"},
+            arguments={"day": "Monday", "meal_type": "breakfast", "recipe_id": "rec_berry_oatmeal", "servings": 2},
             reason="Canned test.",
         )
     })
@@ -731,7 +732,7 @@ def test_canned_proposal_dynamically_receives_context_plan_version(base_plan, ca
     canned = {
         "Swap Friday dinner": ActionProposal(
             operation=OperationType.REPLACE_MEAL,
-            arguments={"day": "Friday", "meal_type": "dinner", "recipe_id": "rec_red_lentil_dahl"},
+            arguments={"day": "Friday", "meal_type": "dinner", "recipe_id": "rec_red_lentil_dahl", "servings": 4},
             reason="Swap Friday dinner.",
             expected_plan_version=999,
         )
@@ -764,7 +765,7 @@ def test_canned_stale_version_fixture_retains_mismatched_version(base_plan, cata
     canned = {
         "TEST_STALE_VERSION": ActionProposal(
             operation=OperationType.REPLACE_MEAL,
-            arguments={"day": "Wednesday", "meal_type": "dinner", "recipe_id": "rec_red_lentil_dahl"},
+            arguments={"day": "Wednesday", "meal_type": "dinner", "recipe_id": "rec_red_lentil_dahl", "servings": 4},
             reason="Intentional stale test.",
             expected_plan_version=777,
         )
