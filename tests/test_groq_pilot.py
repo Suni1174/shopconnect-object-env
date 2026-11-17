@@ -1579,3 +1579,36 @@ def test_cross_task_persistence_of_retained_reservation():
     assert guardrail.total_requests == 2
     # Confirmed token usage strictly contains only Task 2's usage, NOT Task 1's unconfirmed tokens!
     assert guardrail.cumulative_input_tokens == 3200
+
+
+# =============================================================================
+# 12. CLI ENTRYPOINT & STARTUP SANITY TESTS
+# =============================================================================
+
+def test_groq_pilot_cli_startup_clean_no_runpy_warning():
+    """CLI execution via both -m module and direct script path must not produce runpy RuntimeWarning."""
+    import subprocess
+    import sys
+
+    # 1. Test direct script path invocation
+    script_res = subprocess.run(
+        [sys.executable, "src/shopconnect_env/evaluation/groq_pilot.py", "--preflight"],
+        capture_output=True,
+        text=True,
+    )
+    assert script_res.returncode == 0
+    assert "RuntimeWarning" not in script_res.stderr
+    assert "status" in script_res.stdout
+
+    # 2. Test python -m shopconnect_env.evaluation.groq_pilot module invocation
+    env = os.environ.copy()
+    env["PYTHONPATH"] = "src" + (os.pathsep + env["PYTHONPATH"] if "PYTHONPATH" in env else "")
+    module_res = subprocess.run(
+        [sys.executable, "-m", "shopconnect_env.evaluation.groq_pilot", "--preflight"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert module_res.returncode == 0
+    assert "RuntimeWarning" not in module_res.stderr
+    assert "status" in module_res.stdout
