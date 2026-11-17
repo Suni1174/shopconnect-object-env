@@ -229,6 +229,8 @@ class SequentialRateLimiter:
         itpm_limit: int = 7000,
         reserve_tokens: int = 1000,
         enable_sliding_window: bool = True,
+        printer: Optional[Callable[[str], None]] = None,
+        verbose: bool = True,
     ) -> None:
         self.min_interval_seconds = min_interval_seconds
         self.clock = clock or time.monotonic
@@ -238,6 +240,8 @@ class SequentialRateLimiter:
         self.reserve_tokens = reserve_tokens
         self.effective_budget = max(0, itpm_limit - reserve_tokens)
         self.enable_sliding_window = enable_sliding_window
+        self.printer = printer
+        self.verbose = verbose
 
         self.last_request_start: Optional[float] = None
         self.total_sleep_seconds: float = 0.0
@@ -440,10 +444,19 @@ class SequentialRateLimiter:
 
             if wait_time == sliding_wait and sliding_wait > 0.0:
                 reason = "sliding_window_budget"
+                reason_display = "sliding-window budget"
             elif wait_time == quota_wait and quota_wait > 0.0:
                 reason = "quota_deadline"
+                reason_display = "provider quota reset"
             else:
                 reason = "min_interval"
+                reason_display = "minimum interval"
+
+            pacing_msg = f"[Pacing] Waiting {wait_time:.1f}s (reason: {reason_display})..."
+            if self.printer is not None:
+                self.printer(pacing_msg)
+            elif self.verbose:
+                print(pacing_msg, flush=True)
 
             self.sleeper(wait_time)
             self.total_sleep_seconds += wait_time
@@ -452,6 +465,8 @@ class SequentialRateLimiter:
                 "timestamp": now,
                 "duration": wait_time,
                 "reason": reason,
+                "reason_display": reason_display,
+                "pacing_message": pacing_msg,
             })
             total_slept += wait_time
             now = self.clock()
@@ -557,9 +572,11 @@ class GroqPilotRequestGuardrailProvider:
         min_interval_seconds: float = 0.0,
         clock: Optional[Callable[[], float]] = None,
         sleeper: Optional[Callable[[float], None]] = None,
+        telemetry_path: Optional[Union[str, Path]] = None,
     ) -> None:
         self.provider = provider
         self.max_requests = max_requests
+        self.telemetry_path = Path(telemetry_path) if telemetry_path else None
         if rate_limiter is not None:
             self.rate_limiter: Optional[SequentialRateLimiter] = rate_limiter
         elif min_interval_seconds > 0.0:
@@ -583,6 +600,25 @@ class GroqPilotRequestGuardrailProvider:
         self.cumulative_total_tokens: Optional[int] = None
         self.cumulative_derived_total_tokens: int = 0
         self.cumulative_sleep_seconds: float = 0.0
+        self.telemetry_write_errors: int = 0
+        self.telemetry_error_messages: List[str] = []
+
+    def _log_request_telemetry(self, entry: Dict[str, Any]) -> None:
+        """Append request-level telemetry entry to telemetry_path if configured."""
+        if self.telemetry_path:
+            try:
+                self.telemetry_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(self.telemetry_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry) + "\n")
+            except Exception as err:
+                self.telemetry_write_errors += 1
+                err_msg = f"{type(err).__name__}: {err}"
+                self.telemetry_error_messages.append(err_msg)
+                req_idx = entry.get("request_index", "unknown")
+                sys.stderr.write(
+                    f"[WARNING] Telemetry write failed for request {req_idx}: {type(err).__name__}\n"
+                )
+                sys.stderr.flush()
 
     @property
     def sdk_version(self) -> Optional[str]:
@@ -650,6 +686,23 @@ class GroqPilotRequestGuardrailProvider:
                 parallel_tool_calls=parallel_tool_calls,
                 **kwargs,
             )
+        except KeyboardInterrupt as exc:
+            duration_ms = (time.perf_counter() - t0) * 1000.0
+            if res_id is not None and self.rate_limiter is not None:
+                self.rate_limiter.retain_reservation_failed(res_id)
+            interrupt_entry = {
+                "request_index": self.total_requests,
+                "status": "outcome_unknown",
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "error": type(exc).__name__,
+                "interruption_type": type(exc).__name__,
+                "duration_ms": duration_ms,
+                "sleep_seconds": slept,
+                "usage": None,
+            }
+            self.request_history.append(interrupt_entry)
+            self._log_request_telemetry(interrupt_entry)
+            raise
         except Exception as exc:
             duration_ms = (time.perf_counter() - t0) * 1000.0
             if res_id is not None and self.rate_limiter is not None:
@@ -661,13 +714,16 @@ class GroqPilotRequestGuardrailProvider:
             headers = getattr(self.provider, "last_response_headers", {})
             if headers and self.rate_limiter is not None:
                 self.rate_limiter.update_from_headers(headers)
-            self.request_history.append({
+            err_entry = {
                 "request_index": self.total_requests,
                 "status": "error",
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                 "error": type(exc).__name__,
                 "duration_ms": duration_ms,
                 "sleep_seconds": slept,
-            })
+            }
+            self.request_history.append(err_entry)
+            self._log_request_telemetry(err_entry)
             raise
 
         duration_ms = (time.perf_counter() - t0) * 1000.0
@@ -698,14 +754,17 @@ class GroqPilotRequestGuardrailProvider:
         if result.provider_request_id:
             self.provider_request_ids.append(result.provider_request_id)
 
-        self.request_history.append({
+        succ_entry = {
             "request_index": self.total_requests,
             "status": "success",
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "provider_request_id": result.provider_request_id,
             "duration_ms": duration_ms,
             "sleep_seconds": slept,
             "usage": usage_to_dict(result.usage),
-        })
+        }
+        self.request_history.append(succ_entry)
+        self._log_request_telemetry(succ_entry)
 
         return result
 
@@ -1031,15 +1090,44 @@ def run_groq_pilot_dry_run(
 
     pricing = create_groq_free_pricing()
 
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    run_id = f"groq_dry_run_{timestamp}"
+
+    if output_dir is None:
+        target_dir = Path("artifacts") / "protocol_v2_pilot" / run_id
+    else:
+        target_dir = Path(output_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    telemetry_path = target_dir / "request_telemetry.jsonl"
+    meta_path = target_dir / "experiment_meta.json"
+    raw_runs_path = target_dir / "raw_runs.jsonl"
+
+    meta = {
+        "run_id": run_id,
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "status": "running",
+        "pilot_model": "mock-qwen-3.8-27b",
+        "conditions": list(conditions),
+        "task_ids": [t.task_id for t in pilot_tasks],
+        "planned_runs": planned_runs,
+        "completed_runs": 0,
+        "max_requests_ceiling": effective_max_requests,
+        "global_request_ceiling": effective_max_requests,
+        "protocol_version": protocol_version,
+        "incomplete_reason": None,
+        "telemetry_complete": True,
+        "telemetry_write_errors": 0,
+    }
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
     underlying_provider = provider or create_groq_pilot_mock_provider()
     guardrail = GroqPilotRequestGuardrailProvider(
         provider=underlying_provider,
         max_requests=effective_max_requests,
         rate_limiter=rate_limiter,
+        telemetry_path=telemetry_path,
     )
-
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    run_id = f"groq_dry_run_{timestamp}"
 
     runner = ExperimentRunner(
         fixtures=fixtures,
@@ -1059,29 +1147,34 @@ def run_groq_pilot_dry_run(
 
     records: List[RunRecord] = []
     incomplete_reason: Optional[str] = None
-    for task in pilot_tasks:
-        for condition in conditions:
-            if guardrail.total_requests >= effective_max_requests:
-                incomplete_reason = f"Request ceiling of {effective_max_requests} reached before starting {task.task_id} condition {condition}."
-                break
-            try:
-                rec = runner.run_task(task=task, condition_id=condition, provider=guardrail)
-                records.append(rec)
-            except RuntimeError as exc:
-                if "safety ceiling reached" in str(exc).lower():
-                    incomplete_reason = str(exc)
-                    break
-                raise
-        if incomplete_reason is not None:
-            break
+    interrupted = False
 
-    if output_dir is None:
-        target_dir = Path("artifacts") / "protocol_v2_pilot" / run_id
-    else:
-        target_dir = Path(output_dir)
-    target_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        for task in pilot_tasks:
+            for condition in conditions:
+                if guardrail.total_requests >= effective_max_requests:
+                    incomplete_reason = f"Request ceiling of {effective_max_requests} reached before starting {task.task_id} condition {condition}."
+                    break
+                try:
+                    rec = runner.run_task(task=task, condition_id=condition, provider=guardrail)
+                    records.append(rec)
+                    with open(raw_runs_path, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(rec.to_dict()) + "\n")
+                    meta["completed_runs"] = len(records)
+                    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+                except RuntimeError as exc:
+                    if "safety ceiling reached" in str(exc).lower():
+                        incomplete_reason = str(exc)
+                        break
+                    raise
+            if incomplete_reason is not None:
+                break
+    except KeyboardInterrupt:
+        interrupted = True
+        incomplete_reason = "Interrupted by user (KeyboardInterrupt / SIGINT)."
 
     is_complete = len(records) == planned_runs and incomplete_reason is None
+    status = "interrupted" if interrupted else ("completed" if is_complete else "incomplete")
 
     # Export artifacts
     runner.export_artifacts(records, target_dir)
@@ -1094,14 +1187,27 @@ def run_groq_pilot_dry_run(
         incomplete_reason=incomplete_reason,
     )
 
+    meta["status"] = status
+    meta["completed_runs"] = len(records)
+    meta["incomplete_reason"] = incomplete_reason
+    meta["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
+    meta["total_provider_requests"] = guardrail.total_requests
+    meta["telemetry_complete"] = (guardrail.telemetry_write_errors == 0)
+    meta["telemetry_write_errors"] = guardrail.telemetry_write_errors
+    if guardrail.telemetry_write_errors > 0:
+        meta["telemetry_error_messages"] = list(guardrail.telemetry_error_messages)
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
     return {
-        "status": "completed" if is_complete else "incomplete",
+        "status": status,
         "incomplete_reason": incomplete_reason,
         "run_id": run_id,
         "runs_completed": len(records),
         "runs_planned": planned_runs,
         "conditions": list(conditions),
         "total_provider_requests": guardrail.total_requests,
+        "telemetry_complete": (guardrail.telemetry_write_errors == 0),
+        "telemetry_write_errors": guardrail.telemetry_write_errors,
         "max_theoretical_requests": theoretical_total,
         "max_requests_per_condition_c": c_requests,
         "max_inspections_per_condition_c": c_inspections,
@@ -1112,9 +1218,11 @@ def run_groq_pilot_dry_run(
         "output_directory": str(target_dir),
         "protocol_version": protocol_version,
         "artifacts": {
-            "raw_runs": str(target_dir / "raw_runs.jsonl"),
+            "raw_runs": str(raw_runs_path),
             "comparison_csv": str(target_dir / "comparison.csv"),
             "analysis_markdown": str(target_dir / "analysis.md"),
+            "experiment_meta": str(meta_path),
+            "request_telemetry": str(telemetry_path),
         },
     }
 
@@ -1139,6 +1247,7 @@ def run_live_groq_pilot(
     protocol_version: str = "v2",
     conditions: Sequence[str] = PILOT_CONDITIONS,
     enforce_itpm_limits: bool = True,
+    rate_limiter_verbose: bool = True,
 ) -> Dict[str, Any]:
     """Execute live Groq pilot with strict dual-flag confirmation and request ceilings."""
     if not (live and confirm_live):
@@ -1183,6 +1292,37 @@ def run_live_groq_pilot(
 
     pricing = create_groq_free_pricing()
 
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    run_id = f"groq_live_pilot_{timestamp}"
+
+    if output_dir is None:
+        target_dir = Path("artifacts") / "protocol_v2_pilot" / run_id
+    else:
+        target_dir = Path(output_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    telemetry_path = target_dir / "request_telemetry.jsonl"
+    meta_path = target_dir / "experiment_meta.json"
+    raw_runs_path = target_dir / "raw_runs.jsonl"
+
+    meta = {
+        "run_id": run_id,
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "status": "running",
+        "pilot_model": PILOT_MODEL,
+        "conditions": list(conditions),
+        "task_ids": [t.task_id for t in pilot_tasks],
+        "planned_runs": planned_runs,
+        "completed_runs": 0,
+        "max_requests_ceiling": effective_max_requests,
+        "global_request_ceiling": effective_max_requests,
+        "protocol_version": protocol_version,
+        "incomplete_reason": None,
+        "telemetry_complete": True,
+        "telemetry_write_errors": 0,
+    }
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
     base_provider = GroqProvider(
         api_key=api_key,
         model=PILOT_MODEL,
@@ -1197,16 +1337,15 @@ def run_live_groq_pilot(
         min_interval_seconds=min_interval_seconds,
         clock=clock,
         sleeper=sleeper,
+        verbose=rate_limiter_verbose,
     )
 
     guardrail = GroqPilotRequestGuardrailProvider(
         provider=base_provider,
         max_requests=effective_max_requests,
         rate_limiter=rate_limiter,
+        telemetry_path=telemetry_path,
     )
-
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    run_id = f"groq_live_pilot_{timestamp}"
 
     runner = ExperimentRunner(
         fixtures=fixtures,
@@ -1226,29 +1365,34 @@ def run_live_groq_pilot(
 
     records: List[RunRecord] = []
     incomplete_reason: Optional[str] = None
-    for task in pilot_tasks:
-        for condition in conditions:
-            if guardrail.total_requests >= effective_max_requests:
-                incomplete_reason = f"Request ceiling of {effective_max_requests} reached before starting {task.task_id} condition {condition}."
-                break
-            try:
-                rec = runner.run_task(task=task, condition_id=condition, provider=guardrail)
-                records.append(rec)
-            except RuntimeError as exc:
-                if "safety ceiling reached" in str(exc).lower():
-                    incomplete_reason = str(exc)
-                    break
-                raise
-        if incomplete_reason is not None:
-            break
+    interrupted = False
 
-    if output_dir is None:
-        target_dir = Path("artifacts") / "protocol_v2_pilot" / run_id
-    else:
-        target_dir = Path(output_dir)
-    target_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        for task in pilot_tasks:
+            for condition in conditions:
+                if guardrail.total_requests >= effective_max_requests:
+                    incomplete_reason = f"Request ceiling of {effective_max_requests} reached before starting {task.task_id} condition {condition}."
+                    break
+                try:
+                    rec = runner.run_task(task=task, condition_id=condition, provider=guardrail)
+                    records.append(rec)
+                    with open(raw_runs_path, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(rec.to_dict()) + "\n")
+                    meta["completed_runs"] = len(records)
+                    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+                except RuntimeError as exc:
+                    if "safety ceiling reached" in str(exc).lower():
+                        incomplete_reason = str(exc)
+                        break
+                    raise
+            if incomplete_reason is not None:
+                break
+    except KeyboardInterrupt:
+        interrupted = True
+        incomplete_reason = "Interrupted by user (KeyboardInterrupt / SIGINT)."
 
     is_complete = len(records) == planned_runs and incomplete_reason is None
+    status = "interrupted" if interrupted else ("completed" if is_complete else "incomplete")
 
     # Export artifacts
     runner.export_artifacts(records, target_dir)
@@ -1261,14 +1405,27 @@ def run_live_groq_pilot(
         incomplete_reason=incomplete_reason,
     )
 
+    meta["status"] = status
+    meta["completed_runs"] = len(records)
+    meta["incomplete_reason"] = incomplete_reason
+    meta["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
+    meta["total_provider_requests"] = guardrail.total_requests
+    meta["telemetry_complete"] = (guardrail.telemetry_write_errors == 0)
+    meta["telemetry_write_errors"] = guardrail.telemetry_write_errors
+    if guardrail.telemetry_write_errors > 0:
+        meta["telemetry_error_messages"] = list(guardrail.telemetry_error_messages)
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
     return {
-        "status": "completed" if is_complete else "incomplete",
+        "status": status,
         "incomplete_reason": incomplete_reason,
         "run_id": run_id,
         "runs_completed": len(records),
         "runs_planned": planned_runs,
         "conditions": list(conditions),
         "total_provider_requests": guardrail.total_requests,
+        "telemetry_complete": (guardrail.telemetry_write_errors == 0),
+        "telemetry_write_errors": guardrail.telemetry_write_errors,
         "max_theoretical_requests": theoretical_total,
         "max_requests_per_condition_c": c_requests,
         "max_inspections_per_condition_c": c_inspections,
@@ -1286,9 +1443,11 @@ def run_live_groq_pilot(
         },
         "output_directory": str(target_dir),
         "artifacts": {
-            "raw_runs": str(target_dir / "raw_runs.jsonl"),
+            "raw_runs": str(raw_runs_path),
             "comparison_csv": str(target_dir / "comparison.csv"),
             "analysis_markdown": str(target_dir / "analysis.md"),
+            "experiment_meta": str(meta_path),
+            "request_telemetry": str(telemetry_path),
         },
     }
 
@@ -2017,6 +2176,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             enforce_itpm_limits=True,
         )
         print(json.dumps(res, indent=2))
+        if res.get("status") == "interrupted":
+            return 130
         return 0 if res["status"] == "completed" else 1
 
     parser.print_help()

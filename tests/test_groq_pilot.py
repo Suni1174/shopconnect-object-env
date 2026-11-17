@@ -1612,3 +1612,392 @@ def test_groq_pilot_cli_startup_clean_no_runpy_warning():
     assert module_res.returncode == 0
     assert "RuntimeWarning" not in module_res.stderr
     assert "status" in module_res.stdout
+
+
+# =============================================================================
+# 13. RELIABILITY, PACING TELEMETRY & INCREMENTAL PERSISTENCE TESTS
+# =============================================================================
+
+def test_pacing_feedback_messages():
+    """SequentialRateLimiter must output human-readable pacing feedback for all three wait reasons."""
+    messages = []
+    current_time = [100.0]
+
+    def mock_clock() -> float:
+        return current_time[0]
+
+    def mock_sleep(seconds: float) -> None:
+        current_time[0] += seconds
+
+    limiter = SequentialRateLimiter(
+        min_interval_seconds=12.0,
+        clock=mock_clock,
+        sleeper=mock_sleep,
+        printer=messages.append,
+        window_seconds=60.0,
+        itpm_limit=7000,
+        reserve_tokens=1000,
+    )
+
+    # 1. First request dispatches immediately without pacing message
+    limiter.wait_for_slot(estimated_tokens=500)
+    assert len(messages) == 0
+
+    # Advance clock by 2 seconds (elapsed=2s < 12s min_interval)
+    current_time[0] = 102.0
+    limiter.wait_for_slot(estimated_tokens=500)
+    assert len(messages) == 1
+    assert "[Pacing] Waiting 10.0s (reason: minimum interval)..." in messages[0]
+    assert "gsk-" not in messages[0]
+    assert limiter.sleep_records[-1]["reason"] == "min_interval"
+    assert limiter.sleep_records[-1]["reason_display"] == "minimum interval"
+
+    # 2. Test quota reset pacing message
+    headers = {
+        "x-ratelimit-remaining-tokens": "200",
+        "x-ratelimit-reset-tokens": "25.0s",
+    }
+    limiter.update_from_headers(headers, estimated_next_tokens=1000, receipt_time=current_time[0])
+    limiter.wait_for_slot(estimated_tokens=1000)
+    assert len(messages) == 2
+    assert "(reason: provider quota reset)" in messages[1]
+    assert "gsk-" not in messages[1]
+    assert limiter.sleep_records[-1]["reason"] == "quota_deadline"
+    assert limiter.sleep_records[-1]["reason_display"] == "provider quota reset"
+
+    # 3. Test sliding-window budget pacing message
+    limiter.window_entries.clear()
+    limiter.last_request_start = current_time[0] - 20.0
+    limiter.reserve_slot(5500, now=current_time[0] - 10.0)
+    limiter.wait_for_slot(estimated_tokens=1000)  # 5500 + 1000 = 6500 > 6000
+    assert len(messages) == 3
+    assert "(reason: sliding-window budget)" in messages[2]
+    assert "gsk-" not in messages[2]
+    assert limiter.sleep_records[-1]["reason"] == "sliding_window_budget"
+    assert limiter.sleep_records[-1]["reason_display"] == "sliding-window budget"
+
+
+def test_request_level_telemetry_persistence(tmp_path):
+    """GroqPilotRequestGuardrailProvider must append telemetry to request_telemetry.jsonl on success and error."""
+    telemetry_file = tmp_path / "request_telemetry.jsonl"
+    mock_provider = MagicMock()
+    mock_provider.last_response_headers = {}
+
+    guardrail = GroqPilotRequestGuardrailProvider(
+        provider=mock_provider,
+        max_requests=5,
+        telemetry_path=telemetry_file,
+    )
+
+    # 1. Successful request
+    mock_provider.complete.return_value = LLMCompletionResult(
+        message=LLMMessage(role="assistant", content="hello"),
+        usage=LLMUsage(input_tokens=100, output_tokens=20, total_tokens=120, is_provider_reported=True),
+        provider_request_id="req_ok_123",
+        model_identifier="test-model",
+    )
+    guardrail.complete([LLMMessage(role="user", content="hi")])
+
+    assert telemetry_file.exists()
+    lines = [json.loads(line) for line in telemetry_file.read_text(encoding="utf-8").strip().splitlines()]
+    assert len(lines) == 1
+    assert lines[0]["request_index"] == 1
+    assert lines[0]["status"] == "success"
+    assert lines[0]["provider_request_id"] == "req_ok_123"
+    assert lines[0]["usage"]["input_tokens"] == 100
+    assert "timestamp_utc" in lines[0]
+
+    # 2. Failing request
+    mock_provider.complete.side_effect = RuntimeError("Rate limit exceeded")
+    with pytest.raises(RuntimeError):
+        guardrail.complete([LLMMessage(role="user", content="hi again")])
+
+    lines = [json.loads(line) for line in telemetry_file.read_text(encoding="utf-8").strip().splitlines()]
+    assert len(lines) == 2
+    assert lines[1]["request_index"] == 2
+    assert lines[1]["status"] == "error"
+    assert lines[1]["error"] == "RuntimeError"
+    assert "duration_ms" in lines[1]
+    assert "timestamp_utc" in lines[1]
+
+
+def test_pre_creation_of_directory_and_metadata(tmp_path):
+    """Dry run and live harness must create target_dir and experiment_meta.json before completion."""
+    res = run_groq_pilot_dry_run(output_dir=tmp_path)
+    assert res["status"] == "completed"
+
+    meta_file = tmp_path / "experiment_meta.json"
+    telemetry_file = tmp_path / "request_telemetry.jsonl"
+    raw_runs_file = tmp_path / "raw_runs.jsonl"
+
+    assert meta_file.exists()
+    assert telemetry_file.exists()
+    assert raw_runs_file.exists()
+
+    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    assert meta["status"] == "completed"
+    assert meta["completed_runs"] == 9
+    assert meta["planned_runs"] == 9
+    assert "created_at_utc" in meta
+    assert "finished_at_utc" in meta
+
+
+def test_incremental_persistence_of_run_records(tmp_path, monkeypatch):
+    """RunRecords must be appended incrementally to raw_runs.jsonl after each task completes."""
+    from shopconnect_env.evaluation.runner import ExperimentRunner
+
+    original_run_task = ExperimentRunner.run_task
+
+    def instrumented_run_task(self, task, condition_id, provider=None):
+        rec = original_run_task(self, task, condition_id, provider=provider)
+        return rec
+
+    monkeypatch.setattr(ExperimentRunner, "run_task", instrumented_run_task)
+
+    res = run_groq_pilot_dry_run(output_dir=tmp_path)
+    assert res["status"] == "completed"
+    lines = (tmp_path / "raw_runs.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 9
+
+
+def test_graceful_interruption_flushes_artifacts(tmp_path, monkeypatch):
+    """KeyboardInterrupt must flush partial RunRecords, update metadata to interrupted, and write partial analysis."""
+    from shopconnect_env.evaluation.runner import ExperimentRunner
+
+    call_count = [0]
+    original_run_task = ExperimentRunner.run_task
+
+    def interrupt_after_two_runs(self, task, condition_id, provider=None):
+        call_count[0] += 1
+        if call_count[0] > 2:
+            raise KeyboardInterrupt("Simulated Ctrl+C")
+        return original_run_task(self, task, condition_id, provider=provider)
+
+    monkeypatch.setattr(ExperimentRunner, "run_task", interrupt_after_two_runs)
+
+    res = run_groq_pilot_dry_run(output_dir=tmp_path)
+
+    # 1. Returns interrupted status
+    assert res["status"] == "interrupted"
+    assert "Interrupted by user" in res["incomplete_reason"]
+    assert res["runs_completed"] == 2
+
+    # 2. Metadata file reflects interrupted state
+    meta_file = tmp_path / "experiment_meta.json"
+    assert meta_file.exists()
+    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    assert meta["status"] == "interrupted"
+    assert meta["completed_runs"] == 2
+    assert "Interrupted by user" in meta["incomplete_reason"]
+
+    # 3. raw_runs.jsonl has exactly the 2 completed records
+    raw_runs = tmp_path / "raw_runs.jsonl"
+    assert raw_runs.exists()
+    lines = raw_runs.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 2
+
+    # 4. comparison.csv exists and has 2 data rows
+    comparison = tmp_path / "comparison.csv"
+    assert comparison.exists()
+    csv_lines = comparison.read_text(encoding="utf-8").strip().splitlines()
+    assert len(csv_lines) == 3  # header + 2 rows
+
+    # 5. analysis.md exists and contains the INCOMPLETE PILOT warning banner
+    analysis = tmp_path / "analysis.md"
+    assert analysis.exists()
+    content = analysis.read_text(encoding="utf-8")
+    assert "INCOMPLETE PILOT" in content
+    assert "Interrupted by user" in content
+
+
+def test_live_groq_pilot_graceful_interruption(tmp_path, monkeypatch):
+    """run_live_groq_pilot must handle KeyboardInterrupt gracefully and flush partial artifacts."""
+    from shopconnect_env.evaluation.runner import ExperimentRunner
+
+    # Mock preflight to pass
+    monkeypatch.setattr(
+        "shopconnect_env.evaluation.groq_pilot.run_groq_pilot_preflight",
+        lambda **kwargs: {"status": "passed", "api_key_configured": True, "errors": []},
+    )
+
+    call_count = [0]
+    original_run_task = ExperimentRunner.run_task
+
+    def interrupt_after_one_run(self, task, condition_id, provider=None):
+        call_count[0] += 1
+        if call_count[0] > 1:
+            raise KeyboardInterrupt("Simulated Ctrl+C during live pilot")
+        return original_run_task(self, task, condition_id, provider=provider)
+
+    monkeypatch.setattr(ExperimentRunner, "run_task", interrupt_after_one_run)
+
+    mock_client = MagicMock()
+    mock_resp = SimpleNamespace(
+        id="chatcmpl-live-test",
+        model="qwen/qwen3.8-27b",
+        system_fingerprint="fp_test",
+        choices=[
+            SimpleNamespace(
+                finish_reason="stop",
+                message=SimpleNamespace(role="assistant", content="No-op", tool_calls=None),
+            )
+        ],
+        usage=SimpleNamespace(prompt_tokens=50, completion_tokens=10, total_tokens=60),
+    )
+    mock_client.chat.completions.create.return_value = mock_resp
+
+    res = run_live_groq_pilot(
+        api_key="gsk-test-key",
+        client=mock_client,
+        output_dir=tmp_path,
+        live=True,
+        confirm_live=True,
+        conditions=("B", "C"),
+    )
+
+    assert res["status"] == "interrupted"
+    assert "Interrupted by user" in res["incomplete_reason"]
+    assert res["runs_completed"] == 1
+
+    meta_file = tmp_path / "experiment_meta.json"
+    assert meta_file.exists()
+    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    assert meta["status"] == "interrupted"
+    assert meta["completed_runs"] == 1
+
+    raw_runs = tmp_path / "raw_runs.jsonl"
+    assert raw_runs.exists()
+    lines = raw_runs.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+
+    analysis = tmp_path / "analysis.md"
+    assert analysis.exists()
+    assert "INCOMPLETE PILOT" in analysis.read_text(encoding="utf-8")
+
+
+def test_interrupted_in_flight_request_telemetry(tmp_path):
+    """In-flight KeyboardInterrupt during provider.complete must log outcome_unknown and retain reservation."""
+    telemetry_file = tmp_path / "request_telemetry.jsonl"
+    mock_provider = MagicMock()
+    mock_provider.last_response_headers = {}
+    mock_provider.complete.side_effect = KeyboardInterrupt("Ctrl+C during in-flight network dispatch")
+
+    current_time = [100.0]
+    limiter = SequentialRateLimiter(
+        clock=lambda: current_time[0],
+        sleeper=lambda s: None,
+        verbose=False,
+    )
+    guardrail = GroqPilotRequestGuardrailProvider(
+        provider=mock_provider,
+        max_requests=5,
+        rate_limiter=limiter,
+        telemetry_path=telemetry_file,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        guardrail.complete([LLMMessage(role="user", content="hello in-flight")])
+
+    # 1. Total requests incremented because dispatch was attempted
+    assert guardrail.total_requests == 1
+
+    # 2. Cumulative tokens remain 0 (no claim that provider consumed tokens)
+    assert guardrail.cumulative_input_tokens == 0
+    assert guardrail.cumulative_output_tokens == 0
+
+    # 3. Reservation is retained as unconfirmed_failed
+    assert len(limiter.window_entries) == 1
+    assert limiter.window_entries[0]["status"] == "unconfirmed_failed"
+
+    # 4. Telemetry record is written with outcome_unknown and duration
+    assert telemetry_file.exists()
+    lines = [json.loads(line) for line in telemetry_file.read_text(encoding="utf-8").strip().splitlines()]
+    assert len(lines) == 1
+    rec = lines[0]
+    assert rec["request_index"] == 1
+    assert rec["status"] == "outcome_unknown"
+    assert rec["error"] == "KeyboardInterrupt"
+    assert rec["interruption_type"] == "KeyboardInterrupt"
+    assert rec["usage"] is None
+    assert rec["duration_ms"] >= 0.0
+    assert "timestamp_utc" in rec
+
+
+def test_interrupted_pacing_wait_does_not_record_http_attempt(tmp_path):
+    """KeyboardInterrupt during pacing sleep must not increment request counter or log an HTTP attempt."""
+    telemetry_file = tmp_path / "request_telemetry.jsonl"
+    mock_provider = MagicMock()
+
+    mock_limiter = MagicMock(spec=SequentialRateLimiter)
+    mock_limiter.wait_for_slot.side_effect = KeyboardInterrupt("Ctrl+C during pacing sleep")
+
+    guardrail = GroqPilotRequestGuardrailProvider(
+        provider=mock_provider,
+        max_requests=5,
+        rate_limiter=mock_limiter,
+        telemetry_path=telemetry_file,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        guardrail.complete([LLMMessage(role="user", content="hello pacing")])
+
+    # Dispatch never occurred: total_requests is 0
+    assert guardrail.total_requests == 0
+    assert not mock_provider.complete.called
+
+    # No HTTP telemetry record created
+    assert not telemetry_file.exists()
+    assert len(guardrail.request_history) == 0
+
+
+def test_telemetry_write_failure_emits_warning_and_marks_metadata(tmp_path, capsys):
+    """Telemetry write failure must not crash complete(), must emit warning to stderr, and mark metadata incomplete."""
+    invalid_telemetry_dir = tmp_path / "telemetry_is_a_dir"
+    invalid_telemetry_dir.mkdir()
+
+    mock_provider = MagicMock()
+    mock_provider.complete.return_value = LLMCompletionResult(
+        message=LLMMessage(role="assistant", content="ok"),
+        usage=LLMUsage(input_tokens=50, output_tokens=10, total_tokens=60, is_provider_reported=True),
+        provider_request_id="req_write_fail",
+        model_identifier="test-model",
+    )
+
+    guardrail = GroqPilotRequestGuardrailProvider(
+        provider=mock_provider,
+        max_requests=5,
+        telemetry_path=invalid_telemetry_dir,
+    )
+
+    # complete() succeeds despite telemetry write error
+    res = guardrail.complete([LLMMessage(role="user", content="hi")])
+    assert res.message.content == "ok"
+
+    # Warning was emitted to stderr without prompt/key exposure
+    captured = capsys.readouterr()
+    assert "[WARNING] Telemetry write failed for request 1" in captured.err
+    assert "gsk-" not in captured.err
+    assert "hello" not in captured.err
+
+    # Error tracked in guardrail
+    assert guardrail.telemetry_write_errors == 1
+    assert len(guardrail.telemetry_error_messages) == 1
+
+
+def test_experiment_metadata_reflects_telemetry_write_failures(tmp_path, monkeypatch):
+    """experiment_meta.json must record telemetry_complete=False if any telemetry write fails."""
+    def failing_log(self, entry):
+        self.telemetry_write_errors += 1
+        self.telemetry_error_messages.append("MockPermissionError: Permission denied")
+
+    monkeypatch.setattr(GroqPilotRequestGuardrailProvider, "_log_request_telemetry", failing_log)
+
+    res = run_groq_pilot_dry_run(output_dir=tmp_path)
+    assert res["status"] == "completed"
+    assert res["telemetry_complete"] is False
+    assert res["telemetry_write_errors"] > 0
+
+    meta = json.loads((tmp_path / "experiment_meta.json").read_text(encoding="utf-8"))
+    assert meta["telemetry_complete"] is False
+    assert meta["telemetry_write_errors"] > 0
+    assert "telemetry_error_messages" in meta
