@@ -5,3 +5,5 @@ pytest==9.2.0
 openai==3.49.0
 # Stage 6: Official Google GenAI SDK for Gemini Provider
 google-genai==3.1.0
+# Environment configuration
+python-dotenv==1.2.4

@@ -17,6 +17,7 @@ Verifies:
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -51,6 +52,8 @@ from shopconnect_env.evaluation.groq_pilot import (
     GroqPilotRequestGuardrailProvider,
     SequentialRateLimiter,
     create_groq_pilot_mock_provider,
+    get_project_root,
+    load_project_env,
     run_groq_connection_test,
     run_groq_json_smoke_test,
     run_groq_pilot_dry_run,
@@ -1002,3 +1005,58 @@ def test_rate_limiter_preserves_deadline_across_benchmark_tasks():
     # Expected wait: 112.0 - 103.0 = 9.0s
     assert slept >= 9.0
     assert current_time[0] >= 112.0
+
+
+# =============================================================================
+# 9. ENVIRONMENT CONFIGURATION & PROJECT ROOT TESTS
+# =============================================================================
+
+def test_get_project_root_resolution():
+    """get_project_root must robustly resolve directory containing requirements.txt."""
+    root = get_project_root()
+    assert isinstance(root, Path)
+    assert root.exists()
+    assert (root / "requirements.txt").exists()
+
+
+def test_load_project_env_precedence_and_override_false(monkeypatch, tmp_path):
+    """load_project_env must load variables from file without overriding existing env vars."""
+    fake_env = tmp_path / ".env"
+    fake_env.write_text("GROQ_API_KEY=gsk_from_file_secret\nSHOPCONNECT_SAMPLE_VAR=from_file\n", encoding="utf-8")
+
+    # Set existing variable in os.environ
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_existing_env_key")
+    monkeypatch.delenv("SHOPCONNECT_SAMPLE_VAR", raising=False)
+
+    success = load_project_env(env_path=fake_env, force_reload=True)
+    assert success is True
+
+    # Existing variable takes precedence (override=False)
+    assert os.environ.get("GROQ_API_KEY") == "gsk_existing_env_key"
+    # Unset variable is loaded from file
+    assert os.environ.get("SHOPCONNECT_SAMPLE_VAR") == "from_file"
+
+
+def test_load_project_env_nonexistent_file(tmp_path):
+    """load_project_env returns False cleanly when .env file does not exist."""
+    missing_env = tmp_path / "nonexistent.env"
+    assert load_project_env(env_path=missing_env, force_reload=True) is False
+
+
+def test_load_project_env_loads_key_when_unset(monkeypatch, tmp_path):
+    """load_project_env loads key into environment when currently unset, without exposing secrets in results."""
+    fake_env = tmp_path / ".env"
+    test_key_val = "gsk_test_mock_secret_key_abc123"
+    fake_env.write_text(f"GROQ_API_KEY={test_key_val}\n", encoding="utf-8")
+
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    assert os.environ.get("GROQ_API_KEY") is None
+
+    success = load_project_env(env_path=fake_env, force_reload=True)
+    assert success is True
+    assert os.environ.get("GROQ_API_KEY") == test_key_val
+
+    # Preflight should now report api_key_configured=True without leaking the secret
+    res = run_groq_pilot_preflight()
+    assert res["api_key_configured"] is True
+    assert test_key_val not in str(res)  # Secret must never be in preflight result dictionary

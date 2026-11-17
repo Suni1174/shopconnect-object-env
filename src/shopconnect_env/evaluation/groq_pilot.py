@@ -30,10 +30,60 @@ import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
 # Ensure src/ is in sys.path for direct CLI script execution
 _src_root = str(Path(__file__).resolve().parent.parent.parent)
 if _src_root not in sys.path:
     sys.path.insert(0, _src_root)
+
+# =============================================================================
+# 0. ENVIRONMENT & PROJECT ROOT RESOLUTION
+# =============================================================================
+
+def get_project_root() -> Path:
+    """Resolve the project root directory robustly using pathlib."""
+    current = Path(__file__).resolve().parent
+    for parent in [current] + list(current.parents):
+        if (parent / "requirements.txt").exists() or (parent / ".git").exists():
+            return parent
+    return Path(__file__).resolve().parents[3]
+
+
+_PROJECT_ENV_LOADED: bool = False
+
+
+def load_project_env(
+    env_path: Optional[Union[str, Path]] = None,
+    force_reload: bool = False,
+) -> bool:
+    """Load environment variables from project-root .env without overriding existing variables."""
+    global _PROJECT_ENV_LOADED
+    if _PROJECT_ENV_LOADED and not force_reload and env_path is None:
+        return True
+
+    if load_dotenv is None:
+        return False
+
+    if env_path is not None:
+        target = Path(env_path).resolve()
+    else:
+        root = get_project_root()
+        target = root / ".env"
+
+    if target.exists() and target.is_file():
+        success = bool(load_dotenv(dotenv_path=target, override=False))
+        if env_path is None:
+            _PROJECT_ENV_LOADED = True
+        return success
+    return False
+
+
+# Automatically load project-root .env at module import
+load_project_env()
 
 from pydantic import ValidationError
 
@@ -526,6 +576,7 @@ def run_groq_pilot_preflight(
     warnings: List[str] = []
 
     # API key check (never log secrets)
+    load_project_env()
     configured_key = api_key or os.environ.get("GROQ_API_KEY", "")
     key_present = bool(configured_key and configured_key.strip())
 
@@ -1060,6 +1111,7 @@ def run_groq_connection_test(
             "Neither flag alone may make a network request."
         )
 
+    load_project_env()
     configured_key = api_key or os.environ.get("GROQ_API_KEY", "")
     key_configured = bool(configured_key and configured_key.strip())
 
@@ -1205,6 +1257,7 @@ def run_groq_tool_calling_smoke_test(
             "Neither flag alone may make a network request."
         )
 
+    load_project_env()
     configured_key = api_key or os.environ.get("GROQ_API_KEY", "")
     key_configured = bool(configured_key and configured_key.strip())
 
@@ -1407,6 +1460,7 @@ def run_groq_json_smoke_test(
             "Neither flag alone may make a network request."
         )
 
+    load_project_env()
     configured_key = api_key or os.environ.get("GROQ_API_KEY", "")
     key_configured = bool(configured_key and configured_key.strip())
 
@@ -1639,6 +1693,7 @@ def _patch_pilot_analysis_markdown(
 # =============================================================================
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    load_project_env()
     parser = argparse.ArgumentParser(description="ShopConnect Groq Pilot Execution Harness")
     parser.add_argument("--preflight", action="store_true", help="Run offline preflight validation")
     parser.add_argument("--dry-run", action="store_true", help="Run offline simulated dry-run (9 runs)")
