@@ -56,6 +56,8 @@ from shopconnect_env.evaluation.groq_pilot import (
     SequentialRateLimiter,
     classify_reservation_action,
     create_groq_pilot_mock_provider,
+    format_conditions_label,
+    format_pilot_sample_size_disclaimer,
     get_project_root,
     is_pre_dispatch_connection_error,
     load_project_env,
@@ -2001,3 +2003,135 @@ def test_experiment_metadata_reflects_telemetry_write_failures(tmp_path, monkeyp
     assert meta["telemetry_complete"] is False
     assert meta["telemetry_write_errors"] > 0
     assert "telemetry_error_messages" in meta
+
+
+# =============================================================================
+# 18. DYNAMIC REPORTING & SAMPLE SIZE DISCLAIMER REGRESSION TESTS
+# =============================================================================
+
+def test_format_conditions_label_formatting():
+    """format_conditions_label formats empty, single, double, and triple condition lists."""
+    assert format_conditions_label([]) == "No Conditions"
+    assert format_conditions_label(["A"]) == "Condition A"
+    assert format_conditions_label(["B"]) == "Condition B"
+    assert format_conditions_label(["C"]) == "Condition C"
+    assert format_conditions_label(["B", "C"]) == "Conditions B and C"
+    assert format_conditions_label(["A", "C"]) == "Conditions A and C"
+    assert format_conditions_label(["A", "B", "C"]) == "Conditions A, B, and C"
+
+
+def test_format_pilot_sample_size_disclaimer_unit():
+    """format_pilot_sample_size_disclaimer generates accurate sample-size notices."""
+    # B/C completed (6 runs)
+    disc_bc = format_pilot_sample_size_disclaimer(
+        conditions=["B", "C"],
+        tasks_count=3,
+        planned_runs=6,
+        completed_runs=6,
+    )
+    assert "consisting of 3 tasks across Conditions B and C (6 runs)." in disc_bc
+    assert "Conditions A, B, and C" not in disc_bc
+    assert "INCOMPLETE" not in disc_bc
+
+    # A/B/C completed (9 runs)
+    disc_abc = format_pilot_sample_size_disclaimer(
+        conditions=["A", "B", "C"],
+        tasks_count=3,
+        planned_runs=9,
+        completed_runs=9,
+    )
+    assert "consisting of 3 tasks across Conditions A, B, and C (9 runs)." in disc_abc
+
+    # Incomplete runs with ceiling reason
+    disc_inc = format_pilot_sample_size_disclaimer(
+        conditions=["B", "C"],
+        tasks_count=3,
+        planned_runs=6,
+        completed_runs=2,
+        incomplete_reason="Request ceiling reached",
+    )
+    assert "consisting of 3 tasks across Conditions B and C (2/6 runs completed)." in disc_inc
+
+    # Incomplete runs with interruption
+    disc_int = format_pilot_sample_size_disclaimer(
+        conditions=["A", "B", "C"],
+        tasks_count=3,
+        planned_runs=9,
+        completed_runs=4,
+        incomplete_reason="Interrupted by user (KeyboardInterrupt / SIGINT).",
+    )
+    assert "consisting of 3 tasks across Conditions A, B, and C (4/9 runs completed)." in disc_int
+
+    # Single task, single condition
+    disc_single = format_pilot_sample_size_disclaimer(
+        conditions=["B"],
+        tasks_count=1,
+        planned_runs=1,
+        completed_runs=1,
+    )
+    assert "consisting of 1 task across Condition B (1 run)." in disc_single
+
+    # Default fallback invocation
+    disc_default = format_pilot_sample_size_disclaimer()
+    assert "consisting of 3 tasks across Conditions A, B, and C (9 runs)." in disc_default
+
+
+def test_groq_pilot_dry_run_bc_conditions_dynamic_reporting(tmp_path):
+    """Dry run with conditions B and C must generate dynamic B/C title and 6-run disclaimer."""
+    res = run_groq_pilot_dry_run(output_dir=tmp_path, conditions=["B", "C"])
+    assert res["status"] == "completed"
+    assert res["runs_completed"] == 6
+    assert res["runs_planned"] == 6
+
+    analysis_path = tmp_path / "analysis.md"
+    assert analysis_path.exists()
+    content = analysis_path.read_text(encoding="utf-8")
+
+    # Dynamic comparative report title
+    assert "# Comparative Evaluation Report: Conditions B and C" in content
+
+    # Dynamic sample size notice
+    assert "LIMITED SAMPLE SIZE NOTICE" in content
+    assert "consisting of 3 tasks across Conditions B and C (6 runs)." in content
+
+    # Must NOT claim A was evaluated or 9 runs
+    assert "consisting of 3 tasks across Conditions A, B, and C" not in content
+    assert "(9 runs)" not in content
+    assert "INCOMPLETE PILOT" not in content
+
+
+def test_groq_pilot_dry_run_abc_conditions_dynamic_reporting(tmp_path):
+    """Dry run with conditions A, B, and C must generate dynamic A/B/C title and 9-run disclaimer."""
+    res = run_groq_pilot_dry_run(output_dir=tmp_path, conditions=["A", "B", "C"])
+    assert res["status"] == "completed"
+    assert res["runs_completed"] == 9
+    assert res["runs_planned"] == 9
+
+    analysis_path = tmp_path / "analysis.md"
+    assert analysis_path.exists()
+    content = analysis_path.read_text(encoding="utf-8")
+
+    # Dynamic comparative report title
+    assert "# Comparative Evaluation Report: Conditions A, B, and C" in content
+
+    # Dynamic sample size notice
+    assert "LIMITED SAMPLE SIZE NOTICE" in content
+    assert "consisting of 3 tasks across Conditions A, B, and C (9 runs)." in content
+    assert "INCOMPLETE PILOT" not in content
+
+
+def test_groq_pilot_dry_run_incomplete_dynamic_reporting(tmp_path):
+    """Incomplete dry run must reflect completed vs planned runs in disclaimer banner."""
+    res = run_groq_pilot_dry_run(output_dir=tmp_path, conditions=["B", "C"], max_requests=3)
+    assert res["status"] == "incomplete"
+    assert res["ceiling_reached"] is True
+    assert res["runs_completed"] < 6
+
+    analysis_path = tmp_path / "analysis.md"
+    assert analysis_path.exists()
+    content = analysis_path.read_text(encoding="utf-8")
+
+    # Dynamic sample size notice reflects completed/planned
+    assert "LIMITED SAMPLE SIZE NOTICE" in content
+    assert f"consisting of 3 tasks across Conditions B and C ({res['runs_completed']}/6 runs completed)." in content
+    assert "INCOMPLETE PILOT" in content

@@ -32,6 +32,7 @@ from shopconnect_env.evaluation.runner import (
     PlanDiffResult,
     PlanDiffer,
     RunRecord,
+    format_conditions_label,
     run_offline_smoke_test,
 )
 from shopconnect_env.evaluation.tasks import (

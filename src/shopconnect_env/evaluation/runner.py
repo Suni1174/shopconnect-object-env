@@ -22,7 +22,7 @@ import json
 from pathlib import Path
 import re
 import time
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from shopconnect_env.agents.base import AgentResponse, BaseAgent, ObjectInspector
 from shopconnect_env.agents.condition_a_agent import ConditionAAgent
@@ -82,6 +82,18 @@ def compute_file_sha256(path: Path) -> str:
         return "file_not_found"
     with open(path, "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()
+
+
+def format_conditions_label(conditions: Sequence[str]) -> str:
+    """Format a sequence of condition identifiers into a human-readable title fragment."""
+    cond_list = list(conditions)
+    if not cond_list:
+        return "No Conditions"
+    if len(cond_list) == 1:
+        return f"Condition {cond_list[0]}"
+    if len(cond_list) == 2:
+        return f"Conditions {cond_list[0]} and {cond_list[1]}"
+    return f"Conditions {', '.join(cond_list[:-1])}, and {cond_list[-1]}"
 
 
 def classify_rejection_reason(reason: str) -> str:
@@ -1345,7 +1357,9 @@ class ExperimentRunner:
             agg = summary_by_cond.get(cond_key, compute_aggregate_metrics([], cond_key))
             return f"{_fmt_p(agg.latency_p50_ms)} / {_fmt_p(agg.latency_p95_ms)}"
 
-        md = f"""# Comparative Evaluation Report: Conditions A, B, and C
+        title_conditions = format_conditions_label(conditions)
+
+        md = f"""# Comparative Evaluation Report: {title_conditions}
 
 **Experiment Run ID:** `{self.experiment_run_id}`  
 **Execution Mode:** {mode_badge}  

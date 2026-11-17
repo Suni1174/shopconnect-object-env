@@ -119,6 +119,7 @@ from shopconnect_env.evaluation.runner import (
     PlanFixture,
     RunRecord,
     compute_sha256,
+    format_conditions_label,
     load_plan_fixtures,
 )
 from shopconnect_env.evaluation.tasks import (
@@ -1185,6 +1186,10 @@ def run_groq_pilot_dry_run(
         guardrail=guardrail,
         max_requests=effective_max_requests,
         incomplete_reason=incomplete_reason,
+        conditions=conditions,
+        tasks_count=len(pilot_tasks),
+        planned_runs=planned_runs,
+        completed_runs=len(records),
     )
 
     meta["status"] = status
@@ -1403,6 +1408,10 @@ def run_live_groq_pilot(
         guardrail=guardrail,
         max_requests=effective_max_requests,
         incomplete_reason=incomplete_reason,
+        conditions=conditions,
+        tasks_count=len(pilot_tasks),
+        planned_runs=planned_runs,
+        completed_runs=len(records),
     )
 
     meta["status"] = status
@@ -2021,6 +2030,36 @@ def run_groq_json_smoke_test(
 # 9. ARTIFACT WRITERS
 # =============================================================================
 
+def format_pilot_sample_size_disclaimer(
+    conditions: Optional[Sequence[str]] = None,
+    tasks_count: Optional[int] = None,
+    planned_runs: Optional[int] = None,
+    completed_runs: Optional[int] = None,
+    incomplete_reason: Optional[str] = None,
+) -> str:
+    """Format the dynamic sample-size disclaimer notice for pilot analysis reports."""
+    conds = list(conditions) if conditions is not None else list(PILOT_CONDITIONS)
+    t_count = tasks_count if tasks_count is not None else PILOT_TASKS_COUNT
+    p_runs = planned_runs if planned_runs is not None else len(conds) * t_count
+
+    cond_str = format_conditions_label(conds)
+    task_str = f"{t_count} task" if t_count == 1 else f"{t_count} tasks"
+
+    if incomplete_reason or (completed_runs is not None and completed_runs < p_runs):
+        c_runs = completed_runs if completed_runs is not None else 0
+        run_str = f"({c_runs}/{p_runs} runs completed)"
+    else:
+        actual_runs = completed_runs if completed_runs is not None else p_runs
+        run_str = f"({actual_runs} run)" if actual_runs == 1 else f"({actual_runs} runs)"
+
+    return (
+        "> [!IMPORTANT]\n"
+        "> **LIMITED SAMPLE SIZE NOTICE**: This report represents a controlled preliminary pilot\n"
+        f"> consisting of {task_str} across {cond_str} {run_str}.\n"
+        "> It is **NOT** the full 25-task benchmark."
+    )
+
+
 def _patch_pilot_analysis_markdown(
     analysis_path: Path,
     run_id: str,
@@ -2028,6 +2067,10 @@ def _patch_pilot_analysis_markdown(
     guardrail: GroqPilotRequestGuardrailProvider,
     max_requests: int = PROTOCOL_V2_GLOBAL_REQUEST_CEILING,
     incomplete_reason: Optional[str] = None,
+    conditions: Optional[Sequence[str]] = None,
+    tasks_count: Optional[int] = None,
+    planned_runs: Optional[int] = None,
+    completed_runs: Optional[int] = None,
 ) -> None:
     existing = analysis_path.read_text(encoding="utf-8") if analysis_path.exists() else ""
     if is_live and "generated using deterministic offline test providers" in existing:
@@ -2043,11 +2086,16 @@ def _patch_pilot_analysis_markdown(
         )
         existing = existing.replace(offline_phrase, live_replacement)
 
+    disclaimer = format_pilot_sample_size_disclaimer(
+        conditions=conditions,
+        tasks_count=tasks_count,
+        planned_runs=planned_runs,
+        completed_runs=completed_runs,
+        incomplete_reason=incomplete_reason,
+    )
+
     banner = f"""# {PILOT_TAG}
-> [!IMPORTANT]
-> **LIMITED SAMPLE SIZE NOTICE**: This report represents a controlled preliminary pilot
-> consisting of 3 tasks across Conditions A, B, and C (9 runs).
-> It is **NOT** the full 25-task benchmark.
+{disclaimer}
 
 - **Pilot Run ID:** `{run_id}`
 - **Execution Mode:** `{'LIVE GROQ CLOUD API' if is_live else 'OFFLINE SIMULATED TEST DOUBLE'}`
