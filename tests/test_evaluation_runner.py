@@ -847,3 +847,127 @@ def test_raw_runs_traceability_preserves_all_fifteen_required_fields(runner, ben
     assert "api_key" not in raw_text.lower()
     assert "secret" not in raw_text.lower()
 
+
+def test_outcome_evaluator_decouples_infra_429_even_with_raw_output(benchmark_tasks):
+    """FIX 2: OutcomeEvaluator sets model_decision_correct=None and infra_success=False on HTTP 429 even when raw_output is non-empty."""
+    task = benchmark_tasks[0]
+    response = AgentResponse(
+        proposal=None,
+        rationale="Agent exception during interaction: Groq API rate limit or quota exceeded.",
+        raw_output="I am checking the recipe details for dinner on Wednesday...",  # Non-empty intermediate raw output!
+        metadata={"status": "error", "condition_id": "C"},
+    )
+    plan_diff = PlanDiffResult(
+        target_day="Wednesday",
+        target_meal_type="dinner",
+        target_slot_before=None,
+        target_slot_after=None,
+        target_changed=False,
+        actual_target_recipe_id=None,
+        actual_target_servings=None,
+        all_changed_coordinates=[],
+        non_target_changes=[],
+        non_target_drift_count=0,
+        unintended_assignments=0,
+        non_target_recipe_overwrites=0,
+        basket_consistent=True,
+        policy_violations=[],
+        plan_mutated=False,
+        basket_mutated=False,
+    )
+    res = OutcomeEvaluator.evaluate(
+        task=task,
+        response=response,
+        action_result=None,
+        plan_diff=plan_diff,
+        execution_error="Error code: 429 - Rate limit reached for model 'qwen/qwen3.8-27b' on tokens per minute (TPM)",
+        protocol_version="v2",
+    )
+
+    assert res["actual_outcome"] == "ERROR"
+    assert res["task_success"] is False
+    assert res["model_decision_correct"] is None  # Must NOT be penalized as False!
+    assert res["target_accuracy"] is None
+    assert res["infra_success"] is False
+    assert res["system_safety_success"] is True
+
+
+def test_outcome_evaluator_marks_model_schema_error_as_model_decision_false(benchmark_tasks):
+    """FIX 2: Model tool schema violations (e.g. missing required parameter) set model_decision_correct=False and infra_success=True."""
+    task = benchmark_tasks[0]
+    response = AgentResponse(
+        proposal=None,
+        rationale="Tool call validation failed.",
+        raw_output="",
+        metadata={"status": "error", "condition_id": "C"},
+    )
+    plan_diff = PlanDiffResult(
+        target_day="Wednesday",
+        target_meal_type="dinner",
+        target_slot_before=None,
+        target_slot_after=None,
+        target_changed=False,
+        actual_target_recipe_id=None,
+        actual_target_servings=None,
+        all_changed_coordinates=[],
+        non_target_changes=[],
+        non_target_drift_count=0,
+        unintended_assignments=0,
+        non_target_recipe_overwrites=0,
+        basket_consistent=True,
+        policy_violations=[],
+        plan_mutated=False,
+        basket_mutated=False,
+    )
+    res = OutcomeEvaluator.evaluate(
+        task=task,
+        response=response,
+        action_result=None,
+        plan_diff=plan_diff,
+        execution_error="Groq API provider error (BadRequestError): Error code: 400 - tool call validation failed: parameters for tool inspect_recipe did not match schema: errors: [missing properties: 'recipe_id']",
+        protocol_version="v2",
+    )
+
+    assert res["actual_outcome"] == "ERROR"
+    assert res["task_success"] is False
+    assert res["model_decision_correct"] is False  # Model error is attributed to model competence!
+    assert res["target_accuracy"] is False
+    assert res["infra_success"] is True
+
+
+def test_analysis_report_generation_live_vs_simulated_disclaimers(runner, benchmark_tasks, tmp_path):
+    """FIX 4: Analysis markdown renders live disclaimer for provider_mode='live' and simulation disclaimer for simulated mode."""
+    task = benchmark_tasks[0]
+    provider = MockLLMProvider([make_res(content="")])
+
+    # 1. Simulated runner
+    sim_dir = tmp_path / "simulated"
+    sim_dir.mkdir()
+    record_sim = runner.run_task(task, "B", provider=provider)
+    runner.export_artifacts([record_sim], sim_dir)
+    md_sim = (sim_dir / "analysis.md").read_text(encoding="utf-8")
+
+    assert "deterministic offline test providers" in md_sim
+    assert "Real benchmarks will be executed in Phase 6.5" in md_sim
+    assert "SIMULATED TEST DOUBLE RUN" in md_sim
+
+    # 2. Live runner
+    live_dir = tmp_path / "live"
+    live_dir.mkdir()
+    runner_live = ExperimentRunner(
+        fixtures=runner.fixtures,
+        tasks=list(runner.tasks.values()),
+        catalog=runner.catalog,
+        ingredients=runner.ingredients,
+        pricing=runner.pricing,
+        default_provider=provider,
+        provider_mode="live",
+    )
+    record_live = runner_live.run_task(task, "B", provider=provider)
+    runner_live.export_artifacts([record_live], live_dir)
+    md_live = (live_dir / "analysis.md").read_text(encoding="utf-8")
+
+    assert "deterministic offline test providers" not in md_live
+    assert "live cloud API inference against hosted model endpoints" in md_live
+    assert "LIVE LLM EVALUATION RUN" in md_live
+

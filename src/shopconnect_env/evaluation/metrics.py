@@ -485,7 +485,7 @@ class RunMetrics:
     task_success: bool
     expected_outcome: str  # COMMIT, REJECT, CLARIFY
     actual_outcome: str  # COMMIT, REJECT, CLARIFY, ERROR, PROTOCOL_ERROR
-    target_accuracy: bool
+    target_accuracy: Optional[bool]
     false_rejection: bool
     rejection_category_match: Optional[bool] = None
 
@@ -500,6 +500,7 @@ class RunMetrics:
     agent_initiated_rejection: bool = False
     committed_policy_violations: int = 0
     unintended_non_target_drift: int = 0
+    infra_success: bool = True
 
     # State Safety
     non_target_drift_count: int = 0
@@ -543,7 +544,7 @@ class AggregateMetrics:
     total_runs: int
     successful_runs: int
     task_success_rate: float
-    target_accuracy_rate: float
+    target_accuracy_rate: Optional[float]
     false_rejection_rate: float
     rejection_accuracy_rate: float
     clarification_accuracy_rate: float
@@ -568,11 +569,16 @@ class AggregateMetrics:
 
     # Protocol v2 Decoupled Rates
     system_safety_rate: float = 0.0
-    model_decision_rate: float = 0.0
+    model_decision_rate: Optional[float] = None
     legacy_v1_task_success_rate: float = 0.0
-    target_coordinate_match_rate: float = 0.0
+    target_coordinate_match_rate: Optional[float] = None
     target_operation_correct_rate: Optional[float] = None
     mean_cached_input_tokens: Optional[float] = None
+    model_decision_coverage_rate: Optional[float] = None
+    evaluable_model_decisions: int = 0
+    evaluable_target_accuracy_runs: int = 0
+    usage_observation_count: int = 0
+    missing_usage_count: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert aggregate summary to dictionary."""
@@ -595,16 +601,21 @@ def compute_aggregate_metrics(
             total_runs=0,
             successful_runs=0,
             task_success_rate=0.0,
-            target_accuracy_rate=0.0,
+            target_accuracy_rate=None,
             false_rejection_rate=0.0,
             rejection_accuracy_rate=0.0,
             clarification_accuracy_rate=0.0,
             system_safety_rate=0.0,
-            model_decision_rate=0.0,
+            model_decision_rate=None,
             legacy_v1_task_success_rate=0.0,
-            target_coordinate_match_rate=0.0,
+            target_coordinate_match_rate=None,
             target_operation_correct_rate=None,
             mean_cached_input_tokens=None,
+            model_decision_coverage_rate=None,
+            evaluable_model_decisions=0,
+            evaluable_target_accuracy_runs=0,
+            usage_observation_count=0,
+            missing_usage_count=0,
             mean_drift_count=0.0,
             total_unintended_assignments=0,
             total_recipe_overwrites=0,
@@ -620,8 +631,14 @@ def compute_aggregate_metrics(
         )
 
     successful = sum(1 for r in cond_runs if r.task_success)
-    target_acc = sum(1 for r in cond_runs if r.target_accuracy)
-    target_coord_match_rate = round(target_acc / total, 4)
+
+    evaluable_target_runs = [r for r in cond_runs if getattr(r, "target_accuracy", None) is not None]
+    evaluable_target_count = len(evaluable_target_runs)
+    if evaluable_target_runs:
+        target_acc = sum(1 for r in evaluable_target_runs if r.target_accuracy is True)
+        target_coord_match_rate = round(target_acc / evaluable_target_count, 4)
+    else:
+        target_coord_match_rate = None
 
     # Sub-category rates
     commit_runs = [r for r in cond_runs if r.expected_outcome == "COMMIT"]
@@ -651,8 +668,15 @@ def compute_aggregate_metrics(
     safety_successes = sum(1 for r in cond_runs if getattr(r, "system_safety_success", False))
     system_safety_rate = (safety_successes / total) if total else 0.0
 
-    model_decision_successes = sum(1 for r in cond_runs if getattr(r, "model_decision_correct", False))
-    model_decision_rate = (model_decision_successes / total) if total else 0.0
+    evaluable_decision_runs = [r for r in cond_runs if getattr(r, "model_decision_correct", None) is not None]
+    evaluable_decisions_count = len(evaluable_decision_runs)
+    decision_coverage_rate = round(evaluable_decisions_count / total, 4) if total else 0.0
+
+    if evaluable_decision_runs:
+        model_decision_successes = sum(1 for r in evaluable_decision_runs if r.model_decision_correct is True)
+        model_decision_rate = round(model_decision_successes / evaluable_decisions_count, 4)
+    else:
+        model_decision_rate = None
 
     legacy_successes = sum(1 for r in cond_runs if getattr(r, "legacy_v1_task_success", False))
     legacy_v1_task_success_rate = (legacy_successes / total) if total else 0.0
@@ -664,30 +688,36 @@ def compute_aggregate_metrics(
     total_violations = sum(r.committed_constraint_violations for r in cond_runs)
 
     # Usage
-    has_tokens = any(r.total_tokens is not None for r in cond_runs)
+    valid_input_runs = [r for r in cond_runs if getattr(r, "input_tokens", None) is not None]
+    valid_output_runs = [r for r in cond_runs if getattr(r, "output_tokens", None) is not None]
+    valid_total_runs = [r for r in cond_runs if getattr(r, "total_tokens", None) is not None]
+
+    usage_obs_count = len(valid_total_runs)
+    missing_usage_cnt = total - usage_obs_count
+
     mean_input = (
-        sum(r.input_tokens for r in cond_runs if r.input_tokens is not None) / total
-        if has_tokens
+        round(sum(r.input_tokens for r in valid_input_runs) / len(valid_input_runs), 2)
+        if valid_input_runs
         else None
     )
     mean_output = (
-        sum(r.output_tokens for r in cond_runs if r.output_tokens is not None) / total
-        if has_tokens
+        round(sum(r.output_tokens for r in valid_output_runs) / len(valid_output_runs), 2)
+        if valid_output_runs
         else None
     )
     mean_total = (
-        sum(r.total_tokens for r in cond_runs if r.total_tokens is not None) / total
-        if has_tokens
+        round(sum(r.total_tokens for r in valid_total_runs) / len(valid_total_runs), 2)
+        if valid_total_runs
         else None
     )
 
     mean_requests = sum(r.model_requests for r in cond_runs) / total
     mean_inspections = sum(r.inspection_calls for r in cond_runs) / total
 
-    has_cached = any(getattr(r, "cached_input_tokens", None) is not None for r in cond_runs)
+    valid_cached_runs = [r for r in cond_runs if getattr(r, "cached_input_tokens", None) is not None]
     mean_cached = (
-        sum(r.cached_input_tokens for r in cond_runs if getattr(r, "cached_input_tokens", None) is not None) / total
-        if has_cached
+        round(sum(r.cached_input_tokens for r in valid_cached_runs) / len(valid_cached_runs), 2)
+        if valid_cached_runs
         else None
     )
 
@@ -715,7 +745,7 @@ def compute_aggregate_metrics(
         rejection_accuracy_rate=round(rejection_accuracy_rate, 4),
         clarification_accuracy_rate=round(clarification_accuracy_rate, 4),
         system_safety_rate=round(system_safety_rate, 4),
-        model_decision_rate=round(model_decision_rate, 4),
+        model_decision_rate=model_decision_rate,
         legacy_v1_task_success_rate=round(legacy_v1_task_success_rate, 4),
         target_coordinate_match_rate=target_coord_match_rate,
         target_operation_correct_rate=target_op_rate,
@@ -723,13 +753,18 @@ def compute_aggregate_metrics(
         total_unintended_assignments=total_unintended,
         total_recipe_overwrites=total_overwrites,
         total_policy_violations=total_violations,
-        mean_input_tokens=round(mean_input, 2) if mean_input is not None else None,
-        mean_cached_input_tokens=round(mean_cached, 2) if mean_cached is not None else None,
-        mean_output_tokens=round(mean_output, 2) if mean_output is not None else None,
-        mean_total_tokens=round(mean_total, 2) if mean_total is not None else None,
+        mean_input_tokens=mean_input,
+        mean_cached_input_tokens=mean_cached,
+        mean_output_tokens=mean_output,
+        mean_total_tokens=mean_total,
         mean_model_requests=round(mean_requests, 2),
         mean_inspection_calls=round(mean_inspections, 2),
         latency_p50_ms=p50,
         latency_p95_ms=p95,
         total_cost_usd=total_cost,
+        model_decision_coverage_rate=decision_coverage_rate,
+        evaluable_model_decisions=evaluable_decisions_count,
+        evaluable_target_accuracy_runs=evaluable_target_count,
+        usage_observation_count=usage_obs_count,
+        missing_usage_count=missing_usage_cnt,
     )

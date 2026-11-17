@@ -1341,3 +1341,109 @@ def test_condition_c_finalize_no_action_requires_category_and_reason(catalog_dat
     assert response.metadata["invalid_tool_responses"] == 1
     assert response.metadata["agent_initiated_rejection"] is False
     assert "rejection_category" in response.rationale.lower()
+
+
+def test_condition_c_provider_exception_preserves_inspection_calls_made(catalog_data, broker):
+    """FIX 1: Provider exception preserves completed inspection count in response.inspection_calls_made."""
+    ingredients, recipes = catalog_data
+    builder = ObjectContextBuilder()
+    req = ContextRequest(
+        user_request="Replace Wednesday dinner with rustic tomato pasta for 4 servings.",
+        plan=broker.get_plan(),
+        catalog=recipes,
+        ingredients=ingredients,
+    )
+    context = builder.build(req)
+
+    # Turn 1: valid inspect_slot tool call
+    # Turn 2: provider raises exception (e.g. RateLimitError)
+    call_1 = {
+        "id": "c1",
+        "call_id": "c1",
+        "name": "inspect_slot",
+        "function": {"name": "inspect_slot", "arguments": json.dumps({"day": "Wednesday", "meal_type": "dinner"})},
+    }
+
+    class FailingProvider:
+        def __init__(self):
+            self.turn = 0
+
+        def complete(self, **kwargs):
+            self.turn += 1
+            if self.turn == 1:
+                return LLMCompletionResult(
+                    message=LLMMessage(role="assistant", tool_calls=(call_1,)),
+                    usage=LLMUsage(input_tokens=100, output_tokens=20, total_tokens=120, is_provider_reported=True),
+                    model_identifier="mock-c",
+                )
+            raise RuntimeError("Upstream provider 429 rate limit exceeded")
+
+    agent = ConditionCAgent(provider=FailingProvider())
+    response = agent.propose_action(context, inspector=builder)
+
+    assert response.has_proposal is False
+    assert "rate limit exceeded" in response.rationale.lower()
+    # Preserves completed distinct inspections!
+    assert response.inspection_calls_made == 1
+    assert response.metadata["distinct_inspections"] == 1
+
+
+def test_condition_c_inspector_exception_preserves_inspection_calls_made(catalog_data, broker):
+    """FIX 1: Inspector dispatch exception preserves completed inspection count in response.inspection_calls_made."""
+    ingredients, recipes = catalog_data
+    builder = ObjectContextBuilder()
+    req = ContextRequest(
+        user_request="Replace Wednesday dinner with rustic tomato pasta for 4 servings.",
+        plan=broker.get_plan(),
+        catalog=recipes,
+        ingredients=ingredients,
+    )
+    context = builder.build(req)
+
+    call_1 = {
+        "id": "c1",
+        "call_id": "c1",
+        "name": "inspect_slot",
+        "function": {"name": "inspect_slot", "arguments": json.dumps({"day": "Wednesday", "meal_type": "dinner"})},
+    }
+    call_2 = {
+        "id": "c2",
+        "call_id": "c2",
+        "name": "inspect_recipe",
+        "function": {"name": "inspect_recipe", "arguments": json.dumps({"recipe_id": "fail_recipe"})},
+    }
+
+    mock_provider = MockLLMProvider(
+        responses=[
+            LLMCompletionResult(
+                message=LLMMessage(role="assistant", tool_calls=(call_1,)),
+                usage=LLMUsage(input_tokens=100, output_tokens=20, total_tokens=120, is_provider_reported=True),
+                model_identifier="mock-c",
+            ),
+            LLMCompletionResult(
+                message=LLMMessage(role="assistant", tool_calls=(call_2,)),
+                usage=LLMUsage(input_tokens=150, output_tokens=30, total_tokens=180, is_provider_reported=True),
+                model_identifier="mock-c",
+            ),
+        ]
+    )
+
+    class FailingInspector(ObjectContextBuilder):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def inspect_recipe(self, recipe_id):
+            raise RuntimeError("Database connection lost during inspect_recipe")
+
+    agent = ConditionCAgent(provider=mock_provider)
+    inspector = FailingInspector()
+    # Populate builder state
+    inspector.build(req)
+    response = agent.propose_action(context, inspector=inspector)
+
+    assert response.has_proposal is False
+    assert "database connection lost" in response.rationale.lower()
+    # First call succeeded, second failed during dispatch -> exactly 1 completed!
+    assert response.inspection_calls_made == 1
+    assert response.metadata["distinct_inspections"] == 1

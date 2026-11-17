@@ -28,12 +28,15 @@ from shopconnect_env.agents.condition_c_agent import ConditionCAgent
 from shopconnect_env.agents.providers import (
     AuthenticationError,
     ConfigurationError,
+    ConnectionError,
     GroqProvider,
     LLMCompletionResult,
     LLMMessage,
     LLMUsage,
     MockLLMProvider,
+    ProviderError,
     RateLimitError,
+    TimeoutError,
 )
 from shopconnect_env.context.base import ContextResult
 from shopconnect_env.evaluation.groq_pilot import (
@@ -51,8 +54,10 @@ from shopconnect_env.evaluation.groq_pilot import (
     PILOT_MODEL,
     GroqPilotRequestGuardrailProvider,
     SequentialRateLimiter,
+    classify_reservation_action,
     create_groq_pilot_mock_provider,
     get_project_root,
+    is_pre_dispatch_connection_error,
     load_project_env,
     run_groq_connection_test,
     run_groq_json_smoke_test,
@@ -1060,3 +1065,517 @@ def test_load_project_env_loads_key_when_unset(monkeypatch, tmp_path):
     res = run_groq_pilot_preflight()
     assert res["api_key_configured"] is True
     assert test_key_val not in str(res)  # Secret must never be in preflight result dictionary
+
+
+# =============================================================================
+# 10. SLIDING WINDOW RATE LIMITER & PACING REGRESSION TESTS
+# =============================================================================
+
+def test_sliding_window_expiration_after_window_seconds():
+    """Tokens in sliding window must expire exactly after window_seconds elapses."""
+    current_time = [100.0]
+
+    def mock_clock() -> float:
+        return current_time[0]
+
+    limiter = SequentialRateLimiter(
+        window_seconds=60.0,
+        itpm_limit=7000,
+        reserve_tokens=1000,
+        clock=mock_clock,
+    )
+
+    # Reserve 2500 tokens at T=100.0
+    res_id = limiter.reserve_slot(2500)
+    assert limiter.get_window_tokens() == 2500
+    assert len(limiter.window_entries) == 1
+
+    # Advance time by 30 seconds to T=130.0 (within 60s window)
+    current_time[0] = 130.0
+    assert limiter.get_window_tokens() == 2500
+    assert len(limiter.window_entries) == 1
+
+    # Advance time by 31 more seconds to T=161.0 (> 60s elapsed from T=100.0)
+    current_time[0] = 161.0
+    assert limiter.get_window_tokens() == 0
+    assert len(limiter.window_entries) == 0
+
+
+def test_sliding_window_budget_triggers_pacing_wait():
+    """Requests exceeding effective budget must wait until older entries slide out of window."""
+    current_time = [100.0]
+    sleeps: list[float] = []
+
+    def mock_clock() -> float:
+        return current_time[0]
+
+    def mock_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        current_time[0] += seconds
+
+    limiter = SequentialRateLimiter(
+        min_interval_seconds=5.0,
+        window_seconds=60.0,
+        itpm_limit=7000,
+        reserve_tokens=1000,  # Effective budget: 6,000 tokens
+        clock=mock_clock,
+        sleeper=mock_sleep,
+    )
+
+    # Request 1 at T=100.0: 2,800 tokens (fits within 6000)
+    s1 = limiter.wait_for_slot(estimated_tokens=2800)
+    assert s1 == 0.0
+    limiter.last_request_start = current_time[0]
+    assert limiter.get_window_tokens() == 2800
+
+    # Monotonic clock advances to T=105.0 (min_interval satisfied)
+    current_time[0] = 105.0
+
+    # Request 2 at T=105.0: 2,800 tokens (2800 + 2800 = 5600 <= 6000)
+    s2 = limiter.wait_for_slot(estimated_tokens=2800)
+    assert s2 == 0.0
+    limiter.last_request_start = current_time[0]
+    assert limiter.get_window_tokens() == 5600
+
+    # Monotonic clock advances to T=110.0
+    current_time[0] = 110.0
+
+    # Request 3 at T=110.0: 1,500 tokens.
+    # Active window tokens = 5600. 5600 + 1500 = 7100 > 6000.
+    # Must wait for Request 1 (at T=100.0) to slide out at T=160.0.
+    # Expected wait: 160.0 - 110.0 + 0.05 = 50.05s
+    s3 = limiter.wait_for_slot(estimated_tokens=1500)
+    assert s3 >= 50.0
+    assert len(sleeps) == 1
+    assert sleeps[0] >= 50.0
+    assert current_time[0] >= 160.0
+
+    # Verify reason in sleep_records
+    assert any(rec["reason"] == "sliding_window_budget" for rec in limiter.sleep_records)
+
+    # After wait, Request 1 has expired, leaving Request 2 (2800 tokens) + Request 3 (1500 tokens).
+    # 2800 + 1500 = 4300 <= 6000 -> fits!
+    assert limiter.get_window_tokens() == 4300
+
+
+def test_sliding_window_failed_dispatch_releases_reservation():
+    """Failed provider dispatch must release reservation so failed attempts do not consume quota."""
+    current_time = [100.0]
+
+    def mock_clock() -> float:
+        return current_time[0]
+
+    limiter = SequentialRateLimiter(
+        window_seconds=60.0,
+        itpm_limit=7000,
+        reserve_tokens=1000,
+        clock=mock_clock,
+    )
+
+    res_id = limiter.reserve_slot(2500)
+    assert limiter.get_window_tokens() == 2500
+
+    # Simulate dispatch failure and release
+    limiter.release_reservation(res_id)
+    assert limiter.get_window_tokens() == 0
+    assert len(limiter.window_entries) == 0
+
+
+def test_sliding_window_successful_dispatch_reconciles_actual_tokens():
+    """Successful dispatch must reconcile estimated reservation with actual input tokens."""
+    current_time = [100.0]
+
+    def mock_clock() -> float:
+        return current_time[0]
+
+    limiter = SequentialRateLimiter(
+        window_seconds=60.0,
+        itpm_limit=7000,
+        reserve_tokens=1000,
+        clock=mock_clock,
+    )
+
+    res_id = limiter.reserve_slot(2800)
+    assert limiter.get_window_tokens() == 2800
+
+    # Provider reports 2650 input tokens (including any cached tokens)
+    limiter.reconcile_reservation(res_id, actual_tokens=2650)
+    assert limiter.get_window_tokens() == 2650
+    assert limiter.window_entries[0]["status"] == "confirmed"
+    assert limiter.window_entries[0]["tokens"] == 2650
+
+
+def test_sliding_window_quota_reset_headers_merge_with_sliding_window_delay():
+    """Rate limiter must wait for the maximum of sliding window wait, quota deadline, and interval."""
+    current_time = [100.0]
+    sleeps: list[float] = []
+
+    def mock_clock() -> float:
+        return current_time[0]
+
+    def mock_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        current_time[0] += seconds
+
+    limiter = SequentialRateLimiter(
+        min_interval_seconds=5.0,
+        window_seconds=60.0,
+        itpm_limit=7000,
+        reserve_tokens=1000,
+        clock=mock_clock,
+        sleeper=mock_sleep,
+    )
+
+    # 1. Fill window with 5000 tokens at T=100.0
+    limiter.reserve_slot(5000)
+    limiter.last_request_start = 100.0
+
+    # Advance to T=120.0
+    current_time[0] = 120.0
+
+    # Headers report low remaining tokens with 15.0s reset duration (reset deadline: 120.0 + 15.0 = 135.0)
+    # Sliding window wait: 5000 + 2000 = 7000 > 6000 -> expires at 100.0 + 60.0 = 160.0 (wait: 40.05s)
+    # Since sliding_wait (40.05s) > quota_wait (15.0s), sliding_wait must dominate
+    limiter.update_from_headers({
+        "x-ratelimit-remaining-tokens": "300",
+        "x-ratelimit-reset-tokens": "15.0s",
+    })
+
+    slept = limiter.wait_for_slot(estimated_tokens=2000)
+    assert slept >= 40.0
+    assert limiter.sleep_records[-1]["reason"] == "sliding_window_budget"
+
+
+def test_sliding_window_persistence_across_multiple_tasks():
+    """Sliding-window token budget must persist across multiple tasks via guardrail provider."""
+    current_time = [100.0]
+    sleeps: list[float] = []
+
+    def mock_clock() -> float:
+        return current_time[0]
+
+    def mock_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        current_time[0] += seconds
+
+    limiter = SequentialRateLimiter(
+        min_interval_seconds=5.0,
+        window_seconds=60.0,
+        itpm_limit=7000,
+        reserve_tokens=1000,
+        clock=mock_clock,
+        sleeper=mock_sleep,
+    )
+
+    mock_provider = MagicMock()
+    mock_provider.complete.return_value = LLMCompletionResult(
+        message=LLMMessage(role="assistant", content="OK"),
+        usage=LLMUsage(input_tokens=3500, output_tokens=50, total_tokens=3550, is_provider_reported=True),
+        model_identifier="qwen/qwen3.8-27b",
+        provider_request_id="task1_req1",
+        latency_ms=250.0,
+        finish_reason="stop",
+    )
+
+    guardrail = GroqPilotRequestGuardrailProvider(
+        provider=mock_provider,
+        max_requests=10,
+        rate_limiter=limiter,
+    )
+
+    # Task 1 dispatch at T=100.0
+    msg = [LLMMessage(role="user", content="Task 1 Prompt")]
+    res1 = guardrail.complete(msg, estimated_tokens=3500)
+    assert res1.usage.input_tokens == 3500
+    assert limiter.get_window_tokens() == 3500
+
+    # Advance to T=120.0 (Task 2 starts 20 seconds later)
+    current_time[0] = 120.0
+
+    # Task 2 wants to dispatch a request needing 3200 tokens
+    # 3500 + 3200 = 6700 > 6000. Must wait until Task 1 tokens expire (100.0 + 60.0 = 160.0, i.e. 40.05s)
+    mock_provider.complete.return_value = LLMCompletionResult(
+        message=LLMMessage(role="assistant", content="Task 2 OK"),
+        usage=LLMUsage(input_tokens=3200, output_tokens=60, total_tokens=3260, is_provider_reported=True),
+        model_identifier="qwen/qwen3.8-27b",
+        provider_request_id="task2_req1",
+        latency_ms=300.0,
+        finish_reason="stop",
+    )
+
+    res2 = guardrail.complete(msg, estimated_tokens=3200)
+    assert len(sleeps) >= 1
+    assert sleeps[-1] >= 40.0
+    assert current_time[0] >= 160.0
+    assert res2.usage.input_tokens == 3200
+    # Task 1 entry expired, so only Task 2 entry remains in window
+    assert limiter.get_window_tokens() == 3200
+
+
+# =============================================================================
+# 11. SLIDING-WINDOW RESERVATION SAFETY PATCH REGRESSION TESTS
+# =============================================================================
+
+def test_classify_reservation_action_mapping():
+    """Verify exception classification into release vs retain categories."""
+    # Release cases:
+    assert classify_reservation_action(RateLimitError("Rate limit reached")) == "release"
+    assert classify_reservation_action(ProviderError("Error code: 400 - tool call validation failed")) == "release"
+    assert classify_reservation_action(AuthenticationError("401 Unauthorized")) == "release"
+    assert classify_reservation_action(ConnectionError("Failed to resolve 'api.groq.com': getaddrinfo failed")) == "release"
+    assert classify_reservation_action(ConnectionError("Connection refused by peer")) == "release"
+
+    # Retain cases:
+    assert classify_reservation_action(ProviderError("Error code: 500 - Internal Server Error")) == "retain"
+    assert classify_reservation_action(ProviderError("Error code: 502 - Bad Gateway")) == "retain"
+    assert classify_reservation_action(ProviderError("Error code: 503 - Service Unavailable")) == "retain"
+    assert classify_reservation_action(TimeoutError("Groq API request timed out.")) == "retain"
+    assert classify_reservation_action(ConnectionError("Connection reset by peer")) == "retain"
+    assert classify_reservation_action(RuntimeError("Unexpected unclassified failure")) == "retain"
+
+
+def test_reservation_release_on_http_400_schema_error():
+    """Confirmed HTTP 400 schema error releases reservation immediately."""
+    limiter = SequentialRateLimiter(window_seconds=60.0, itpm_limit=7000, reserve_tokens=1000)
+    mock_provider = MagicMock()
+    mock_provider.complete.side_effect = ProviderError(
+        "Groq API provider error (BadRequestError): Error code: 400 - tool call validation failed: parameters for tool inspect_recipe did not match schema"
+    )
+
+    guardrail = GroqPilotRequestGuardrailProvider(provider=mock_provider, max_requests=5, rate_limiter=limiter)
+    msg = [LLMMessage(role="user", content="Ping")]
+
+    with pytest.raises(ProviderError):
+        guardrail.complete(msg, estimated_tokens=2500)
+
+    # Reservation released
+    assert limiter.get_window_tokens() == 0
+    assert len(limiter.window_entries) == 0
+    # Request counter incremented
+    assert guardrail.total_requests == 1
+    # Unconfirmed tokens never in usage totals
+    assert guardrail.cumulative_input_tokens == 0
+
+
+def test_reservation_release_on_http_429_quota_rejection():
+    """HTTP 429 quota error releases reservation and updates quota reset deadline."""
+    current_time = [100.0]
+
+    def mock_clock() -> float:
+        return current_time[0]
+
+    def mock_sleep(seconds: float) -> None:
+        current_time[0] += seconds
+
+    limiter = SequentialRateLimiter(
+        window_seconds=60.0,
+        itpm_limit=7000,
+        reserve_tokens=1000,
+        clock=mock_clock,
+        sleeper=mock_sleep,
+    )
+    mock_provider = MagicMock()
+
+    def raise_429(*args, **kwargs):
+        mock_provider.last_response_headers = {
+            "x-ratelimit-remaining-tokens": "100",
+            "x-ratelimit-reset-tokens": "14.5s",
+        }
+        raise RateLimitError("Groq API rate limit or quota exceeded.")
+
+    mock_provider.complete.side_effect = raise_429
+    mock_provider.last_response_headers = {}
+
+    guardrail = GroqPilotRequestGuardrailProvider(provider=mock_provider, max_requests=5, rate_limiter=limiter)
+    msg = [LLMMessage(role="user", content="Ping")]
+
+    with pytest.raises(RateLimitError):
+        guardrail.complete(msg, estimated_tokens=2500)
+
+    # Reservation released
+    assert limiter.get_window_tokens() == 0
+    # Quota deadline preserved: 100.0 + 14.5 = 114.5
+    assert limiter.quota_deadline == 114.5
+    assert guardrail.total_requests == 1
+    assert guardrail.cumulative_input_tokens == 0
+
+
+def test_reservation_retained_on_http_500_server_error():
+    """HTTP 500 server-side error conservatively retains reservation as unconfirmed_failed."""
+    limiter = SequentialRateLimiter(window_seconds=60.0, itpm_limit=7000, reserve_tokens=1000)
+    mock_provider = MagicMock()
+    mock_provider.complete.side_effect = ProviderError("Groq API provider error (InternalServerError): Error code: 500 - internal server error")
+
+    guardrail = GroqPilotRequestGuardrailProvider(provider=mock_provider, max_requests=5, rate_limiter=limiter)
+    msg = [LLMMessage(role="user", content="Ping")]
+
+    with pytest.raises(ProviderError):
+        guardrail.complete(msg, estimated_tokens=2500)
+
+    # Reservation conservatively retained
+    assert limiter.get_window_tokens() == 2500
+    assert len(limiter.window_entries) == 1
+    assert limiter.window_entries[0]["status"] == "unconfirmed_failed"
+    assert limiter.window_entries[0]["tokens"] == 2500
+    # Request counter incremented
+    assert guardrail.total_requests == 1
+    # Unconfirmed estimates NEVER added to confirmed usage totals
+    assert guardrail.cumulative_input_tokens == 0
+
+
+def test_reservation_retained_on_timeout_error():
+    """Post-dispatch TimeoutError conservatively retains reservation as unconfirmed_failed."""
+    limiter = SequentialRateLimiter(window_seconds=60.0, itpm_limit=7000, reserve_tokens=1000)
+    mock_provider = MagicMock()
+    mock_provider.complete.side_effect = TimeoutError("Groq API request timed out.")
+
+    guardrail = GroqPilotRequestGuardrailProvider(provider=mock_provider, max_requests=5, rate_limiter=limiter)
+    msg = [LLMMessage(role="user", content="Ping")]
+
+    with pytest.raises(TimeoutError):
+        guardrail.complete(msg, estimated_tokens=2800)
+
+    # Retained
+    assert limiter.get_window_tokens() == 2800
+    assert limiter.window_entries[0]["status"] == "unconfirmed_failed"
+    assert guardrail.total_requests == 1
+    assert guardrail.cumulative_input_tokens == 0
+
+
+def test_reservation_retained_on_post_dispatch_connection_drop():
+    """Ambiguous post-dispatch ConnectionError conservatively retains reservation as unconfirmed_failed."""
+    limiter = SequentialRateLimiter(window_seconds=60.0, itpm_limit=7000, reserve_tokens=1000)
+    mock_provider = MagicMock()
+    mock_provider.complete.side_effect = ConnectionError("Connection reset by peer during read")
+
+    guardrail = GroqPilotRequestGuardrailProvider(provider=mock_provider, max_requests=5, rate_limiter=limiter)
+    msg = [LLMMessage(role="user", content="Ping")]
+
+    with pytest.raises(ConnectionError):
+        guardrail.complete(msg, estimated_tokens=2800)
+
+    # Retained
+    assert limiter.get_window_tokens() == 2800
+    assert limiter.window_entries[0]["status"] == "unconfirmed_failed"
+    assert guardrail.total_requests == 1
+    assert guardrail.cumulative_input_tokens == 0
+
+
+def test_reservation_released_on_pre_dispatch_connection_failure():
+    """Confirmed pre-dispatch connection error (DNS failure / connection refused) releases reservation."""
+    limiter = SequentialRateLimiter(window_seconds=60.0, itpm_limit=7000, reserve_tokens=1000)
+    mock_provider = MagicMock()
+    mock_provider.complete.side_effect = ConnectionError("Failed to establish a new connection: [Errno 11001] getaddrinfo failed")
+
+    guardrail = GroqPilotRequestGuardrailProvider(provider=mock_provider, max_requests=5, rate_limiter=limiter)
+    msg = [LLMMessage(role="user", content="Ping")]
+
+    with pytest.raises(ConnectionError):
+        guardrail.complete(msg, estimated_tokens=2800)
+
+    # Released
+    assert limiter.get_window_tokens() == 0
+    assert len(limiter.window_entries) == 0
+    assert guardrail.total_requests == 1
+    assert guardrail.cumulative_input_tokens == 0
+
+
+def test_retained_failed_reservation_expires_after_60_seconds():
+    """Retained unconfirmed_failed reservation expires cleanly after 60 seconds."""
+    current_time = [100.0]
+
+    def mock_clock() -> float:
+        return current_time[0]
+
+    def mock_sleep(seconds: float) -> None:
+        current_time[0] += seconds
+
+    limiter = SequentialRateLimiter(
+        window_seconds=60.0,
+        itpm_limit=7000,
+        reserve_tokens=1000,
+        clock=mock_clock,
+        sleeper=mock_sleep,
+    )
+    mock_provider = MagicMock()
+    mock_provider.complete.side_effect = TimeoutError("Groq API request timed out.")
+
+    guardrail = GroqPilotRequestGuardrailProvider(provider=mock_provider, max_requests=5, rate_limiter=limiter)
+    msg = [LLMMessage(role="user", content="Ping")]
+
+    with pytest.raises(TimeoutError):
+        guardrail.complete(msg, estimated_tokens=2800)
+
+    assert limiter.get_window_tokens() == 2800
+    assert limiter.window_entries[0]["status"] == "unconfirmed_failed"
+
+    # Advance time by 30 seconds to T=130.0 (still in window)
+    current_time[0] = 130.0
+    assert limiter.get_window_tokens() == 2800
+
+    # Advance time past 60s window to T=161.0
+    current_time[0] = 161.0
+    assert limiter.get_window_tokens() == 0
+    assert len(limiter.window_entries) == 0
+
+
+def test_cross_task_persistence_of_retained_reservation():
+    """Retained unconfirmed_failed reservation from Task 1 paces Task 2 until window expires."""
+    current_time = [100.0]
+    sleeps: list[float] = []
+
+    def mock_clock() -> float:
+        return current_time[0]
+
+    def mock_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        current_time[0] += seconds
+
+    limiter = SequentialRateLimiter(
+        min_interval_seconds=5.0,
+        window_seconds=60.0,
+        itpm_limit=7000,
+        reserve_tokens=1000,  # Effective budget: 6,000 tokens
+        clock=mock_clock,
+        sleeper=mock_sleep,
+    )
+
+    mock_provider = MagicMock()
+    guardrail = GroqPilotRequestGuardrailProvider(provider=mock_provider, max_requests=5, rate_limiter=limiter)
+    msg = [LLMMessage(role="user", content="Task 1 Prompt")]
+
+    # Task 1 at T=100.0 fails with HTTP 503 Service Unavailable, retaining 3,500 tokens
+    mock_provider.complete.side_effect = ProviderError("Groq API provider error (ServiceUnavailableError): Error code: 503")
+    with pytest.raises(ProviderError):
+        guardrail.complete(msg, estimated_tokens=3500)
+
+    assert limiter.get_window_tokens() == 3500
+    assert limiter.window_entries[0]["status"] == "unconfirmed_failed"
+    assert guardrail.total_requests == 1
+    assert guardrail.cumulative_input_tokens == 0
+
+    # Runner transitions to Task 2 at T=120.0 (20s later)
+    current_time[0] = 120.0
+
+    # Task 2 wants to dispatch 3,200 tokens
+    # 3500 (retained) + 3200 = 6700 > 6000. Limiter must wait until Task 1 entry expires at 100.0 + 60.0 = 160.0 (40.05s wait)
+    mock_provider.complete.side_effect = None
+    mock_provider.complete.return_value = LLMCompletionResult(
+        message=LLMMessage(role="assistant", content="Task 2 OK"),
+        usage=LLMUsage(input_tokens=3200, output_tokens=50, total_tokens=3250, is_provider_reported=True),
+        model_identifier="qwen/qwen3.8-27b",
+        provider_request_id="task2_req1",
+        latency_ms=250.0,
+        finish_reason="stop",
+    )
+
+    res2 = guardrail.complete(msg, estimated_tokens=3200)
+    assert len(sleeps) >= 1
+    assert sleeps[-1] >= 40.0
+    assert current_time[0] >= 160.0
+    assert res2.usage.input_tokens == 3200
+    # Task 1's unconfirmed reservation expired; only Task 2's confirmed usage remains
+    assert limiter.get_window_tokens() == 3200
+    assert guardrail.total_requests == 2
+    # Confirmed token usage strictly contains only Task 2's usage, NOT Task 1's unconfirmed tokens!
+    assert guardrail.cumulative_input_tokens == 3200

@@ -67,6 +67,7 @@ from shopconnect_env.evaluation import (
     load_benchmark_tasks,
     load_plan_fixtures,
 )
+from shopconnect_env.evaluation.metrics import RunMetrics, compute_aggregate_metrics
 from shopconnect_env.evaluation.runner import evaluate_task_clarification
 
 
@@ -1242,3 +1243,118 @@ def test_cached_tokens_reporting_in_comparison_csv_and_non_double_counting(runne
         assert row["input_tokens"] == "1000"
         assert row["output_tokens"] == "200"
         assert row["total_tokens"] == "1200"
+
+
+def test_metric_aggregation_excludes_indeterminate_infrastructure_runs():
+    """FIX 3: Model decision rate and target accuracy exclude indeterminate infrastructure failures from denominator."""
+    r1 = RunMetrics(
+        task_id="task_01",
+        fixture_id="f1",
+        condition_id="C",
+        task_success=False,
+        expected_outcome="COMMIT",
+        actual_outcome="ERROR",
+        target_accuracy=False,
+        false_rejection=False,
+        model_decision_correct=False,  # Evaluated model error
+    )
+    r2 = RunMetrics(
+        task_id="task_14",
+        fixture_id="f1",
+        condition_id="C",
+        task_success=False,
+        expected_outcome="REJECT",
+        actual_outcome="ERROR",
+        target_accuracy=None,  # Indeterminate infrastructure failure (e.g. HTTP 429)
+        false_rejection=False,
+        model_decision_correct=None,  # Excluded from accuracy denominator
+    )
+    r3 = RunMetrics(
+        task_id="task_22",
+        fixture_id="f1",
+        condition_id="C",
+        task_success=False,
+        expected_outcome="CLARIFY",
+        actual_outcome="ERROR",
+        target_accuracy=None,
+        false_rejection=False,
+        model_decision_correct=None,  # Excluded from accuracy denominator
+    )
+
+    agg = compute_aggregate_metrics([r1, r2, r3], "C")
+
+    # Total runs is 3, task success rate is 0.0
+    assert agg.total_runs == 3
+    assert agg.task_success_rate == 0.0
+
+    # Only r1 has an evaluable model decision (0 out of 1 correct)
+    assert agg.evaluable_model_decisions == 1
+    assert agg.model_decision_coverage_rate == round(1 / 3, 4)
+    assert agg.model_decision_rate == 0.0  # 0 / 1
+
+    # Only r1 has evaluable target accuracy
+    assert agg.evaluable_target_accuracy_runs == 1
+    assert agg.target_coordinate_match_rate == 0.0
+    assert agg.target_accuracy_rate == 0.0
+
+    # When all runs are indeterminate infrastructure failures:
+    agg_all_infra = compute_aggregate_metrics([r2, r3], "C")
+    assert agg_all_infra.evaluable_model_decisions == 0
+    assert agg_all_infra.model_decision_coverage_rate == 0.0
+    assert agg_all_infra.model_decision_rate is None  # Reported as None/null, not 0.0!
+    assert agg_all_infra.target_coordinate_match_rate is None
+
+
+def test_missing_usage_aggregation_does_not_impute_zeros():
+    """FIX 5: Null token observations are never silently averaged as zero."""
+    r1 = RunMetrics(
+        task_id="task_01",
+        fixture_id="f1",
+        condition_id="C",
+        task_success=False,
+        expected_outcome="COMMIT",
+        actual_outcome="ERROR",
+        target_accuracy=False,
+        false_rejection=False,
+        input_tokens=1992,
+        output_tokens=59,
+        total_tokens=2051,
+    )
+    r2 = RunMetrics(
+        task_id="task_14",
+        fixture_id="f1",
+        condition_id="C",
+        task_success=False,
+        expected_outcome="REJECT",
+        actual_outcome="ERROR",
+        target_accuracy=None,
+        false_rejection=False,
+        input_tokens=None,  # Missing usage
+        output_tokens=None,
+        total_tokens=None,
+    )
+    r3 = RunMetrics(
+        task_id="task_22",
+        fixture_id="f1",
+        condition_id="C",
+        task_success=False,
+        expected_outcome="CLARIFY",
+        actual_outcome="ERROR",
+        target_accuracy=None,
+        false_rejection=False,
+        input_tokens=None,  # Missing usage
+        output_tokens=None,
+        total_tokens=None,
+    )
+
+    agg = compute_aggregate_metrics([r1, r2, r3], "C")
+
+    # Counts
+    assert agg.total_runs == 3
+    assert agg.usage_observation_count == 1
+    assert agg.missing_usage_count == 2
+
+    # Means must reflect available observation (1992, 59, 2051), NOT divided by 3 (664, 19.67, 683.67)!
+    assert agg.mean_input_tokens == 1992.0
+    assert agg.mean_output_tokens == 59.0
+    assert agg.mean_total_tokens == 2051.0

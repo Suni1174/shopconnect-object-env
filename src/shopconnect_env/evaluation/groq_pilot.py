@@ -20,6 +20,7 @@ Stage 6 Protocol v2:
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import copy
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -89,12 +90,17 @@ from pydantic import ValidationError
 
 from shopconnect_env.agents.condition_a_agent import ConditionAEnvelopeAdapter
 from shopconnect_env.agents.providers import (
+    AuthenticationError,
+    ConnectionError,
     GroqProvider,
     LLMCompletionResult,
     LLMMessage,
     LLMProvider,
     LLMUsage,
     MockLLMProvider,
+    ProviderError,
+    RateLimitError,
+    TimeoutError,
     usage_to_dict,
 )
 from shopconnect_env.context.base import ContextRequest
@@ -212,20 +218,37 @@ MIN_REQUEST_INTERVAL_SECONDS: float = 12.0  # 12.0s minimum interval between req
 # =============================================================================
 
 class SequentialRateLimiter:
-    """Enforces a safe sequential interval and quota-aware pacing between provider requests."""
+    """Enforces a safe sequential interval, quota-aware pacing, and 60-second sliding-window token budget."""
 
     def __init__(
         self,
         min_interval_seconds: float = MIN_REQUEST_INTERVAL_SECONDS,
         clock: Optional[Callable[[], float]] = None,
         sleeper: Optional[Callable[[float], None]] = None,
+        window_seconds: float = 60.0,
+        itpm_limit: int = 7000,
+        reserve_tokens: int = 1000,
+        enable_sliding_window: bool = True,
     ) -> None:
         self.min_interval_seconds = min_interval_seconds
         self.clock = clock or time.monotonic
         self.sleeper = sleeper or time.sleep
+        self.window_seconds = window_seconds
+        self.itpm_limit = itpm_limit
+        self.reserve_tokens = reserve_tokens
+        self.effective_budget = max(0, itpm_limit - reserve_tokens)
+        self.enable_sliding_window = enable_sliding_window
+
         self.last_request_start: Optional[float] = None
         self.total_sleep_seconds: float = 0.0
         self.sleep_events: List[float] = []
+        self.sleep_records: List[Dict[str, Any]] = []
+
+        # Sliding window history: deque of dicts {"id": int, "timestamp": float, "tokens": int, "status": str}
+        self.window_entries: deque = deque()
+        self._next_reservation_id: int = 1
+        self.last_reservation_id: Optional[int] = None
+
         self.pending_quota_delay_seconds: float = 0.0
         self.last_remaining_tokens: Optional[int] = None
         self.last_reset_tokens_seconds: Optional[float] = None
@@ -234,6 +257,58 @@ class SequentialRateLimiter:
         self.retry_after_deadline: Optional[float] = None
         self.token_reset_deadline: Optional[float] = None
         self._last_processed_headers: Optional[Mapping[str, Any]] = None
+
+    def prune_window(self, now: Optional[float] = None) -> None:
+        """Expire entries older than the rolling window_seconds."""
+        current_time = now if now is not None else self.clock()
+        cutoff = current_time - self.window_seconds
+        while self.window_entries and self.window_entries[0]["timestamp"] <= cutoff:
+            self.window_entries.popleft()
+
+    def get_window_tokens(self, now: Optional[float] = None) -> int:
+        """Return the sum of active reserved and confirmed tokens in the current window."""
+        self.prune_window(now)
+        return sum(entry["tokens"] for entry in self.window_entries)
+
+    def reserve_slot(self, estimated_tokens: int, now: Optional[float] = None) -> int:
+        """Reserve token allocation before dispatching a request."""
+        current_time = now if now is not None else self.clock()
+        res_id = self._next_reservation_id
+        self._next_reservation_id += 1
+        self.window_entries.append({
+            "id": res_id,
+            "timestamp": current_time,
+            "tokens": max(0, estimated_tokens),
+            "status": "reserved",
+        })
+        self.last_reservation_id = res_id
+        return res_id
+
+    def reconcile_reservation(self, reservation_id: int, actual_tokens: int) -> None:
+        """Reconcile estimated reservation with actual provider-reported input tokens.
+
+        Cached input tokens are part of input tokens, not additional, so actual_tokens
+        strictly reflects total input tokens consumed.
+        """
+        for entry in self.window_entries:
+            if entry["id"] == reservation_id:
+                entry["tokens"] = max(0, actual_tokens)
+                entry["status"] = "confirmed"
+                return
+
+    def release_reservation(self, reservation_id: int) -> None:
+        """Release reservation upon request failure without consuming token budget."""
+        for i, entry in enumerate(self.window_entries):
+            if entry["id"] == reservation_id:
+                del self.window_entries[i]
+                return
+
+    def retain_reservation_failed(self, reservation_id: int) -> None:
+        """Conservatively retain estimated reservation as unconfirmed_failed until window expiry."""
+        for entry in self.window_entries:
+            if entry["id"] == reservation_id:
+                entry["status"] = "unconfirmed_failed"
+                return
 
     def update_from_headers(
         self,
@@ -309,7 +384,7 @@ class SequentialRateLimiter:
         provider: Optional[Any] = None,
         estimated_tokens: Optional[int] = None,
     ) -> float:
-        """Wait until min_interval_seconds and quota reset duration have elapsed."""
+        """Wait until min_interval_seconds, quota reset duration, and sliding-window budget permit dispatch."""
         now = self.clock()
 
         if provider is not None and hasattr(provider, "last_response_headers"):
@@ -323,37 +398,148 @@ class SequentialRateLimiter:
         elif estimated_tokens is not None:
             self._recheck_token_quota(estimated_tokens)
 
-        # 1. Quota wait from monotonic deadline
-        quota_wait = 0.0
-        if self.quota_deadline is not None:
-            quota_wait = max(0.0, self.quota_deadline - now)
+        est = estimated_tokens if estimated_tokens is not None else 0
 
-        # 2. Inter-request interval wait from last request start
-        interval_wait = 0.0
-        if self.last_request_start is not None:
-            elapsed = now - self.last_request_start
-            interval_wait = max(0.0, self.min_interval_seconds - elapsed)
+        total_slept = 0.0
+        while True:
+            self.prune_window(now)
 
-        wait_time = max(quota_wait, interval_wait)
-        self.pending_quota_delay_seconds = 0.0
+            # 1. Sliding window wait
+            sliding_wait = 0.0
+            if self.enable_sliding_window and est > 0:
+                current_window_tokens = sum(e["tokens"] for e in self.window_entries)
+                if current_window_tokens + est > self.effective_budget and self.window_entries:
+                    acc = 0
+                    target_time = None
+                    for entry in self.window_entries:
+                        acc += entry["tokens"]
+                        if (current_window_tokens - acc) + est <= self.effective_budget:
+                            target_time = entry["timestamp"] + self.window_seconds
+                            break
+                    if target_time is None and self.window_entries:
+                        target_time = self.window_entries[-1]["timestamp"] + self.window_seconds
+                    if target_time is not None:
+                        sliding_wait = max(0.0, target_time - now + 0.05)
 
-        if wait_time > 0.0:
+            # 2. Quota wait from monotonic deadline
+            quota_wait = 0.0
+            if self.quota_deadline is not None:
+                quota_wait = max(0.0, self.quota_deadline - now)
+
+            # 3. Inter-request interval wait from last request start
+            interval_wait = 0.0
+            if self.last_request_start is not None:
+                elapsed = now - self.last_request_start
+                interval_wait = max(0.0, self.min_interval_seconds - elapsed)
+
+            wait_time = max(sliding_wait, quota_wait, interval_wait)
+            self.pending_quota_delay_seconds = 0.0
+
+            if wait_time <= 0.0:
+                break
+
+            if wait_time == sliding_wait and sliding_wait > 0.0:
+                reason = "sliding_window_budget"
+            elif wait_time == quota_wait and quota_wait > 0.0:
+                reason = "quota_deadline"
+            else:
+                reason = "min_interval"
+
             self.sleeper(wait_time)
             self.total_sleep_seconds += wait_time
             self.sleep_events.append(wait_time)
+            self.sleep_records.append({
+                "timestamp": now,
+                "duration": wait_time,
+                "reason": reason,
+            })
+            total_slept += wait_time
             now = self.clock()
 
-        if self.token_reset_deadline is not None and now >= self.token_reset_deadline:
-            self.last_remaining_tokens = None
-            self.token_reset_deadline = None
-        if self.retry_after_deadline is not None and now >= self.retry_after_deadline:
-            self.retry_after_deadline = None
+            if self.token_reset_deadline is not None and now >= self.token_reset_deadline:
+                self.last_remaining_tokens = None
+                self.token_reset_deadline = None
+            if self.retry_after_deadline is not None and now >= self.retry_after_deadline:
+                self.retry_after_deadline = None
 
-        deadlines = [d for d in (self.retry_after_deadline, self.token_reset_deadline) if d is not None]
-        self.quota_deadline = max(deadlines) if deadlines else None
+            deadlines = [d for d in (self.retry_after_deadline, self.token_reset_deadline) if d is not None]
+            self.quota_deadline = max(deadlines) if deadlines else None
+
+        if self.enable_sliding_window and est > 0:
+            self.reserve_slot(est, now=now)
 
         self.last_request_start = now
-        return wait_time
+        return total_slept
+
+
+def is_pre_dispatch_connection_error(exc: Exception) -> bool:
+    """Check if connection error unambiguously occurred before any HTTP request was transmitted."""
+    msg = str(exc).lower()
+    pre_dispatch_markers = [
+        "getaddrinfo failed",
+        "nodename nor servname provided",
+        "name resolution failed",
+        "failed to resolve",
+        "dns resolution",
+        "connection refused",
+        "winerror 10061",
+        "errno 111",
+    ]
+    return any(marker in msg for marker in pre_dispatch_markers)
+
+
+def classify_reservation_action(exc: Exception) -> str:
+    """Classify whether a failed request's token reservation should be released or retained.
+
+    Returns:
+        'release': For confirmed client-side / pre-dispatch rejections (HTTP 400, HTTP 429,
+                   HTTP 401, or confirmed pre-dispatch connection failures).
+        'retain':  For ambiguous post-dispatch failures, HTTP 500/502/503/504 server-side
+                   errors, timeouts, and connection interruptions after dispatch.
+    """
+    exc_type = type(exc).__name__.lower()
+    exc_msg = str(exc).lower()
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None and hasattr(exc, "response"):
+        resp = getattr(exc, "response", None)
+        status_code = getattr(resp, "status_code", None)
+
+    # 1. HTTP 429: Quota rejection (rate-limit headers lock the limiter; release request reservation)
+    if (
+        isinstance(exc, RateLimitError)
+        or status_code == 429
+        or "429" in exc_msg
+        or "ratelimit" in exc_type
+    ):
+        return "release"
+
+    # 2. HTTP 400: Confirmed client schema / tool validation rejection
+    if (
+        status_code == 400
+        or "badrequest" in exc_type
+        or "error code: 400" in exc_msg
+        or "status code: 400" in exc_msg
+        or "tool call validation failed" in exc_msg
+    ):
+        return "release"
+
+    # 3. HTTP 401 / AuthenticationError: Unambiguous client credential rejection before inference
+    if (
+        isinstance(exc, AuthenticationError)
+        or status_code == 401
+        or "unauthorized" in exc_msg
+        or "401" in exc_msg
+    ):
+        return "release"
+
+    # 4. Unambiguous pre-dispatch connection error (DNS lookup failure, connection refused)
+    if isinstance(exc, (ConnectionError, OSError)) and is_pre_dispatch_connection_error(exc):
+        return "release"
+
+    # 5. Default to conservative retention:
+    # Includes HTTP 500/502/503/504, TimeoutError, ambiguous/post-dispatch ConnectionError,
+    # and unexpected server/provider exceptions where prompt tokens may have been ingested.
+    return "retain"
 
 
 # =============================================================================
@@ -433,15 +619,21 @@ class GroqPilotRequestGuardrailProvider:
             )
 
         slept = 0.0
+        res_id = None
         if self.rate_limiter is not None:
-            prompt_chars = sum(len(m.content or "") for m in messages)
-            if tools:
-                try:
-                    prompt_chars += len(json.dumps(tools))
-                except Exception:
-                    pass
-            est_tokens = max(1, int(prompt_chars / 3.0))
+            override_est = kwargs.pop("estimated_tokens", None)
+            if override_est is not None:
+                est_tokens = int(override_est)
+            else:
+                prompt_chars = sum(len(m.content or "") for m in messages)
+                if tools:
+                    try:
+                        prompt_chars += len(json.dumps(tools))
+                    except Exception:
+                        pass
+                est_tokens = max(1, int(prompt_chars / 3.0))
             slept = self.rate_limiter.wait_for_slot(provider=self.provider, estimated_tokens=est_tokens)
+            res_id = getattr(self.rate_limiter, "last_reservation_id", None)
             self.cumulative_sleep_seconds += slept
 
         self.total_requests += 1
@@ -460,6 +652,12 @@ class GroqPilotRequestGuardrailProvider:
             )
         except Exception as exc:
             duration_ms = (time.perf_counter() - t0) * 1000.0
+            if res_id is not None and self.rate_limiter is not None:
+                action = classify_reservation_action(exc)
+                if action == "release":
+                    self.rate_limiter.release_reservation(res_id)
+                else:
+                    self.rate_limiter.retain_reservation_failed(res_id)
             headers = getattr(self.provider, "last_response_headers", {})
             if headers and self.rate_limiter is not None:
                 self.rate_limiter.update_from_headers(headers)
@@ -473,6 +671,9 @@ class GroqPilotRequestGuardrailProvider:
             raise
 
         duration_ms = (time.perf_counter() - t0) * 1000.0
+        if res_id is not None and self.rate_limiter is not None:
+            actual_input = result.usage.input_tokens if (result.usage and result.usage.input_tokens is not None) else est_tokens
+            self.rate_limiter.reconcile_reservation(res_id, actual_input)
         headers = getattr(self.provider, "last_response_headers", {})
         if headers and self.rate_limiter is not None:
             self.rate_limiter.update_from_headers(headers)
@@ -1670,6 +1871,19 @@ def _patch_pilot_analysis_markdown(
     incomplete_reason: Optional[str] = None,
 ) -> None:
     existing = analysis_path.read_text(encoding="utf-8") if analysis_path.exists() else ""
+    if is_live and "generated using deterministic offline test providers" in existing:
+        offline_phrase = (
+            "> This evaluation artifact was generated using deterministic offline test providers. "
+            "It verifies the functionality of the execution pipeline, state differ, metrics aggregator, "
+            "and report generator. It does NOT constitute empirical evidence of live model performance. "
+            "Real benchmarks will be executed in Phase 6.5 using live OpenAI API access."
+        )
+        live_replacement = (
+            "> This evaluation artifact was generated using live cloud API inference against hosted model endpoints. "
+            "Task outcomes reflect empirical model decision-making and provider availability under live production rate limits and quota constraints."
+        )
+        existing = existing.replace(offline_phrase, live_replacement)
+
     banner = f"""# {PILOT_TAG}
 > [!IMPORTANT]
 > **LIMITED SAMPLE SIZE NOTICE**: This report represents a controlled preliminary pilot

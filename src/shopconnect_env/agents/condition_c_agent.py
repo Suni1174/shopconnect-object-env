@@ -362,6 +362,7 @@ class ConditionCAgent(BaseAgent):
                     proposal=None,
                     rationale=f"Agent exception during interaction: {exc}",
                     raw_output=last_raw_output,
+                    inspection_calls_made=distinct_inspections,
                     metadata={
                         "condition_id": "C",
                         "plan_version": plan_version,
@@ -565,7 +566,6 @@ class ConditionCAgent(BaseAgent):
                         )
                         continue
 
-                    distinct_inspections += 1
                     try:
                         insp_result = self._dispatch_inspection(inspector, tool_name, args_dict)
                     except Exception as exc:
@@ -574,6 +574,7 @@ class ConditionCAgent(BaseAgent):
                             proposal=None,
                             rationale=f"Inspection exception during interaction: {exc}",
                             raw_output=last_raw_output,
+                            inspection_calls_made=distinct_inspections,
                             metadata={
                                 "condition_id": "C",
                                 "plan_version": plan_version,
@@ -590,6 +591,7 @@ class ConditionCAgent(BaseAgent):
                                 "inspection_steps": inspection_steps,
                             },
                         )
+                    distinct_inspections += 1
                     inspection_cache[cache_key] = copy.deepcopy(insp_result)
                     disclosure_chars = len(json.dumps(insp_result))
                     inspection_steps.append({
