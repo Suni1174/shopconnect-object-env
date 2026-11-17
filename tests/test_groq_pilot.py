@@ -876,3 +876,129 @@ def test_condition_c_groq_passes_parallel_tool_calls_false():
     assert mock_client.chat.completions.create.called
     call_kwargs = mock_client.chat.completions.create.call_args.kwargs
     assert call_kwargs["parallel_tool_calls"] is False
+
+
+# =============================================================================
+# 8. PILOT 3 READINESS REGRESSION TESTS
+# =============================================================================
+
+def test_rate_limiter_accounts_for_request_duration_without_undersleeping():
+    """Rate limiter must use monotonic deadline to prevent execution latency from reducing token wait."""
+    current_time = [100.0]
+    sleeps = []
+
+    def mock_clock() -> float:
+        return current_time[0]
+
+    def mock_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        current_time[0] += seconds
+
+    limiter = SequentialRateLimiter(min_interval_seconds=5.0, clock=mock_clock, sleeper=mock_sleep)
+
+    # 1. First request starts at T=100.0
+    s1 = limiter.wait_for_slot()
+    assert s1 == 0.0
+
+    # 2. Request execution takes 4.5 seconds
+    current_time[0] += 4.5  # Monotonic clock advances to T=104.5
+
+    # 3. At response receipt, Groq reports remaining_tokens=500 and reset_tokens=6.8s
+    limiter.update_from_headers({
+        "x-ratelimit-remaining-tokens": "500",
+        "x-ratelimit-reset-tokens": "6.8s",
+    })
+
+    # 4. Next request arrives 0.1 seconds later (T=104.6)
+    current_time[0] += 0.1  # Monotonic clock is now T=104.6
+
+    # 5. Estimated next request requires 2,800 tokens
+    slept = limiter.wait_for_slot(estimated_tokens=2800)
+
+    # Under old implementation (measuring elapsed from last_request_start=100.0):
+    # elapsed = 104.6 - 100.0 = 4.6s -> wait_time = 6.8 - 4.6 = 2.2s (under-slept!)
+    # Under fixed implementation (measuring deadline from header receipt=104.5):
+    # deadline = 104.5 + 6.8 = 111.3 -> wait_time = 111.3 - 104.6 = 6.7s
+    assert slept >= 6.7
+    assert sleeps[-1] >= 6.7
+
+
+def test_condition_c_preserves_tokens_when_inspection_dispatch_raises():
+    """Condition C must preserve accumulated tokens if an exception occurs inside inspector dispatch."""
+    mock_provider = MagicMock()
+    turn1_resp = LLMCompletionResult(
+        message=LLMMessage(
+            role="assistant",
+            content=None,
+            tool_calls=[{"id": "c1", "name": "inspect_plan", "arguments": "{}"}],
+        ),
+        usage=LLMUsage(input_tokens=1500, output_tokens=25, total_tokens=1525, is_provider_reported=True),
+        model_identifier="qwen/qwen3.8-27b",
+        provider_request_id="groq_turn1",
+        latency_ms=300.0,
+        finish_reason="tool_calls",
+    )
+    mock_provider.complete.return_value = turn1_resp
+
+    agent = ConditionCAgent(provider=mock_provider, max_model_requests=6, max_inspection_calls=5)
+    ctx = ContextResult(
+        condition="Condition C: Object-Centric Intelligence",
+        condition_id="C",
+        system_prompt="sys",
+        task_prompt="task",
+        serialized_context='{"plan_version": 1}',
+        metadata={"plan_version": 1},
+    )
+
+    mock_inspector = MagicMock()
+    mock_inspector.inspect_plan.side_effect = RuntimeError("Simulated inspector dispatch crash")
+
+    resp = agent.propose_action(context=ctx, inspector=mock_inspector)
+
+    assert resp.proposal is None
+    assert resp.metadata["status"] == "error"
+    assert "Inspection dispatch error" in resp.metadata["error"]
+    assert "Simulated inspector dispatch crash" in resp.metadata["error"]
+    assert resp.metadata["total_model_requests"] == 1
+    assert "groq_turn1" in resp.metadata["provider_request_ids"]
+    assert 300.0 in resp.metadata["per_request_latencies_ms"]
+    assert resp.metadata_dict["usage"]["input_tokens"] == 1500
+    assert resp.metadata_dict["usage"]["output_tokens"] == 25
+    assert resp.metadata_dict["usage"]["total_tokens"] == 1525
+    assert resp.metadata_dict["usage"]["is_provider_reported"] is True
+
+
+def test_rate_limiter_preserves_deadline_across_benchmark_tasks():
+    """A pending quota deadline set during Task 1 must be honored by the first request of Task 2."""
+    current_time = [100.0]
+    sleeps = []
+
+    def mock_clock() -> float:
+        return current_time[0]
+
+    def mock_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        current_time[0] += seconds
+
+    limiter = SequentialRateLimiter(min_interval_seconds=5.0, clock=mock_clock, sleeper=mock_sleep)
+
+    # Task 1 request runs at T=100.0
+    limiter.wait_for_slot()
+    current_time[0] += 2.0  # T=102.0
+
+    # Task 1 receives response with 10.0s reset duration and low remaining tokens
+    limiter.update_from_headers({
+        "x-ratelimit-remaining-tokens": "200",
+        "x-ratelimit-reset-tokens": "10.0s",
+    })
+    # Monotonic deadline is 102.0 + 10.0 = 112.0
+
+    # Task 1 completes, runner transitions to Task 2 at T=103.0 (1.0s later)
+    current_time[0] += 1.0  # T=103.0
+
+    # Task 2 first request arrives, requiring 2800 tokens (Condition B)
+    slept = limiter.wait_for_slot(estimated_tokens=2800)
+
+    # Expected wait: 112.0 - 103.0 = 9.0s
+    assert slept >= 9.0
+    assert current_time[0] >= 112.0

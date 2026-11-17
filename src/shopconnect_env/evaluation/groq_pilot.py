@@ -179,22 +179,32 @@ class SequentialRateLimiter:
         self.pending_quota_delay_seconds: float = 0.0
         self.last_remaining_tokens: Optional[int] = None
         self.last_reset_tokens_seconds: Optional[float] = None
+        self.last_header_receipt_time: Optional[float] = None
+        self.quota_deadline: Optional[float] = None
+        self.retry_after_deadline: Optional[float] = None
+        self.token_reset_deadline: Optional[float] = None
+        self._last_processed_headers: Optional[Mapping[str, Any]] = None
 
     def update_from_headers(
         self,
         headers: Mapping[str, Any],
         estimated_next_tokens: Optional[int] = None,
+        receipt_time: Optional[float] = None,
     ) -> None:
-        """Capture rate-limit headers and enforce quota-aware backoff before next request."""
+        """Capture rate-limit headers and enforce quota-aware deadline before next request."""
         if not headers:
             return
         headers_lower = {str(k).lower(): str(v) for k, v in headers.items()}
+        now = receipt_time if receipt_time is not None else self.clock()
+        self.last_header_receipt_time = now
+        self._last_processed_headers = dict(headers)
 
         # 1. Retry-After header
         retry_after_raw = headers_lower.get("retry-after")
         if retry_after_raw:
             try:
                 delay = float(str(retry_after_raw).strip())
+                self.retry_after_deadline = now + delay
                 self.pending_quota_delay_seconds = max(self.pending_quota_delay_seconds, delay)
             except (ValueError, TypeError):
                 pass
@@ -222,9 +232,27 @@ class SequentialRateLimiter:
                 # Default threshold is 3000 tokens (sufficient for Condition B ~2800 tokens)
                 required_tokens = (estimated_next_tokens + 200) if estimated_next_tokens is not None else 3000
                 if rem < required_tokens:
+                    self.token_reset_deadline = now + reset_s
                     self.pending_quota_delay_seconds = max(self.pending_quota_delay_seconds, reset_s)
+                else:
+                    self.token_reset_deadline = None
             except (ValueError, TypeError):
                 pass
+
+        deadlines = [d for d in (self.retry_after_deadline, self.token_reset_deadline) if d is not None]
+        self.quota_deadline = max(deadlines) if deadlines else None
+
+    def _recheck_token_quota(self, estimated_tokens: int) -> None:
+        """Re-evaluates token quota deadline against known estimated tokens for next request."""
+        if self.last_remaining_tokens is not None and self.last_reset_tokens_seconds is not None:
+            required_tokens = estimated_tokens + 200
+            receipt_t = self.last_header_receipt_time if self.last_header_receipt_time is not None else self.clock()
+            if self.last_remaining_tokens < required_tokens:
+                self.token_reset_deadline = receipt_t + self.last_reset_tokens_seconds
+            else:
+                self.token_reset_deadline = None
+            deadlines = [d for d in (self.retry_after_deadline, self.token_reset_deadline) if d is not None]
+            self.quota_deadline = max(deadlines) if deadlines else None
 
     def wait_for_slot(
         self,
@@ -232,37 +260,50 @@ class SequentialRateLimiter:
         estimated_tokens: Optional[int] = None,
     ) -> float:
         """Wait until min_interval_seconds and quota reset duration have elapsed."""
-        if provider is not None and hasattr(provider, "last_response_headers"):
-            self.update_from_headers(provider.last_response_headers, estimated_next_tokens=estimated_tokens)
-        elif estimated_tokens is not None and self.last_remaining_tokens is not None and self.last_reset_tokens_seconds is not None:
-            required_tokens = estimated_tokens + 200
-            if self.last_remaining_tokens < required_tokens:
-                self.pending_quota_delay_seconds = max(self.pending_quota_delay_seconds, self.last_reset_tokens_seconds)
-
-        effective_interval = max(self.min_interval_seconds, self.pending_quota_delay_seconds)
-        self.pending_quota_delay_seconds = 0.0
-
-        if effective_interval <= 0.0:
-            self.last_request_start = self.clock()
-            return 0.0
-
         now = self.clock()
-        slept = 0.0
+
+        if provider is not None and hasattr(provider, "last_response_headers"):
+            headers = provider.last_response_headers
+            if headers:
+                if self._last_processed_headers is not None and headers == self._last_processed_headers:
+                    if estimated_tokens is not None:
+                        self._recheck_token_quota(estimated_tokens)
+                else:
+                    self.update_from_headers(headers, estimated_next_tokens=estimated_tokens, receipt_time=now)
+        elif estimated_tokens is not None:
+            self._recheck_token_quota(estimated_tokens)
+
+        # 1. Quota wait from monotonic deadline
+        quota_wait = 0.0
+        if self.quota_deadline is not None:
+            quota_wait = max(0.0, self.quota_deadline - now)
+
+        # 2. Inter-request interval wait from last request start
+        interval_wait = 0.0
         if self.last_request_start is not None:
             elapsed = now - self.last_request_start
-            wait_time = effective_interval - elapsed
-            if wait_time > 0:
-                self.sleeper(wait_time)
-                slept = wait_time
-                now = self.clock()
+            interval_wait = max(0.0, self.min_interval_seconds - elapsed)
+
+        wait_time = max(quota_wait, interval_wait)
+        self.pending_quota_delay_seconds = 0.0
+
+        if wait_time > 0.0:
+            self.sleeper(wait_time)
+            self.total_sleep_seconds += wait_time
+            self.sleep_events.append(wait_time)
+            now = self.clock()
+
+        if self.token_reset_deadline is not None and now >= self.token_reset_deadline:
+            self.last_remaining_tokens = None
+            self.token_reset_deadline = None
+        if self.retry_after_deadline is not None and now >= self.retry_after_deadline:
+            self.retry_after_deadline = None
+
+        deadlines = [d for d in (self.retry_after_deadline, self.token_reset_deadline) if d is not None]
+        self.quota_deadline = max(deadlines) if deadlines else None
 
         self.last_request_start = now
-        self.total_sleep_seconds += slept
-        if slept > 0.0:
-            self.sleep_events.append(slept)
-            if self.last_reset_tokens_seconds is not None and slept >= self.last_reset_tokens_seconds:
-                self.last_remaining_tokens = None
-        return slept
+        return wait_time
 
 
 # =============================================================================

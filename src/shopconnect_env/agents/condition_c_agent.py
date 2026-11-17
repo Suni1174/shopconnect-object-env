@@ -566,7 +566,30 @@ class ConditionCAgent(BaseAgent):
                         continue
 
                     distinct_inspections += 1
-                    insp_result = self._dispatch_inspection(inspector, tool_name, args_dict)
+                    try:
+                        insp_result = self._dispatch_inspection(inspector, tool_name, args_dict)
+                    except Exception as exc:
+                        aggregated_usage = aggregate_usages(usages) if usages else None
+                        return AgentResponse(
+                            proposal=None,
+                            rationale=f"Inspection exception during interaction: {exc}",
+                            raw_output=last_raw_output,
+                            metadata={
+                                "condition_id": "C",
+                                "plan_version": plan_version,
+                                "status": "error",
+                                "error": f"Inspection dispatch error: {exc}",
+                                "total_model_requests": provider_requests,
+                                "usage": usage_to_dict(aggregated_usage) if aggregated_usage else None,
+                                "model_identifier": model_ids[-1] if model_ids else None,
+                                "system_fingerprint": fingerprints[-1] if fingerprints else None,
+                                "provider_request_ids": tuple(request_ids),
+                                "per_request_latencies_ms": tuple(latencies),
+                                "distinct_inspections": distinct_inspections,
+                                "cache_hits": cache_hits,
+                                "inspection_steps": inspection_steps,
+                            },
+                        )
                     inspection_cache[cache_key] = copy.deepcopy(insp_result)
                     disclosure_chars = len(json.dumps(insp_result))
                     inspection_steps.append({
